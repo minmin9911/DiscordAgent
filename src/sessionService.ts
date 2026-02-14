@@ -38,6 +38,7 @@ export class SessionService {
     requesterId: string;
     name?: string;
     firstMessageHint?: string;
+    preferredWorkingDirectory?: string;
   }): SessionRow {
     const source = input.name?.trim() || input.firstMessageHint || "";
     const name = input.name?.trim() || this.generateSessionName(source);
@@ -45,6 +46,7 @@ export class SessionService {
       name,
       createdBy: input.requesterId,
       summary: this.buildSummary(source),
+      preferredWorkingDirectory: input.preferredWorkingDirectory,
     });
     this.db.bindContext(input.contextKey, created.id);
     return created;

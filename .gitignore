@@ -48,8 +48,10 @@ Desktop.ini
 # ---------------------------------
 # Local docs / tooling (not for repo)
 # ---------------------------------
-AGENTS.md
+/*.md
+!/README.md
+!/Readme.md
+!/CHANGELOG.md
 run_codex.cmd
 DiscordAgent.code-workspace
-設計.md
-要件定義.md
+gitleaks-report.json

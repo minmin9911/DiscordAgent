@@ -1,6 +1,16 @@
 import { exec, spawn, type ExecException } from "node:child_process";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
 import { existsSync } from "node:fs";
+import { ATTACH_MAX_BYTES } from "./attachPolicy.js";
+const DISCORD_AGENT_SYSTEM_PROMPT = [
+  "You are running through DiscordAgent.",
+  "DiscordAgent can upload local files to Discord on your behalf.",
+  "Do not ask the user to run !attach. User-side !attach is disabled.",
+  "When file upload is needed, output a standalone command line: !attach <absolute_path>.",
+  "absolute_path is required for reliable path resolution.",
+  `The file size limit is ${ATTACH_MAX_BYTES} bytes (8MB).`,
+  "If a file is larger than 8MB, suggest splitting or compressing first.",
+].join("\n");
 
 export interface CodexResult {
   ok: boolean;
@@ -23,11 +33,19 @@ export class CodexAdapter {
     prompt: string;
     sessionId: string;
     codexThreadId?: string | null;
+    preferredWorkingDirectory?: string | null;
   }): Promise<CodexResult> {
+    const promptWithSystem = this.buildPromptWithSystem(input.prompt);
     if (this.mode === "cli") {
-      return this.runWithCodexCli(input);
+      return this.runWithCodexCli({
+        ...input,
+        prompt: promptWithSystem,
+      });
     }
-    return this.runWithTemplate(input);
+    return this.runWithTemplate({
+      ...input,
+      prompt: promptWithSystem,
+    });
   }
 
   private async runWithTemplate(input: {
@@ -67,6 +85,7 @@ export class CodexAdapter {
   private async runWithCodexCli(input: {
     prompt: string;
     codexThreadId?: string | null;
+    preferredWorkingDirectory?: string | null;
   }): Promise<CodexResult> {
     const args: string[] = [];
     let resolvedCwd: string | undefined;
@@ -75,6 +94,9 @@ export class CodexAdapter {
       if (cwd && existsSync(cwd)) {
         resolvedCwd = cwd;
       }
+    }
+    if (!resolvedCwd && input.preferredWorkingDirectory && existsSync(input.preferredWorkingDirectory)) {
+      resolvedCwd = input.preferredWorkingDirectory;
     }
     if (input.codexThreadId) {
       args.push(
@@ -265,5 +287,9 @@ export class CodexAdapter {
   private escapeForShell(text: string): string {
     // 最低限の安全策としてダブルクォートで囲み、内部のダブルクォートをエスケープする。
     return `"${text.replaceAll(`"`, `\\"`)}"`;
+  }
+
+  private buildPromptWithSystem(userPrompt: string): string {
+    return `${DISCORD_AGENT_SYSTEM_PROMPT}\n\n---\n\n${userPrompt}`;
   }
 }

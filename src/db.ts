@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   codex_thread_id TEXT,
+  preferred_working_directory TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'busy', 'error')),
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -65,11 +66,18 @@ CREATE TABLE IF NOT EXISTS list_context_cache (
   FOREIGN KEY(session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS context_cursors (
+  context_key TEXT PRIMARY KEY,
+  last_message_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used_at ON sessions(last_used_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name);
 CREATE INDEX IF NOT EXISTS idx_sessions_codex_thread_id ON sessions(codex_thread_id);
 CREATE INDEX IF NOT EXISTS idx_executions_session_created ON executions(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(updated_at DESC);
 `;
     this.db.exec(sql);
     this.ensureColumns();
@@ -86,12 +94,19 @@ CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DE
         "CREATE INDEX IF NOT EXISTS idx_sessions_codex_thread_id ON sessions(codex_thread_id)",
       );
     }
+    const hasPreferredWorkingDirectory = columns.some(
+      (c) => c.name === "preferred_working_directory",
+    );
+    if (!hasPreferredWorkingDirectory) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN preferred_working_directory TEXT");
+    }
   }
 
   createSession(input: {
     name: string;
     createdBy: string;
     summary?: string;
+    preferredWorkingDirectory?: string;
   }): SessionRow {
     const id = randomUUID();
     const now = nowIso();
@@ -109,6 +124,9 @@ CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DE
         last_used_at: now,
         summary: input.summary ?? null,
       });
+    if (input.preferredWorkingDirectory) {
+      this.setSessionPreferredWorkingDirectory(id, input.preferredWorkingDirectory);
+    }
 
     return this.getSessionById(id)!;
   }
@@ -196,6 +214,12 @@ CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DE
     this.db
       .prepare("UPDATE sessions SET codex_thread_id = ? WHERE id = ?")
       .run(threadId, sessionId);
+  }
+
+  setSessionPreferredWorkingDirectory(sessionId: string, workingDirectory: string): void {
+    this.db
+      .prepare("UPDATE sessions SET preferred_working_directory = ? WHERE id = ?")
+      .run(workingDirectory, sessionId);
   }
 
   insertExecution(input: {
@@ -327,6 +351,31 @@ CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DE
       .run();
   }
 
+  getContextCursor(contextKey: string): string | null {
+    const row = this.db
+      .prepare(
+        "SELECT last_message_id FROM context_cursors WHERE context_key = ?",
+      )
+      .get(contextKey) as { last_message_id: string } | undefined;
+    return row?.last_message_id ?? null;
+  }
+
+  setContextCursor(contextKey: string, messageId: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO context_cursors (context_key, last_message_id, updated_at)
+         VALUES (@context_key, @last_message_id, @updated_at)
+         ON CONFLICT(context_key) DO UPDATE SET
+           last_message_id = excluded.last_message_id,
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        context_key: contextKey,
+        last_message_id: messageId,
+        updated_at: nowIso(),
+      });
+  }
+
   cancelInFlightExecutionsOnStartup(): number {
     const result = this.db
       .prepare(
@@ -352,5 +401,9 @@ CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DE
       )
       .run(nowIso(), timeoutSec);
     return result.changes;
+  }
+
+  close(): void {
+    this.db.close();
   }
 }

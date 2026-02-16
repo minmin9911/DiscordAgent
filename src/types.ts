@@ -13,6 +13,7 @@ export interface SessionRow {
   name: string;
   codex_thread_id: string | null;
   preferred_working_directory: string | null;
+  attach_instruction_sent_at: string | null;
   status: SessionStatus;
   created_by: string;
   created_at: string;

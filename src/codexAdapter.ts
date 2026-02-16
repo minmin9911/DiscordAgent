@@ -34,8 +34,11 @@ export class CodexAdapter {
     sessionId: string;
     codexThreadId?: string | null;
     preferredWorkingDirectory?: string | null;
+    includeDiscordAgentSystemPrompt?: boolean;
   }): Promise<CodexResult> {
-    const promptWithSystem = this.buildPromptWithSystem(input.prompt);
+    const promptWithSystem = input.includeDiscordAgentSystemPrompt === false
+      ? input.prompt
+      : this.buildPromptWithSystem(input.prompt);
     if (this.mode === "cli") {
       return this.runWithCodexCli({
         ...input,

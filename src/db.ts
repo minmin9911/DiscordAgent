@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   name TEXT NOT NULL,
   codex_thread_id TEXT,
   preferred_working_directory TEXT,
+  attach_instruction_sent_at TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'busy', 'error')),
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -100,6 +101,12 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
     if (!hasPreferredWorkingDirectory) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN preferred_working_directory TEXT");
     }
+    const hasAttachInstructionSentAt = columns.some(
+      (c) => c.name === "attach_instruction_sent_at",
+    );
+    if (!hasAttachInstructionSentAt) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN attach_instruction_sent_at TEXT");
+    }
   }
 
   createSession(input: {
@@ -113,8 +120,8 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
     this.db
       .prepare(
         `INSERT INTO sessions
-         (id, name, status, created_by, created_at, last_used_at, summary, archived_at)
-         VALUES (@id, @name, 'active', @created_by, @created_at, @last_used_at, @summary, NULL)`,
+         (id, name, status, created_by, created_at, last_used_at, summary, archived_at, attach_instruction_sent_at)
+         VALUES (@id, @name, 'active', @created_by, @created_at, @last_used_at, @summary, NULL, NULL)`,
       )
       .run({
         id,
@@ -170,7 +177,12 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
       .prepare(
         `SELECT * FROM sessions
          WHERE status != 'archived'
-           AND (name LIKE @like OR IFNULL(summary, '') LIKE @like)
+           AND (
+             name LIKE @like
+             OR IFNULL(summary, '') LIKE @like
+             OR IFNULL(codex_thread_id, '') LIKE @like
+             OR IFNULL(preferred_working_directory, '') LIKE @like
+           )
          ORDER BY last_used_at DESC
          LIMIT @limit`,
       )
@@ -216,10 +228,30 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
       .run(threadId, sessionId);
   }
 
+  clearSessionCodexThreadId(sessionId: string): void {
+    this.db
+      .prepare("UPDATE sessions SET codex_thread_id = NULL WHERE id = ?")
+      .run(sessionId);
+  }
+
   setSessionPreferredWorkingDirectory(sessionId: string, workingDirectory: string): void {
     this.db
       .prepare("UPDATE sessions SET preferred_working_directory = ? WHERE id = ?")
       .run(workingDirectory, sessionId);
+  }
+
+  setSessionSummary(sessionId: string, summary: string): void {
+    this.db
+      .prepare("UPDATE sessions SET summary = ? WHERE id = ?")
+      .run(summary, sessionId);
+  }
+
+  markAttachInstructionSent(sessionId: string): void {
+    this.db
+      .prepare(
+        "UPDATE sessions SET attach_instruction_sent_at = COALESCE(attach_instruction_sent_at, ?) WHERE id = ?",
+      )
+      .run(nowIso(), sessionId);
   }
 
   insertExecution(input: {

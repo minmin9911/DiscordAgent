@@ -120,25 +120,69 @@ export class SessionService {
     return this.db.getBoundSession(contextKey);
   }
 
+  rebindCurrentSessionCodexThread(input: {
+    contextKey: string;
+    codexThreadId: string;
+    summary?: string;
+    preferredWorkingDirectory?: string;
+  }): { ok: true; session: SessionRow } | { ok: false; code: string } {
+    const current = this.db.getBoundSession(input.contextKey);
+    if (!current) return { ok: false, code: "ERR_ACTIVE_SESSION_NOT_FOUND" };
+
+    const other = this.db.getSessionByCodexThreadId(input.codexThreadId);
+    if (other && other.id !== current.id) {
+      this.db.clearSessionCodexThreadId(other.id);
+    }
+
+    this.db.setSessionCodexThreadId(current.id, input.codexThreadId);
+    if (input.preferredWorkingDirectory) {
+      this.db.setSessionPreferredWorkingDirectory(current.id, input.preferredWorkingDirectory);
+    }
+    if (input.summary) {
+      this.db.setSessionSummary(current.id, this.buildSummary(input.summary) ?? input.summary);
+    }
+
+    const refreshed = this.db.getSessionById(current.id);
+    if (!refreshed) return { ok: false, code: "ERR_DB_READ_FAILED" };
+    return { ok: true, session: refreshed };
+  }
+
   connectCodexThread(input: {
     contextKey: string;
     requesterId: string;
     member: GuildMember | null;
     codexThreadId: string;
+    summary?: string;
+    preferredWorkingDirectory?: string;
   }): { ok: true; session: SessionRow; created: boolean } | { ok: false; code: string } {
     const existing = this.db.getSessionByCodexThreadId(input.codexThreadId);
     if (existing) {
       if (!this.canSwitchSession(input.member, existing, input.requesterId)) {
         return { ok: false, code: "ERR_SWITCH_PERMISSION_DENIED" };
       }
+      if (!existing.preferred_working_directory && input.preferredWorkingDirectory) {
+        this.db.setSessionPreferredWorkingDirectory(
+          existing.id,
+          input.preferredWorkingDirectory,
+        );
+      }
+      if (
+        input.summary &&
+        (!existing.summary || existing.summary.startsWith("linked codex thread:"))
+      ) {
+        this.db.setSessionSummary(existing.id, this.buildSummary(input.summary) ?? input.summary);
+      }
       this.db.bindContext(input.contextKey, existing.id);
-      return { ok: true, session: existing, created: false };
+      const refreshed = this.db.getSessionById(existing.id);
+      if (!refreshed) return { ok: false, code: "ERR_DB_READ_FAILED" };
+      return { ok: true, session: refreshed, created: false };
     }
 
     const created = this.db.createSession({
       name: `codex-${input.codexThreadId.slice(0, 8)}`,
       createdBy: input.requesterId,
-      summary: `linked codex thread: ${input.codexThreadId}`,
+      summary: this.buildSummary(input.summary ?? `linked codex thread: ${input.codexThreadId}`),
+      preferredWorkingDirectory: input.preferredWorkingDirectory,
     });
     this.db.setSessionCodexThreadId(created.id, input.codexThreadId);
     const withThread = this.db.getSessionById(created.id);

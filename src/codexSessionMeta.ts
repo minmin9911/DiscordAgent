@@ -10,6 +10,7 @@ export interface CodexSessionMeta {
   threadId: string;
   cwd: string | null;
   summary: string | null;
+  searchText: string | null;
   updatedAtMs: number;
 }
 
@@ -60,8 +61,20 @@ function parseSessionMeta(sessionFile: string): CodexSessionMeta | null {
   let threadId: string | null = null;
   let cwd: string | null = null;
   let summary: string | null = null;
+  const searchPieces: string[] = [];
 
-  for (const line of lines.slice(0, 250)) {
+  const pushSearchText = (value: string): void => {
+    const t = value.trim();
+    if (!t) return;
+    if (searchPieces.length < 6) {
+      searchPieces.push(t.slice(0, 1000));
+    }
+    if (!summary) {
+      summary = t.slice(0, 120);
+    }
+  };
+
+  for (const line of lines.slice(0, 400)) {
     try {
       const obj = JSON.parse(line) as Record<string, unknown>;
       if (
@@ -81,13 +94,50 @@ function parseSessionMeta(sessionFile: string): CodexSessionMeta | null {
       }
       if (obj.type === "item.completed" && obj.item && typeof obj.item === "object") {
         const item = obj.item as { type?: unknown; text?: unknown; message?: unknown };
-        if (!summary && item.type === "agent_message" && typeof item.text === "string") {
-          summary = item.text.trim().slice(0, 120);
+        if (!summary && item.type === "user_message" && typeof item.text === "string") {
+          pushSearchText(item.text);
           continue;
         }
-        if (!summary && item.type === "user_message" && typeof item.text === "string") {
-          summary = item.text.trim().slice(0, 120);
+        if (!summary && item.type === "agent_message" && typeof item.text === "string") {
+          pushSearchText(item.text);
           continue;
+        }
+      }
+      if (
+        obj.type === "response_item"
+        && obj.payload
+        && typeof obj.payload === "object"
+      ) {
+        const payload = obj.payload as {
+          type?: unknown;
+          role?: unknown;
+          content?: unknown;
+        };
+        if (
+          payload.type === "message"
+          && Array.isArray(payload.content)
+          && (payload.role === "user" || payload.role === "assistant")
+        ) {
+          for (const c of payload.content) {
+            if (!c || typeof c !== "object") continue;
+            const part = c as { type?: unknown; text?: unknown };
+            if (
+              (part.type === "input_text" || part.type === "output_text")
+              && typeof part.text === "string"
+            ) {
+              pushSearchText(part.text);
+            }
+          }
+        }
+      }
+      if (
+        obj.type === "event_msg"
+        && obj.payload
+        && typeof obj.payload === "object"
+      ) {
+        const payload = obj.payload as { type?: unknown; message?: unknown };
+        if (payload.type === "agent_message" && typeof payload.message === "string") {
+          pushSearchText(payload.message);
         }
       }
     } catch {
@@ -106,6 +156,7 @@ function parseSessionMeta(sessionFile: string): CodexSessionMeta | null {
     threadId,
     cwd,
     summary,
+    searchText: searchPieces.length > 0 ? searchPieces.join("\n") : null,
     updatedAtMs: statSync(sessionFile).mtimeMs,
   };
 }
@@ -137,7 +188,9 @@ export function searchCodexSessions(query: string, limit = 20): CodexSessionMeta
   for (const file of collectSessionFiles(sessionsRoot)) {
     const parsed = parseSessionMeta(file);
     if (!parsed) continue;
-    const haystack = `${parsed.threadId} ${parsed.cwd ?? ""} ${parsed.summary ?? ""}`.toLowerCase();
+    const haystack =
+      `${parsed.threadId} ${parsed.cwd ?? ""} ${parsed.summary ?? ""} ${parsed.searchText ?? ""}`
+        .toLowerCase();
     if (!q || haystack.includes(q)) {
       results.push(parsed);
     }
@@ -146,6 +199,16 @@ export function searchCodexSessions(query: string, limit = 20): CodexSessionMeta
   return results
     .sort((a, b) => b.updatedAtMs - a.updatedAtMs)
     .slice(0, Math.max(1, limit));
+}
+
+export function resolveCodexSessionMetaByThreadId(
+  threadId: string,
+): CodexSessionMeta | null {
+  const sessionsRoot = join(homedir(), ".codex", "sessions");
+  if (!existsSync(sessionsRoot)) return null;
+  const sessionFile = findSessionFileByThreadId(sessionsRoot, threadId);
+  if (!sessionFile) return null;
+  return parseSessionMeta(sessionFile);
 }
 
 export function resolveWorkingDirectoryFromThreadId(

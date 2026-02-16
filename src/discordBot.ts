@@ -20,11 +20,13 @@ import { CodexAdapter } from "./codexAdapter.js";
 import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
 import {
+  resolveCodexSessionMetaByThreadId,
   resolveWorkingDirectoryFromThreadId,
   searchCodexSessions,
   type CodexSessionMeta,
 } from "./codexSessionMeta.js";
 import { ATTACH_MAX_BYTES, extractAttachPaths } from "./attachPolicy.js";
+import type { SessionRow } from "./types.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
@@ -51,29 +53,24 @@ function buildCommandReference(): string {
     `${APP_NAME} Command Reference`,
     `build: ${build}`,
     "",
-    "[Basic]",
-    "- Normal message: run on current session",
-    "- !ask <instruction>: run instruction",
-    "- !help: show this reference",
+    "## 基本コマンド",
+    "- !help",
+    "- !ask <instruction>",
+    "  - 「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。",
     "",
-    "[Codex Search]",
-    "- !codex <query>",
-    "  Search ~/.codex/sessions and show candidates",
-    "- !codex pick <no>",
-    "  Select one candidate from the last search result",
-    "",
-    "[Session]",
+    "## セッション管理",
     "- !session new [name]",
-    "- !session connect <codex_thread_id>",
-    "- !session <codex_thread_id>",
-    "- !session list [query]",
-    "- !session switch <id|name|no>",
+    "  - 現在のセッションとの接続を切り、新しいセッションを始めます（Codexのスレッドも新しくなります）。",
     "- !session current",
-    "- !session help",
-    "",
-    "[Notes]",
-    "- Replies include: session: <id> (<name>)",
-    "- !attach is reserved for AI output and blocked for user direct input",
+    "  - 現在のセッションの codex_thread_id / working_directory / status / queue などを表示します。",
+    "- !codex [query]",
+    "  - ~/.codex/sessions を検索して候補表示します（省略時は最新候補）。",
+    "- !codex pick <no>",
+    "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
+    "  - 直前の !codex 結果から番号選択します。",
+    "- !codex session <codex_thread_id>",
+    "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
+    "  - 直接 thread_id を指定します。",
   ].join("\n");
 }
 
@@ -184,6 +181,10 @@ export class DiscordCodexBot {
       );
       if (content === "!help") {
         await msg.reply(buildCommandReference());
+        return;
+      }
+      if (content === "!codex") {
+        await this.handleCodexCommand(msg, "");
         return;
       }
       if (content.startsWith("!codex ")) {
@@ -337,13 +338,33 @@ export class DiscordCodexBot {
 
   private async handleCodexCommand(msg: Message, body: string): Promise<void> {
     const arg = body.trim();
-    if (!arg) {
-      await msg.reply("usage: !codex <query> | !codex pick <no>");
-      return;
-    }
-
     const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
     const cacheKey = this.buildCodexSearchCacheKey(msg.author.id, contextKey);
+    if (/^session$/i.test(arg)) {
+      await msg.reply("usage: !codex session <codex_thread_id>");
+      return;
+    }
+    const sessionMatch = arg.match(/^session\s+(.+)$/i);
+    if (sessionMatch) {
+      const codexThreadId = sessionMatch[1].trim();
+      if (!isUuidLike(codexThreadId)) {
+        await msg.reply("usage: !codex session <codex_thread_id>");
+        return;
+      }
+      const res = this.sessionService.rebindCurrentSessionCodexThread({
+        contextKey,
+        codexThreadId,
+        summary: this.getCodexSummaryHint(codexThreadId) ?? undefined,
+        preferredWorkingDirectory: resolveWorkingDirectoryFromThreadId(codexThreadId) ?? undefined,
+      });
+      if (!res.ok) {
+        await msg.reply(res.code);
+        return;
+      }
+      await msg.reply(`session switched: codex_thread_id=${codexThreadId}`);
+      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
+      return;
+    }
     const pickMatch = arg.match(/^pick\s+(\d+)$/i);
     if (pickMatch) {
       const no = Number(pickMatch[1]);
@@ -353,22 +374,18 @@ export class DiscordCodexBot {
         return;
       }
       const selected = cached[no - 1];
-      const member = msg.member as GuildMember | null;
-      const connectRes = this.sessionService.connectCodexThread({
+      const rebindRes = this.sessionService.rebindCurrentSessionCodexThread({
         contextKey,
-        requesterId: msg.author.id,
-        member,
         codexThreadId: selected.threadId,
+        summary: selected.summary ?? undefined,
+        preferredWorkingDirectory: selected.cwd ?? undefined,
       });
-      if (!connectRes.ok) {
-        await msg.reply(connectRes.code);
+      if (!rebindRes.ok) {
+        await msg.reply(rebindRes.code);
         return;
       }
-      const action = connectRes.created ? "session linked" : "session switched";
-      await msg.reply(
-        `${action}: ${connectRes.session.id} (${connectRes.session.name}) thread=${selected.threadId}`,
-      );
-      await msg.reply(`session: ${connectRes.session.id} (${connectRes.session.name})`);
+      await msg.reply(`session switched: codex_thread_id=${selected.threadId}`);
+      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(rebindRes.session)}`);
       return;
     }
 
@@ -383,8 +400,11 @@ export class DiscordCodexBot {
       const summary = s.summary?.replace(/\s+/g, " ").slice(0, 60) ?? "(no summary)";
       return `${i + 1} | ${s.threadId} | ${this.formatDateTime(s.updatedAtMs)} | ${cwd} | ${summary}`;
     });
-    await msg.reply(
-      `codex sessions (max 20)\n${lines.join("\n")}\npick: !codex pick <no>`,
+    await this.sendMultilineReply(
+      msg,
+      "codex sessions (max 20)",
+      lines,
+      "pick: !codex pick <no>",
     );
   }
   private async handleSessionCommand(msg: Message, body: string): Promise<void> {
@@ -408,8 +428,12 @@ export class DiscordCodexBot {
         member,
       });
       if (localRes.ok) {
-        await msg.reply(`session switched: ${localRes.session.id} (${localRes.session.name})`);
-        await msg.reply(`session: ${localRes.session.id} (${localRes.session.name})`);
+        await msg.reply(
+          `session switched: codex_session=${this.getUserFacingCodexSessionLabel(localRes.session)}`,
+        );
+        await msg.reply(
+          `codex_session: ${this.getUserFacingCodexSessionLabel(localRes.session)}`,
+        );
         return;
       }
       const connectRes = this.sessionService.connectCodexThread({
@@ -417,6 +441,9 @@ export class DiscordCodexBot {
         requesterId: msg.author.id,
         member,
         codexThreadId: shorthandId,
+        summary: this.getCodexSummaryHint(shorthandId) ?? undefined,
+        preferredWorkingDirectory:
+          resolveWorkingDirectoryFromThreadId(shorthandId) ?? undefined,
       });
       if (!connectRes.ok) {
         await msg.reply(connectRes.code);
@@ -424,16 +451,14 @@ export class DiscordCodexBot {
       }
       if (connectRes.created) {
         await msg.reply(
-          `session linked: ${connectRes.session.id} (${connectRes.session.name}) thread=${shorthandId}`,
+          `session linked: codex_thread_id=${shorthandId}`,
         );
       } else {
         await msg.reply(
-          `session switched: ${connectRes.session.id} (${connectRes.session.name}) thread=${shorthandId}`,
+          `session switched: codex_thread_id=${shorthandId}`,
         );
       }
-      await msg.reply(
-        `session: ${connectRes.session.id} (${connectRes.session.name})`,
-      );
+      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(connectRes.session)}`);
       return;
     }
 
@@ -447,6 +472,8 @@ export class DiscordCodexBot {
         requesterId: msg.author.id,
         member,
         codexThreadId: arg,
+        summary: this.getCodexSummaryHint(arg) ?? undefined,
+        preferredWorkingDirectory: resolveWorkingDirectoryFromThreadId(arg) ?? undefined,
       });
       if (!connectRes.ok) {
         await msg.reply(connectRes.code);
@@ -454,14 +481,14 @@ export class DiscordCodexBot {
       }
       if (connectRes.created) {
         await msg.reply(
-          `session linked: ${connectRes.session.id} (${connectRes.session.name}) thread=${arg}`,
+          `session linked: codex_thread_id=${arg}`,
         );
       } else {
         await msg.reply(
-          `session switched: ${connectRes.session.id} (${connectRes.session.name}) thread=${arg}`,
+          `session switched: codex_thread_id=${arg}`,
         );
       }
-      await msg.reply(`session: ${connectRes.session.id} (${connectRes.session.name})`);
+      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(connectRes.session)}`);
       return;
     }
 
@@ -477,11 +504,11 @@ export class DiscordCodexBot {
         name: arg || undefined,
         preferredWorkingDirectory: inheritedWorkingDirectory ?? undefined,
       });
-      await msg.reply(`session created: ${created.id} (${created.name})`);
+      await msg.reply("session created");
       if (inheritedWorkingDirectory) {
         await msg.reply(`working_directory inherited: ${inheritedWorkingDirectory}`);
       }
-      await msg.reply(`session: ${created.id} (${created.name})`);
+      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(created)}`);
       return;
     }
 
@@ -497,7 +524,7 @@ export class DiscordCodexBot {
       }
       const lines = sessions.map(
         (s, i) =>
-          `${i + 1} | ${s.id} | ${s.name} | ${s.status} | ${s.last_used_at}`,
+          `${i + 1} | ${this.getUserFacingCodexSessionLabel(s)} | ${s.status} | ${s.last_used_at}`,
       );
       await msg.reply(`sessions (max 20)\n${lines.join("\n")}`);
       return;
@@ -520,8 +547,10 @@ export class DiscordCodexBot {
           await msg.reply(res.code);
           return;
         }
-        await msg.reply(`session switched: ${res.session.id} (${res.session.name})`);
-        await msg.reply(`session: ${res.session.id} (${res.session.name})`);
+        await msg.reply(
+          `session switched: codex_session=${this.getUserFacingCodexSessionLabel(res.session)}`,
+        );
+        await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
         return;
       }
       const looksLikeId = isUuidLike(arg);
@@ -532,12 +561,29 @@ export class DiscordCodexBot {
           requesterId: msg.author.id,
           member,
         });
-        if (!res.ok) {
-          await msg.reply(res.code);
+        if (res.ok) {
+          await msg.reply(
+            `session switched: codex_session=${this.getUserFacingCodexSessionLabel(res.session)}`,
+          );
+          await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
           return;
         }
-        await msg.reply(`session switched: ${res.session.id} (${res.session.name})`);
-        await msg.reply(`session: ${res.session.id} (${res.session.name})`);
+        const connectRes = this.sessionService.connectCodexThread({
+          contextKey,
+          requesterId: msg.author.id,
+          member,
+          codexThreadId: arg,
+          summary: this.getCodexSummaryHint(arg) ?? undefined,
+          preferredWorkingDirectory: resolveWorkingDirectoryFromThreadId(arg) ?? undefined,
+        });
+        if (!connectRes.ok) {
+          await msg.reply(connectRes.code);
+          return;
+        }
+        await msg.reply(
+          `session switched: codex_session=${this.getUserFacingCodexSessionLabel(connectRes.session)}`,
+        );
+        await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(connectRes.session)}`);
         return;
       }
       const res = this.sessionService.switchByName({
@@ -560,8 +606,10 @@ export class DiscordCodexBot {
         await msg.reply(res.code);
         return;
       }
-      await msg.reply(`session switched: ${res.session.id} (${res.session.name})`);
-      await msg.reply(`session: ${res.session.id} (${res.session.name})`);
+      await msg.reply(
+        `session switched: codex_session=${this.getUserFacingCodexSessionLabel(res.session)}`,
+      );
+      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
       return;
     }
 
@@ -580,10 +628,8 @@ export class DiscordCodexBot {
           )
         : (current.preferred_working_directory ?? "(not linked yet)");
       const lines = [
-        `session_id: ${current.id}`,
         `codex_thread_id: ${current.codex_thread_id ?? "(not linked yet)"}`,
         `working_directory: ${workingDirectory}`,
-        `name: ${current.name}`,
         `status: ${current.status}`,
         `queue_length: ${runtime.queueLength}`,
         `last_used_at: ${current.last_used_at}`,
@@ -593,7 +639,7 @@ export class DiscordCodexBot {
       return;
     }
 
-    await msg.reply("usage: !session <new|list|switch|connect|current|help|<codex_thread_id>> ...");
+    await msg.reply("usage: !session <new|current> ...");
   }
 
   private async handleExecutionMessage(msg: Message, content: string): Promise<void> {
@@ -639,7 +685,7 @@ export class DiscordCodexBot {
       text: content,
       maxRetries: 1,
       onQueued: async (position) => {
-        const text = `queued (#${position}) session: ${session.id} (${session.name})`;
+        const text = `queued (#${position}) codex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
         try {
           await msg.reply(text);
         } catch {
@@ -647,7 +693,8 @@ export class DiscordCodexBot {
         }
       },
       onProgress: async (elapsedSec, queueLength) => {
-        const progressText = `running... elapsed=${elapsedSec}s queue=${queueLength} session: ${session.id} (${session.name})`;
+        const progressText =
+          `running... elapsed=${elapsedSec}s queue=${queueLength} codex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
         if (!progressMessageId) {
           const sent = await sendChannel.send(progressText);
           progressMessageId = sent.id;
@@ -663,6 +710,11 @@ export class DiscordCodexBot {
       },
       run: async () => {
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
+        const shouldInjectAttachInstruction = !session.attach_instruction_sent_at;
+        if (shouldInjectAttachInstruction) {
+          this.db.markAttachInstructionSent(session.id);
+          session.attach_instruction_sent_at = new Date().toISOString();
+        }
         this.logger.info(
           { executionId, sessionId: session.id, codexThreadId: session.codex_thread_id },
           "execution started",
@@ -672,6 +724,7 @@ export class DiscordCodexBot {
           sessionId: session.id,
           codexThreadId: session.codex_thread_id,
           preferredWorkingDirectory: session.preferred_working_directory,
+          includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
         });
         this.logger.info(
           {
@@ -731,7 +784,9 @@ export class DiscordCodexBot {
         const parsed = extractAttachPaths(output);
         const body = parsed.cleanedOutput || "(no output)";
         const chunks = splitIntoChunks(body, appConfig.messageChunkSize);
-        await sendChannel.send(`session: ${session.id} (${session.name})`);
+        await sendChannel.send(
+          `codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+        );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
         }
@@ -790,6 +845,50 @@ export class DiscordCodexBot {
       } catch {
         await sendChannel.send(`ERR_ATTACH_UPLOAD_FAILED: ${filePath}`);
       }
+    }
+  }
+
+  private getCodexSummaryHint(codexThreadId: string): string | null {
+    const meta = resolveCodexSessionMetaByThreadId(codexThreadId);
+    const summary = meta?.summary?.trim();
+    if (!summary) return null;
+    return summary.slice(0, 120);
+  }
+
+  private getUserFacingCodexSessionLabel(session: SessionRow): string {
+    return session.codex_thread_id ?? "(not linked yet)";
+  }
+
+  private async sendMultilineReply(
+    msg: Message,
+    header: string,
+    lines: string[],
+    footer?: string,
+  ): Promise<void> {
+    const MAX = 1800;
+    const blocks: string[] = [];
+    let current = `${header}\n`;
+    for (const line of lines) {
+      const next = `${current}${line}\n`;
+      if (next.length > MAX && current !== `${header}\n`) {
+        blocks.push(current.trimEnd());
+        current = `${header}\n${line}\n`;
+      } else {
+        current = next;
+      }
+    }
+    if (footer) {
+      const withFooter = `${current}${footer}`;
+      if (withFooter.length <= MAX) {
+        current = withFooter;
+      } else {
+        blocks.push(current.trimEnd());
+        current = `${header}\n${footer}`;
+      }
+    }
+    blocks.push(current.trimEnd());
+    for (const block of blocks) {
+      await msg.reply(block);
     }
   }
 }

@@ -23,6 +23,9 @@ export interface CodexResult {
 }
 
 export class CodexAdapter {
+  private readonly activeChildPids = new Set<number>();
+  private readonly pidToThreadId = new Map<number, string>();
+
   constructor(
     private readonly mode: "cli" | "template",
     private readonly commandTemplate: string,
@@ -49,6 +52,19 @@ export class CodexAdapter {
       ...input,
       prompt: promptWithSystem,
     });
+  }
+
+  emergencyStopAllRunning(): number {
+    const pids = [...this.activeChildPids];
+    for (const pid of pids) {
+      this.killProcessTree(pid);
+    }
+    return pids.length;
+  }
+
+  getActiveCodexThreadIds(): string[] {
+    this.pruneDeadTrackedProcesses();
+    return [...new Set(this.pidToThreadId.values())];
   }
 
   private async runWithTemplate(input: {
@@ -136,6 +152,12 @@ export class CodexAdapter {
         windowsHide: true,
         cwd: resolvedCwd,
       });
+      if (child.pid) {
+        this.activeChildPids.add(child.pid);
+        if (input.codexThreadId) {
+          this.pidToThreadId.set(child.pid, input.codexThreadId);
+        }
+      }
       let stdout = "";
       let stderr = "";
       let timedOut = false;
@@ -156,14 +178,22 @@ export class CodexAdapter {
       }
       child.on("error", (err) => {
         clearTimeout(timer);
+        if (child.pid) {
+          this.activeChildPids.delete(child.pid);
+          this.pidToThreadId.delete(child.pid);
+        }
         resolve({
           ok: false,
           output: err.message,
           errorCode: "ERR_CODEX_EXEC_FAILED",
         });
       });
-      child.on("close", () => {
+      child.on("close", (code) => {
         clearTimeout(timer);
+        if (child.pid) {
+          this.activeChildPids.delete(child.pid);
+          this.pidToThreadId.delete(child.pid);
+        }
         if (timedOut) {
           resolve({
             ok: false,
@@ -185,7 +215,7 @@ export class CodexAdapter {
           });
           return;
         }
-        if (parsed.errors.length > 0) {
+        if (parsed.errors.length > 0 && parsed.agentMessages.length === 0) {
           resolve({
             ok: false,
             output: parsed.errors.join("\n"),
@@ -196,15 +226,19 @@ export class CodexAdapter {
           });
           return;
         }
-        const output = this.sanitizeOutput(
-          parsed.agentMessages.join("\n") || fallback || "(no output)",
-        );
+        const mergedWarnings = parsed.errors.length > 0
+          ? [...parsed.warnings, ...parsed.errors]
+          : parsed.warnings;
+        const output = this.selectUserOutput(parsed.agentMessages, fallback);
+        const outputWithCode = code && code !== 0
+          ? `${output}\n\n[warning] codex exited with code ${code}, but a response was received.`
+          : output;
         resolve({
           ok: true,
-          output,
+          output: outputWithCode,
           threadId: parsed.threadId,
           workingDirectoryUsed: resolvedCwd,
-          warnings: parsed.warnings,
+          warnings: mergedWarnings,
         });
       });
     });
@@ -226,6 +260,26 @@ export class CodexAdapter {
       process.kill(pid, "SIGKILL");
     } catch {
       // 既に終了済みの場合は無視。
+    }
+  }
+
+  private pruneDeadTrackedProcesses(): void {
+    const pids = [...this.activeChildPids];
+    for (const pid of pids) {
+      if (this.isProcessAlive(pid)) continue;
+      this.activeChildPids.delete(pid);
+      this.pidToThreadId.delete(pid);
+    }
+  }
+
+  private isProcessAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EPERM") return true;
+      return false;
     }
   }
 
@@ -277,7 +331,9 @@ export class CodexAdapter {
     return (
       message.includes("Under-development features enabled:") ||
       message.includes("suppress_unstable_features_warning") ||
-      message.includes("state db missing rollout path")
+      message.includes("state db missing rollout path") ||
+      message.includes("Falling back from WebSockets to HTTPS transport") ||
+      message.includes("stream disconnected before completion")
     );
   }
 
@@ -285,6 +341,11 @@ export class CodexAdapter {
     const lines = text.split(/\r?\n/);
     const cleaned = lines.filter((line) => !this.isKnownWarning(line.trim()));
     return cleaned.join("\n").trim();
+  }
+
+  private selectUserOutput(agentMessages: string[], fallback: string): string {
+    const agentText = agentMessages.join("\n").trim();
+    return agentText || fallback || "(no output)";
   }
 
   private escapeForShell(text: string): string {

@@ -6,6 +6,7 @@ dotenv();
 const schema = z.object({
   DISCORD_TOKEN: z.string().min(1),
   ALLOWED_CHANNEL_IDS: z.string().min(1),
+  ALLOWED_USER_IDS: z.string().optional().default(""),
   SQLITE_PATH: z.string().default("./data/app.db"),
   LOG_LEVEL: z.string().default("info"),
   CODEX_EXEC_TEMPLATE: z
@@ -22,6 +23,11 @@ export const appConfig = {
   discordToken: parsed.DISCORD_TOKEN,
   allowedChannelIds: new Set(
     parsed.ALLOWED_CHANNEL_IDS.split(",")
+      .map((v) => v.trim())
+      .filter(Boolean),
+  ),
+  allowedUserIds: new Set(
+    parsed.ALLOWED_USER_IDS.split(",")
       .map((v) => v.trim())
       .filter(Boolean),
   ),

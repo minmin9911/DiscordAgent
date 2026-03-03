@@ -57,6 +57,12 @@ function buildCommandReference(): string {
     "- !help",
     "- !ask <instruction>",
     "  - 「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。",
+    "- !queue",
+    "  - 実行キューの状況を表示します。",
+    "- !queue stopall",
+    "  - 全キューを緊急停止します（待機中は取消、実行中は強制停止）。",
+    "- !queue fix",
+    "  - running孤児（プロセス不在）を修復します。",
     "",
     "## セッション管理",
     "- !session new [name]",
@@ -142,6 +148,11 @@ export class DiscordCodexBot {
     return false;
   }
 
+  private isAllowedUser(msg: Message): boolean {
+    if (appConfig.allowedUserIds.size === 0) return true;
+    return appConfig.allowedUserIds.has(msg.author.id);
+  }
+
   private async handleMessage(msg: Message): Promise<void> {
     if (msg.author.bot) return;
     if (msg.system) return;
@@ -168,6 +179,14 @@ export class DiscordCodexBot {
 
     const contextKey = this.sessionService.buildContextKey(msg.guildId, msg.channelId);
     try {
+      if (!this.isAllowedUser(msg)) {
+        this.logger.warn(
+          { userId: msg.author.id, channelId: msg.channelId, guildId: msg.guildId },
+          "user rejected by allowlist",
+        );
+        await msg.reply("ERR_USER_NOT_ALLOWED");
+        return;
+      }
       const content = msg.content.trim();
       if (!content) return;
       this.logger.info(
@@ -197,6 +216,14 @@ export class DiscordCodexBot {
       }
       if (content.startsWith("!ask ")) {
         await this.handleExecutionMessage(msg, content.slice("!ask ".length).trim());
+        return;
+      }
+      if (content === "!queue") {
+        await this.handleQueueCommand(msg, "");
+        return;
+      }
+      if (content.startsWith("!queue ")) {
+        await this.handleQueueCommand(msg, content.slice("!queue ".length).trim());
         return;
       }
       if (content.startsWith("!attach ")) {
@@ -336,6 +363,10 @@ export class DiscordCodexBot {
     return new Date(ms).toISOString().replace("T", " ").slice(0, 19);
   }
 
+  private getExecutionLockKey(session: SessionRow): string {
+    return session.codex_thread_id ? `codex:${session.codex_thread_id}` : `session:${session.id}`;
+  }
+
   private async handleCodexCommand(msg: Message, body: string): Promise<void> {
     const arg = body.trim();
     const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
@@ -353,6 +384,7 @@ export class DiscordCodexBot {
       }
       const res = this.sessionService.rebindCurrentSessionCodexThread({
         contextKey,
+        requesterId: msg.author.id,
         codexThreadId,
         summary: this.getCodexSummaryHint(codexThreadId) ?? undefined,
         preferredWorkingDirectory: resolveWorkingDirectoryFromThreadId(codexThreadId) ?? undefined,
@@ -376,6 +408,7 @@ export class DiscordCodexBot {
       const selected = cached[no - 1];
       const rebindRes = this.sessionService.rebindCurrentSessionCodexThread({
         contextKey,
+        requesterId: msg.author.id,
         codexThreadId: selected.threadId,
         summary: selected.summary ?? undefined,
         preferredWorkingDirectory: selected.cwd ?? undefined,
@@ -619,7 +652,8 @@ export class DiscordCodexBot {
         await msg.reply("ERR_ACTIVE_SESSION_NOT_FOUND");
         return;
       }
-      const runtime = this.manager.getRuntimeState(current.id);
+      const lockKey = this.getExecutionLockKey(current);
+      const runtime = this.manager.getRuntimeState(lockKey);
       const workingDirectory = current.codex_thread_id
         ? (
             resolveWorkingDirectoryFromThreadId(current.codex_thread_id)
@@ -630,6 +664,7 @@ export class DiscordCodexBot {
       const lines = [
         `codex_thread_id: ${current.codex_thread_id ?? "(not linked yet)"}`,
         `working_directory: ${workingDirectory}`,
+        `queue_lock_key: ${lockKey}`,
         `status: ${current.status}`,
         `queue_length: ${runtime.queueLength}`,
         `last_used_at: ${current.last_used_at}`,
@@ -669,10 +704,12 @@ export class DiscordCodexBot {
     }
     const sendChannel = msg.channel;
     let progressMessageId: string | null = null;
+    const executionLockKey = this.getExecutionLockKey(session);
     this.logger.info(
       {
         executionId,
         sessionId: session.id,
+        lockKey: executionLockKey,
         channelId: msg.channelId,
         userId: msg.author.id,
       },
@@ -682,6 +719,7 @@ export class DiscordCodexBot {
     const result = await this.manager.enqueue({
       executionId,
       sessionId: session.id,
+      lockKey: executionLockKey,
       text: content,
       maxRetries: 1,
       onQueued: async (position) => {
@@ -802,6 +840,102 @@ export class DiscordCodexBot {
       });
       await msg.reply(result.code);
     }
+  }
+
+  private async handleQueueCommand(msg: Message, body: string): Promise<void> {
+    const sub = body.trim().toLowerCase();
+    if (sub === "stopall") {
+      this.manager.drainPendingAll();
+      const killed = this.codex.emergencyStopAllRunning();
+      const canceled = this.db.cancelAllInFlightExecutions("ERR_EMERGENCY_STOP");
+      this.logger.warn(
+        {
+          by: msg.author.id,
+          canceled,
+          killed,
+        },
+        "queue emergency stopall requested",
+      );
+      await msg.reply(
+        [
+          "queue stopall executed",
+          `cancelled_inflight: ${canceled}`,
+          `killed_running_processes: ${killed}`,
+        ].join("\n"),
+      );
+      return;
+    }
+    if (sub === "fix") {
+      const inFlight = this.db.listInFlightExecutions(1000);
+      const running = inFlight.filter((v) => v.result_status === "running");
+      const activeThreadIds = new Set(this.codex.getActiveCodexThreadIds());
+      const orphanIds = running
+        .filter((v) => v.codex_thread_id && !activeThreadIds.has(v.codex_thread_id))
+        .map((v) => v.id);
+      const fixed = this.db.cancelExecutionsByIds(
+        orphanIds,
+        "ERR_QUEUE_FIXED_ORPHAN_RUNNING",
+      );
+      this.logger.warn(
+        {
+          by: msg.author.id,
+          checkedRunning: running.length,
+          fixed,
+          activeThreads: [...activeThreadIds],
+        },
+        "queue fix requested",
+      );
+      await msg.reply(
+        [
+          "queue fix executed",
+          `checked_running: ${running.length}`,
+          `fixed_orphan_running: ${fixed}`,
+          `active_codex_threads: ${activeThreadIds.size}`,
+        ].join("\n"),
+      );
+      return;
+    }
+
+    if (sub.length > 0 && sub !== "status") {
+      await msg.reply("usage: !queue [status|stopall|fix]");
+      return;
+    }
+
+    const snapshots = this.manager.getQueueSnapshots();
+    const inFlight = this.db.listInFlightExecutions(100);
+    if (snapshots.length === 0 && inFlight.length === 0) {
+      await msg.reply("queue status\n(no queued/running tasks)");
+      return;
+    }
+
+    const lines: string[] = [];
+    for (const s of snapshots) {
+      lines.push(
+        [
+          `${s.lockKey}`,
+          `running=${s.running ? "yes" : "no"}`,
+          `queued=${s.queued}`,
+          `running_since=${s.runningSince ?? "-"}`,
+        ].join(" | "),
+      );
+    }
+    lines.push("---");
+    for (const e of inFlight) {
+      const lockKey = e.codex_thread_id
+        ? `codex:${e.codex_thread_id}`
+        : `session:${e.session_id}`;
+      lines.push(
+        [
+          e.result_status,
+          e.id,
+          lockKey,
+          `session=${e.session_name}`,
+          `created=${e.created_at}`,
+          `started=${e.started_at ?? "-"}`,
+        ].join(" | "),
+      );
+    }
+    await this.sendMultilineReply(msg, "queue status", lines);
   }
 
   private async handleAttachCommands(

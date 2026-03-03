@@ -122,12 +122,21 @@ export class SessionService {
 
   rebindCurrentSessionCodexThread(input: {
     contextKey: string;
+    requesterId?: string;
     codexThreadId: string;
     summary?: string;
     preferredWorkingDirectory?: string;
   }): { ok: true; session: SessionRow } | { ok: false; code: string } {
-    const current = this.db.getBoundSession(input.contextKey);
-    if (!current) return { ok: false, code: "ERR_ACTIVE_SESSION_NOT_FOUND" };
+    let current = this.db.getBoundSession(input.contextKey);
+    if (!current) {
+      if (!input.requesterId) return { ok: false, code: "ERR_ACTIVE_SESSION_NOT_FOUND" };
+      current = this.createAndBindSession({
+        contextKey: input.contextKey,
+        requesterId: input.requesterId,
+        firstMessageHint: input.summary ?? `codex-${input.codexThreadId.slice(0, 8)}`,
+        preferredWorkingDirectory: input.preferredWorkingDirectory,
+      });
+    }
 
     const other = this.db.getSessionByCodexThreadId(input.codexThreadId);
     if (other && other.id !== current.id) {

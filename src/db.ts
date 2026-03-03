@@ -438,4 +438,79 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
   close(): void {
     this.db.close();
   }
+
+  listInFlightExecutions(limit = 100): Array<{
+    id: string;
+    session_id: string;
+    session_name: string;
+    codex_thread_id: string | null;
+    result_status: ExecutionStatus;
+    created_at: string;
+    started_at: string | null;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT
+           e.id,
+           e.session_id,
+           s.name AS session_name,
+           s.codex_thread_id,
+           e.result_status,
+           e.created_at,
+           e.started_at
+         FROM executions e
+         JOIN sessions s ON s.id = e.session_id
+         WHERE e.result_status IN ('queued', 'running')
+         ORDER BY e.created_at ASC
+         LIMIT ?`,
+      )
+      .all(limit) as Array<{
+      id: string;
+      session_id: string;
+      session_name: string;
+      codex_thread_id: string | null;
+      result_status: ExecutionStatus;
+      created_at: string;
+      started_at: string | null;
+    }>;
+  }
+
+  cancelExecutionsByIds(ids: string[], errorCode: string): number {
+    if (ids.length === 0) return 0;
+    const tx = this.db.transaction((targetIds: string[]) => {
+      let changed = 0;
+      const stmt = this.db.prepare(
+        `UPDATE executions
+         SET result_status = 'cancelled',
+             error_code = @error_code,
+             ended_at = @ended_at
+         WHERE id = @id
+           AND result_status IN ('queued', 'running')`,
+      );
+      const endedAt = nowIso();
+      for (const id of targetIds) {
+        const result = stmt.run({
+          id,
+          error_code: errorCode,
+          ended_at: endedAt,
+        });
+        changed += result.changes;
+      }
+      return changed;
+    });
+    return tx(ids);
+  }
+
+  cancelAllInFlightExecutions(errorCode: string): number {
+    const result = this.db
+      .prepare(
+        `UPDATE executions
+         SET result_status = 'cancelled',
+             error_code = ?,
+             ended_at = ?
+         WHERE result_status IN ('queued', 'running')`,
+      )
+      .run(errorCode, nowIso());
+    return result.changes;
+  }
 }

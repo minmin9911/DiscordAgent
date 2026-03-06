@@ -444,6 +444,7 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
     session_id: string;
     session_name: string;
     codex_thread_id: string | null;
+    preferred_working_directory: string | null;
     result_status: ExecutionStatus;
     created_at: string;
     started_at: string | null;
@@ -455,6 +456,7 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
            e.session_id,
            s.name AS session_name,
            s.codex_thread_id,
+           s.preferred_working_directory,
            e.result_status,
            e.created_at,
            e.started_at
@@ -469,6 +471,7 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
       session_id: string;
       session_name: string;
       codex_thread_id: string | null;
+      preferred_working_directory: string | null;
       result_status: ExecutionStatus;
       created_at: string;
       started_at: string | null;

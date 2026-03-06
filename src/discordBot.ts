@@ -9,8 +9,9 @@ import {
   type GuildMember,
   type Message,
 } from "discord.js";
-import { existsSync, statSync } from "node:fs";
-import { isAbsolute } from "node:path";
+import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
+import { isAbsolute, join, resolve } from "node:path";
 import pino from "pino";
 import { AppDb } from "./db.js";
 import { SessionService } from "./sessionService.js";
@@ -26,6 +27,10 @@ import {
   type CodexSessionMeta,
 } from "./codexSessionMeta.js";
 import { ATTACH_MAX_BYTES, extractAttachPaths } from "./attachPolicy.js";
+import {
+  buildPromptWithIncomingAttachments,
+  sanitizeAttachmentFileName,
+} from "./incomingAttachmentPolicy.js";
 import type { SessionRow } from "./types.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
@@ -117,9 +122,13 @@ export class DiscordCodexBot {
   async start(): Promise<void> {
     this.client.once("clientReady", () => {
       this.logger.info({ user: this.client.user?.tag }, "bot ready");
+      this.cleanupIncomingAttachments("startup");
       this.recoverUnreadForAllContexts("client_ready").catch((err) => {
         this.logger.error({ err }, "unread recovery on ready failed");
       });
+      setInterval(() => {
+        this.cleanupIncomingAttachments("periodic");
+      }, 60 * 60 * 1000);
       setInterval(() => {
         this.recoverUnreadForAllContexts("polling").catch((err) => {
           this.logger.warn({ err }, "unread recovery by polling failed");
@@ -704,6 +713,73 @@ export class DiscordCodexBot {
     }
     const sendChannel = msg.channel;
     let progressMessageId: string | null = null;
+    let finalized = false;
+    let lastProgressEditAtMs = 0;
+    const seenAgentItemIds = new Set<string>();
+    const streamAgentMessages: string[] = [];
+    const streamHistory: string[] = [];
+    const STREAM_HISTORY_MAX = 8;
+    const MAX_PROGRESS_LEN = 1800;
+    const normalizeStreamPreview = (text: string): string => text
+      .replace(/\r?\n+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 240);
+    const addStreamHistory = (entry: string): void => {
+      if (!entry) return;
+      const prev = streamHistory[streamHistory.length - 1];
+      if (prev === entry) return;
+      streamHistory.push(entry);
+      if (streamHistory.length > STREAM_HISTORY_MAX) {
+        streamHistory.splice(0, streamHistory.length - STREAM_HISTORY_MAX);
+      }
+    };
+    const composeStatusText = (statusLine: string): string => {
+      const lines = [statusLine];
+      if (streamHistory.length > 0) {
+        lines.push("stream_log:");
+        for (let i = 0; i < streamHistory.length; i += 1) {
+          lines.push(`${i + 1}. ${streamHistory[i]}`);
+        }
+      }
+      const merged = lines.join("\n");
+      if (merged.length <= MAX_PROGRESS_LEN) return merged;
+      return `${merged.slice(0, MAX_PROGRESS_LEN - 30)}\n...(truncated)`;
+    };
+    const editProgressMessage = async (text: string): Promise<void> => {
+      if (finalized) return;
+      const now = Date.now();
+      if (now - lastProgressEditAtMs < 1000) return;
+      lastProgressEditAtMs = now;
+      if (!progressMessageId) {
+        const sent = await sendChannel.send(text);
+        progressMessageId = sent.id;
+        return;
+      }
+      try {
+        const prev = await sendChannel.messages.fetch(progressMessageId);
+        await prev.edit(text);
+      } catch {
+        const sent = await sendChannel.send(text);
+        progressMessageId = sent.id;
+      }
+    };
+    const sendOrEditFinal = async (text: string): Promise<void> => {
+      finalized = true;
+      if (!progressMessageId) {
+        const sent = await sendChannel.send(text);
+        progressMessageId = sent.id;
+        return;
+      }
+      try {
+        const prev = await sendChannel.messages.fetch(progressMessageId);
+        await prev.edit(text);
+      } catch {
+        await sendChannel.send(text);
+      }
+    };
+    const incomingPaths = await this.saveIncomingAttachments(msg, session.id);
+    const prompt = buildPromptWithIncomingAttachments(content, incomingPaths);
     const executionLockKey = this.getExecutionLockKey(session);
     this.logger.info(
       {
@@ -731,20 +807,12 @@ export class DiscordCodexBot {
         }
       },
       onProgress: async (elapsedSec, queueLength) => {
+        if (finalized) return;
         const progressText =
-          `running... elapsed=${elapsedSec}s queue=${queueLength} codex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
-        if (!progressMessageId) {
-          const sent = await sendChannel.send(progressText);
-          progressMessageId = sent.id;
-          return;
-        }
-        try {
-          const prev = await sendChannel.messages.fetch(progressMessageId);
-          await prev.edit(progressText);
-        } catch {
-          const sent = await sendChannel.send(progressText);
-          progressMessageId = sent.id;
-        }
+          composeStatusText(
+            `running... elapsed=${elapsedSec}s queue=${queueLength} codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+          );
+        await editProgressMessage(progressText);
       },
       run: async () => {
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
@@ -758,11 +826,43 @@ export class DiscordCodexBot {
           "execution started",
         );
         const runResult = await this.codex.run({
-          prompt: content,
+          prompt,
           sessionId: session.id,
           codexThreadId: session.codex_thread_id,
           preferredWorkingDirectory: session.preferred_working_directory,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
+          onEvent: async (event) => {
+            if (finalized) return;
+            if (event.type === "turn.started") {
+              await editProgressMessage(
+                composeStatusText(
+                  `running... phase=turn.started codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+                ),
+              );
+            }
+          },
+          onAgentMessage: async ({ itemId, text }) => {
+            if (finalized) return;
+            if (seenAgentItemIds.has(itemId)) return;
+            seenAgentItemIds.add(itemId);
+            streamAgentMessages.push(text);
+            const preview = normalizeStreamPreview(text);
+            const previewText = preview.length > 0
+              ? `${preview}${text.length > preview.length ? " ..." : ""}`
+              : "(empty)";
+            addStreamHistory(previewText);
+            await editProgressMessage(
+              composeStatusText(
+                `running... phase=agent_message codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+              ),
+            );
+          },
+          onStdErrLine: async (line) => {
+            this.logger.debug(
+              { executionId, sessionId: session.id, line },
+              "codex stderr stream line",
+            );
+          },
         });
         this.logger.info(
           {
@@ -809,6 +909,7 @@ export class DiscordCodexBot {
         return { status: "success" as const, output: runResult.output };
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
+        if (finalized) return;
         this.db.updateExecutionStatus(executionId, status, {
           errorCode,
           retryCount: retries,
@@ -820,10 +921,16 @@ export class DiscordCodexBot {
         );
 
         const parsed = extractAttachPaths(output);
-        const body = parsed.cleanedOutput || "(no output)";
+        const streamBody = streamAgentMessages.join("\n").trim();
+        const body = streamBody || parsed.cleanedOutput || "(no output)";
         const chunks = splitIntoChunks(body, appConfig.messageChunkSize);
-        await sendChannel.send(
-          `codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+        const sessionLabel = this.getUserFacingCodexSessionLabel(session);
+        const historyLines = streamHistory.map((v, i) => `${i + 1}. ${v}`);
+        const historyBlock = historyLines.length > 0
+          ? `stream_log:\n${historyLines.join("\n")}\n`
+          : "";
+        await sendOrEditFinal(
+          `codex_session: ${sessionLabel}\n${historyBlock}complete: body is sent in next message(s)`,
         );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
@@ -924,18 +1031,128 @@ export class DiscordCodexBot {
       const lockKey = e.codex_thread_id
         ? `codex:${e.codex_thread_id}`
         : `session:${e.session_id}`;
+      const workingDirectory = e.codex_thread_id
+        ? (
+            resolveWorkingDirectoryFromThreadId(e.codex_thread_id)
+            ?? e.preferred_working_directory
+            ?? "(unknown)"
+          )
+        : (e.preferred_working_directory ?? "(not linked yet)");
       lines.push(
         [
           e.result_status,
           e.id,
           lockKey,
           `session=${e.session_name}`,
+          `working_directory=${workingDirectory}`,
           `created=${e.created_at}`,
           `started=${e.started_at ?? "-"}`,
         ].join(" | "),
       );
     }
     await this.sendMultilineReply(msg, "queue status", lines);
+  }
+
+  private async saveIncomingAttachments(msg: Message, sessionId: string): Promise<string[]> {
+    if (msg.attachments.size === 0) return [];
+    const root = resolve(appConfig.incomingAttachDir);
+    const sessionDir = join(root, sessionId);
+    mkdirSync(sessionDir, { recursive: true });
+    const saved: string[] = [];
+    for (const attachment of msg.attachments.values()) {
+      if (attachment.size > appConfig.incomingAttachMaxBytes) {
+        this.logger.warn(
+          {
+            sessionId,
+            name: attachment.name,
+            size: attachment.size,
+            limit: appConfig.incomingAttachMaxBytes,
+          },
+          "incoming attachment skipped: too large",
+        );
+        continue;
+      }
+      const safeName = sanitizeAttachmentFileName(
+        attachment.name ?? `${attachment.id}.bin`,
+      );
+      const targetPath = resolve(
+        join(sessionDir, `${Date.now()}_${attachment.id}_${safeName}`),
+      );
+      try {
+        const res = await fetch(attachment.url);
+        if (!res.ok) {
+          this.logger.warn(
+            {
+              sessionId,
+              name: attachment.name,
+              status: res.status,
+            },
+            "incoming attachment download failed",
+          );
+          continue;
+        }
+        const ab = await res.arrayBuffer();
+        const bytes = Buffer.from(ab);
+        if (bytes.byteLength > appConfig.incomingAttachMaxBytes) {
+          this.logger.warn(
+            {
+              sessionId,
+              name: attachment.name,
+              size: bytes.byteLength,
+              limit: appConfig.incomingAttachMaxBytes,
+            },
+            "incoming attachment skipped after download: too large",
+          );
+          continue;
+        }
+        await writeFile(targetPath, bytes);
+        saved.push(targetPath);
+      } catch (err) {
+        this.logger.warn(
+          { err, sessionId, name: attachment.name },
+          "incoming attachment save failed",
+        );
+      }
+    }
+    if (saved.length > 0) {
+      this.logger.info(
+        { sessionId, count: saved.length, paths: saved },
+        "incoming attachments saved",
+      );
+    }
+    return saved;
+  }
+
+  private cleanupIncomingAttachments(reason: string): void {
+    const root = resolve(appConfig.incomingAttachDir);
+    if (!existsSync(root)) return;
+    const ttlMs = appConfig.incomingAttachTtlHours * 60 * 60 * 1000;
+    const now = Date.now();
+    let removed = 0;
+    try {
+      for (const sessionDir of readdirSync(root, { withFileTypes: true })) {
+        if (!sessionDir.isDirectory()) continue;
+        const sessionPath = join(root, sessionDir.name);
+        for (const file of readdirSync(sessionPath, { withFileTypes: true })) {
+          if (!file.isFile()) continue;
+          const filePath = join(sessionPath, file.name);
+          try {
+            const st = statSync(filePath);
+            if (now - st.mtimeMs < ttlMs) continue;
+            rmSync(filePath, { force: true });
+            removed += 1;
+          } catch {
+            // best effort cleanup
+          }
+        }
+      }
+    } catch (err) {
+      this.logger.warn({ err, reason }, "incoming attachment cleanup failed");
+      return;
+    }
+    if (removed > 0) {
+      this.logger.info({ reason, removed }, "incoming attachment cleanup completed");
+    }
   }
 
   private async handleAttachCommands(

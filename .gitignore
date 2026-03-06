@@ -8,6 +8,7 @@
 # ---------------------------------
 # Runtime data (sensitive)
 # ---------------------------------
+data/
 data/*.db
 data/*.sqlite
 data/*.sqlite3
@@ -37,6 +38,7 @@ coverage/
 *.tsbuildinfo
 .eslintcache
 .vitest/
+.tmp/
 
 # ---------------------------------
 # OS / editor noise
@@ -48,6 +50,9 @@ Desktop.ini
 # ---------------------------------
 # Local docs / tooling (not for repo)
 # ---------------------------------
+docs/
+poc/
+tmp_*.md
 /*.md
 !/README.md
 !/Readme.md
@@ -55,3 +60,4 @@ Desktop.ini
 run_codex.cmd
 DiscordAgent.code-workspace
 gitleaks-report.json
+scripts/fix-*.mjs

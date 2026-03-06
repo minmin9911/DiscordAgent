@@ -14,6 +14,9 @@ const schema = z.object({
     .default("echo [MOCK CODEX][{sessionId}] {input}"),
   CODEX_MODE: z.enum(["cli", "template"]).default("cli"),
   CODEX_TIMEOUT_SEC: z.coerce.number().int().positive().default(1800),
+  INCOMING_ATTACH_DIR: z.string().default("./data/incoming_attachments"),
+  INCOMING_ATTACH_TTL_HOURS: z.coerce.number().int().positive().default(72),
+  INCOMING_ATTACH_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
   INSTANCE_LOCK_PORT: z.coerce.number().int().min(1024).max(65535).default(45991),
 });
 
@@ -36,6 +39,9 @@ export const appConfig = {
   codexExecTemplate: parsed.CODEX_EXEC_TEMPLATE,
   codexMode: parsed.CODEX_MODE,
   codexTimeoutSec: Math.min(parsed.CODEX_TIMEOUT_SEC, 3600),
+  incomingAttachDir: parsed.INCOMING_ATTACH_DIR,
+  incomingAttachTtlHours: parsed.INCOMING_ATTACH_TTL_HOURS,
+  incomingAttachMaxBytes: parsed.INCOMING_ATTACH_MAX_BYTES,
   instanceLockPort: parsed.INSTANCE_LOCK_PORT,
   listDefaultLimit: 20,
   queueLimitPerSession: 20,

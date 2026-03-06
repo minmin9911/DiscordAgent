@@ -22,6 +22,15 @@ export interface CodexResult {
   timedOut?: boolean;
 }
 
+export interface CodexStreamEvent {
+  type: string;
+  threadId?: string;
+  itemType?: string;
+  itemId?: string;
+  itemText?: string;
+  raw: Record<string, unknown>;
+}
+
 export class CodexAdapter {
   private readonly activeChildPids = new Set<number>();
   private readonly pidToThreadId = new Map<number, string>();
@@ -38,6 +47,9 @@ export class CodexAdapter {
     codexThreadId?: string | null;
     preferredWorkingDirectory?: string | null;
     includeDiscordAgentSystemPrompt?: boolean;
+    onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
+    onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
+    onStdErrLine?: (line: string) => void | Promise<void>;
   }): Promise<CodexResult> {
     const promptWithSystem = input.includeDiscordAgentSystemPrompt === false
       ? input.prompt
@@ -105,6 +117,9 @@ export class CodexAdapter {
     prompt: string;
     codexThreadId?: string | null;
     preferredWorkingDirectory?: string | null;
+    onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
+    onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
+    onStdErrLine?: (line: string) => void | Promise<void>;
   }): Promise<CodexResult> {
     const args: string[] = [];
     let resolvedCwd: string | undefined;
@@ -160,6 +175,8 @@ export class CodexAdapter {
       }
       let stdout = "";
       let stderr = "";
+      let stdoutLineBuffer = "";
+      let stderrLineBuffer = "";
       let timedOut = false;
       const timer = setTimeout(() => {
         timedOut = true;
@@ -167,10 +184,28 @@ export class CodexAdapter {
       }, this.timeoutMs);
 
       child.stdout.on("data", (buf: Buffer) => {
-        stdout += buf.toString("utf8");
+        const chunk = buf.toString("utf8");
+        stdout += chunk;
+        stdoutLineBuffer += chunk;
+        const lines = stdoutLineBuffer.split(/\r?\n/);
+        stdoutLineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          this.handleStdoutJsonlLine(line, input.onEvent, input.onAgentMessage);
+        }
       });
       child.stderr.on("data", (buf: Buffer) => {
-        stderr += buf.toString("utf8");
+        const chunk = buf.toString("utf8");
+        stderr += chunk;
+        stderrLineBuffer += chunk;
+        const lines = stderrLineBuffer.split(/\r?\n/);
+        stderrLineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const text = line.trim();
+          if (!text) continue;
+          if (input.onStdErrLine) {
+            void Promise.resolve(input.onStdErrLine(text)).catch(() => {});
+          }
+        }
       });
       if (child.stdin) {
         child.stdin.write(input.prompt);
@@ -193,6 +228,14 @@ export class CodexAdapter {
         if (child.pid) {
           this.activeChildPids.delete(child.pid);
           this.pidToThreadId.delete(child.pid);
+        }
+        const lastStdoutLine = stdoutLineBuffer.trim();
+        if (lastStdoutLine) {
+          this.handleStdoutJsonlLine(lastStdoutLine, input.onEvent, input.onAgentMessage);
+        }
+        const lastStderrLine = stderrLineBuffer.trim();
+        if (lastStderrLine && input.onStdErrLine) {
+          void Promise.resolve(input.onStdErrLine(lastStderrLine)).catch(() => {});
         }
         if (timedOut) {
           resolve({
@@ -335,6 +378,50 @@ export class CodexAdapter {
       message.includes("Falling back from WebSockets to HTTPS transport") ||
       message.includes("stream disconnected before completion")
     );
+  }
+
+  private handleStdoutJsonlLine(
+    line: string,
+    onEvent?: (event: CodexStreamEvent) => void | Promise<void>,
+    onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>,
+  ): void {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    let obj: Record<string, unknown>;
+    try {
+      obj = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    const eventType = typeof obj.type === "string" ? obj.type : "unknown";
+    let threadId: string | undefined;
+    if (typeof obj.thread_id === "string") {
+      threadId = obj.thread_id;
+    }
+    let itemType: string | undefined;
+    let itemId: string | undefined;
+    let itemText: string | undefined;
+    if (obj.item && typeof obj.item === "object") {
+      const item = obj.item as Record<string, unknown>;
+      if (typeof item.type === "string") itemType = item.type;
+      if (typeof item.id === "string") itemId = item.id;
+      if (typeof item.text === "string") itemText = item.text;
+    }
+    if (onEvent) {
+      void Promise.resolve(
+        onEvent({
+          type: eventType,
+          threadId,
+          itemType,
+          itemId,
+          itemText,
+          raw: obj,
+        }),
+      ).catch(() => {});
+    }
+    if (onAgentMessage && eventType === "item.completed" && itemType === "agent_message" && itemId && itemText) {
+      void Promise.resolve(onAgentMessage({ itemId, text: itemText })).catch(() => {});
+    }
   }
 
   private sanitizeOutput(text: string): string {

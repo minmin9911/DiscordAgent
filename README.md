@@ -74,6 +74,9 @@ npm install
 - `SQLITE_PATH`: DB パス
 - `CODEX_MODE`: `cli`（推奨）または `template`（非推奨・実験用）
 - `CODEX_TIMEOUT_SEC`: Codex 実行タイムアウト秒
+- `INCOMING_ATTACH_DIR`: Discord受信添付の保存先ディレクトリ
+- `INCOMING_ATTACH_TTL_HOURS`: 受信添付の保持時間（時間）
+- `INCOMING_ATTACH_MAX_BYTES`: 受信添付1ファイルあたりの最大サイズ（bytes）
 - `INSTANCE_LOCK_PORT`: 単一起動用ロックポート（二重起動防止の排他制御に使用しているポート）
 
 ### `CODEX_MODE=template` について
@@ -123,6 +126,8 @@ npm install
 - Codex側から `!attach <absolute_path>` コマンドを送信することで、Discordに添付ファイルをつけることが可能です（ユーザからは、Discordを通じて「XXXXを添付して」などの指示を行って添付させます）。
 - ユーザ側からの `!attach` コマンドは無効です。
 - 上限: 8MB
+- ユーザが投稿した添付ファイル（画像等）は `INCOMING_ATTACH_DIR` に一時保存され、次回のCodex実行時に絶対パスが自動でプロンプトへ付与されます。
+- 一時保存ファイルは `INCOMING_ATTACH_TTL_HOURS` を過ぎると定期クリーンアップで削除されます。
 
 ## セキュリティ運用
 
@@ -140,3 +145,9 @@ npm install
   - 漏えい疑い時は即時 `Regenerate Token` と再配布
 - 実行環境を分離する
   - Bot は専用の Windows PC 上で稼働させ、日常利用端末と分離
+
+# その他
+
+run_DiscordAgent.cmd では、本ソフトが繰り返し起動するようになっています。
+（直接npmせず）このバッチファイルから起動し、Codexに「npmプロセスを狙い撃ちでKill」させることで、外出先から本ソフトを再起動させることが可能です。
+但し、意図せぬ挙動をした場合に、外出先から一切の操作ができなくなり、破壊的な影響が生じる可能性もありますので、リスクを理解して利用してください。

@@ -1,4 +1,7 @@
 @echo off
 setlocal
+
+:loop
 cd /d %~dp0
-npm run dev %*
+call npm run dev %*
+goto loop

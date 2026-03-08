@@ -73,12 +73,26 @@ CREATE TABLE IF NOT EXISTS context_cursors (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS external_sync_cursors (
+  codex_thread_id TEXT PRIMARY KEY,
+  last_line_no INTEGER NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS external_sync_seen_events (
+  codex_thread_id TEXT NOT NULL,
+  event_id TEXT NOT NULL,
+  seen_at TEXT NOT NULL,
+  PRIMARY KEY (codex_thread_id, event_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used_at ON sessions(last_used_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name);
 CREATE INDEX IF NOT EXISTS idx_sessions_codex_thread_id ON sessions(codex_thread_id);
 CREATE INDEX IF NOT EXISTS idx_executions_session_created ON executions(session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_sync_seen_events(seen_at DESC);
 `;
     this.db.exec(sql);
     this.ensureColumns();
@@ -406,6 +420,81 @@ CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(upd
         last_message_id: messageId,
         updated_at: nowIso(),
       });
+  }
+
+  getExternalSyncCursor(codexThreadId: string): number | null {
+    const row = this.db
+      .prepare(
+        "SELECT last_line_no FROM external_sync_cursors WHERE codex_thread_id = ?",
+      )
+      .get(codexThreadId) as { last_line_no: number } | undefined;
+    return row?.last_line_no ?? null;
+  }
+
+  setExternalSyncCursor(codexThreadId: string, lastLineNo: number): void {
+    this.db
+      .prepare(
+        `INSERT INTO external_sync_cursors (codex_thread_id, last_line_no, updated_at)
+         VALUES (@codex_thread_id, @last_line_no, @updated_at)
+         ON CONFLICT(codex_thread_id) DO UPDATE SET
+           last_line_no = excluded.last_line_no,
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        codex_thread_id: codexThreadId,
+        last_line_no: Math.max(0, Math.trunc(lastLineNo)),
+        updated_at: nowIso(),
+      });
+  }
+
+  markExternalSyncEventSeen(codexThreadId: string, eventId: string): void {
+    if (!eventId.trim()) return;
+    this.db
+      .prepare(
+        `INSERT OR IGNORE INTO external_sync_seen_events
+         (codex_thread_id, event_id, seen_at)
+         VALUES (?, ?, ?)`,
+      )
+      .run(codexThreadId, eventId, nowIso());
+  }
+
+  hasExternalSyncEventSeen(codexThreadId: string, eventId: string): boolean {
+    if (!eventId.trim()) return false;
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS ok
+         FROM external_sync_seen_events
+         WHERE codex_thread_id = ? AND event_id = ?
+         LIMIT 1`,
+      )
+      .get(codexThreadId, eventId) as { ok: number } | undefined;
+    return !!row?.ok;
+  }
+
+  listActiveCodexThreadIds(): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT codex_thread_id
+         FROM sessions
+         WHERE status != 'archived'
+           AND codex_thread_id IS NOT NULL
+           AND codex_thread_id != ''`,
+      )
+      .all() as Array<{ codex_thread_id: string }>;
+    return rows.map((v) => v.codex_thread_id);
+  }
+
+  listContextKeysByCodexThreadId(codexThreadId: string): string[] {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT cb.context_key
+         FROM context_bindings cb
+         JOIN sessions s ON s.id = cb.active_session_id
+         WHERE s.status != 'archived'
+           AND s.codex_thread_id = ?`,
+      )
+      .all(codexThreadId) as Array<{ context_key: string }>;
+    return rows.map((v) => v.context_key);
   }
 
   cancelInFlightExecutionsOnStartup(): number {

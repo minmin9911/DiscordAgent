@@ -61,3 +61,5 @@ run_codex.cmd
 DiscordAgent.code-workspace
 gitleaks-report.json
 scripts/fix-*.mjs
+scripts/*
+!scripts/bump-build-number.cjs

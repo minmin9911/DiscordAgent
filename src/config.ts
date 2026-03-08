@@ -18,6 +18,9 @@ const schema = z.object({
   INCOMING_ATTACH_TTL_HOURS: z.coerce.number().int().positive().default(72),
   INCOMING_ATTACH_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
   INSTANCE_LOCK_PORT: z.coerce.number().int().min(1024).max(65535).default(45991),
+  EXTERNAL_SYNC_ENABLED: z.coerce.boolean().default(true),
+  EXTERNAL_SYNC_POLL_SEC: z.coerce.number().int().min(5).max(300).default(15),
+  EXTERNAL_SYNC_MAX_BURST: z.coerce.number().int().min(1).max(300).default(30),
 });
 
 const parsed = schema.parse(process.env);
@@ -43,6 +46,9 @@ export const appConfig = {
   incomingAttachTtlHours: parsed.INCOMING_ATTACH_TTL_HOURS,
   incomingAttachMaxBytes: parsed.INCOMING_ATTACH_MAX_BYTES,
   instanceLockPort: parsed.INSTANCE_LOCK_PORT,
+  externalSyncEnabled: parsed.EXTERNAL_SYNC_ENABLED,
+  externalSyncPollSec: parsed.EXTERNAL_SYNC_POLL_SEC,
+  externalSyncMaxBurst: parsed.EXTERNAL_SYNC_MAX_BURST,
   listDefaultLimit: 20,
   queueLimitPerSession: 20,
   progressIntervalSec: 30,

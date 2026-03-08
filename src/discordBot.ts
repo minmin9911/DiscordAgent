@@ -26,6 +26,7 @@ import {
   searchCodexSessions,
   type CodexSessionMeta,
 } from "./codexSessionMeta.js";
+import { readCodexThreadEventsSinceLine } from "./codexExternalSync.js";
 import { ATTACH_MAX_BYTES, extractAttachPaths } from "./attachPolicy.js";
 import {
   buildPromptWithIncomingAttachments,
@@ -35,6 +36,7 @@ import type { SessionRow } from "./types.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
+const EXTERNAL_SYNC_PREVIEW_MAX = 1500;
 type RecoveryChannel = TextChannel | NewsChannel | ThreadChannel;
 
 function splitIntoChunks(text: string, size: number): string[] {
@@ -67,7 +69,13 @@ function buildCommandReference(): string {
     "- !queue stopall",
     "  - 全キューを緊急停止します（待機中は取消、実行中は強制停止）。",
     "- !queue fix",
-    "  - running孤児（プロセス不在）を修復します。",
+    "  - running孤児（存在しないCodexプロセスを待機中のスレッド）を修復します。",
+    "- !sync",
+    "  - 他のクライアント更新の同期状態を表示します。",
+    "- !sync on|off",
+    "  - 他のクライアント更新の同期を有効/無効にします。",
+    "- !sync reset",
+    "  - 現時点でのCodexのメッセージを全て同期済みとして扱います。未来の更新のみ同期します。",
     "",
     "## セッション管理",
     "- !session new [name]",
@@ -80,6 +88,7 @@ function buildCommandReference(): string {
     "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
     "  - 直前の !codex 結果から番号選択します。",
     "- !codex session <codex_thread_id>",
+    "  - 【推奨】CodexのスレッドID（UUID）でスレッドを指定します。",
     "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
     "  - 直接 thread_id を指定します。",
   ].join("\n");
@@ -100,6 +109,12 @@ export class DiscordCodexBot {
   private readonly manager: ExecutionManager;
   private readonly processedMessageIds = new Set<string>();
   private readonly codexSearchCache = new Map<string, CodexSessionMeta[]>();
+  private readonly localSyncSuppress = new Map<
+    string,
+    { userTexts: Set<string>; agentTexts: Set<string>; expiresAtMs: number }
+  >();
+  private externalSyncEnabled = appConfig.externalSyncEnabled;
+  private externalSyncRunning = false;
   private recoveringUnread = false;
 
   constructor(params: { db: AppDb; logger: pino.Logger }) {
@@ -134,6 +149,14 @@ export class DiscordCodexBot {
           this.logger.warn({ err }, "unread recovery by polling failed");
         });
       }, UNREAD_RECOVERY_POLL_MS);
+      setInterval(() => {
+        this.runExternalSyncCycle("polling").catch((err) => {
+          this.logger.warn({ err }, "external sync by polling failed");
+        });
+      }, appConfig.externalSyncPollSec * 1000);
+      this.runExternalSyncCycle("startup").catch((err) => {
+        this.logger.warn({ err }, "external sync on startup failed");
+      });
     });
     this.client.on("shardResume", () => {
       this.recoverUnreadForAllContexts("shard_resume").catch((err) => {
@@ -233,6 +256,14 @@ export class DiscordCodexBot {
       }
       if (content.startsWith("!queue ")) {
         await this.handleQueueCommand(msg, content.slice("!queue ".length).trim());
+        return;
+      }
+      if (content === "!sync") {
+        await this.handleSyncCommand(msg, "");
+        return;
+      }
+      if (content.startsWith("!sync ")) {
+        await this.handleSyncCommand(msg, content.slice("!sync ".length).trim());
         return;
       }
       if (content.startsWith("!attach ")) {
@@ -781,6 +812,10 @@ export class DiscordCodexBot {
     const incomingPaths = await this.saveIncomingAttachments(msg, session.id);
     const prompt = buildPromptWithIncomingAttachments(content, incomingPaths);
     const executionLockKey = this.getExecutionLockKey(session);
+    let observedThreadId: string | null = session.codex_thread_id ?? null;
+    if (observedThreadId) {
+      this.addLocalSyncSuppressionText(observedThreadId, "user_message", content);
+    }
     this.logger.info(
       {
         executionId,
@@ -833,6 +868,17 @@ export class DiscordCodexBot {
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onEvent: async (event) => {
             if (finalized) return;
+            if (event.threadId) {
+              observedThreadId = event.threadId;
+            }
+            if (
+              event.type === "item.completed"
+              && (event.itemType === "user_message" || event.itemType === "agent_message")
+              && event.itemId
+              && observedThreadId
+            ) {
+              this.db.markExternalSyncEventSeen(observedThreadId, event.itemId);
+            }
             if (event.type === "turn.started") {
               await editProgressMessage(
                 composeStatusText(
@@ -845,6 +891,9 @@ export class DiscordCodexBot {
             if (finalized) return;
             if (seenAgentItemIds.has(itemId)) return;
             seenAgentItemIds.add(itemId);
+            if (observedThreadId) {
+              this.addLocalSyncSuppressionText(observedThreadId, "agent_message", text);
+            }
             streamAgentMessages.push(text);
             const preview = normalizeStreamPreview(text);
             const previewText = preview.length > 0
@@ -885,6 +934,8 @@ export class DiscordCodexBot {
         if (runResult.threadId && !session.codex_thread_id) {
           this.db.setSessionCodexThreadId(session.id, runResult.threadId);
           session.codex_thread_id = runResult.threadId;
+          observedThreadId = runResult.threadId;
+          this.addLocalSyncSuppressionText(runResult.threadId, "user_message", content);
           this.logger.info(
             { executionId, sessionId: session.id, threadId: runResult.threadId },
             "codex thread bound",
@@ -1051,6 +1102,269 @@ export class DiscordCodexBot {
       );
     }
     await this.sendMultilineReply(msg, "queue status", lines);
+  }
+
+  private async handleSyncCommand(msg: Message, body: string): Promise<void> {
+    const arg = body.trim().toLowerCase();
+    if (!arg || arg === "status") {
+      const lines = [
+        `sync_enabled: ${this.externalSyncEnabled ? "yes" : "no"}`,
+        `sync_poll_sec: ${appConfig.externalSyncPollSec}`,
+        `sync_max_burst_global: ${appConfig.externalSyncMaxBurst}`,
+        "mode: future-only",
+      ];
+      await msg.reply(lines.join("\n"));
+      return;
+    }
+    if (arg === "on") {
+      this.externalSyncEnabled = true;
+      await msg.reply("sync enabled");
+      return;
+    }
+    if (arg === "off") {
+      this.externalSyncEnabled = false;
+      await msg.reply("sync disabled");
+      return;
+    }
+    if (arg === "reset") {
+      const anchored = this.resetExternalSyncCursorsToLatest();
+      await msg.reply(
+        `sync reset done: anchored_threads=${anchored}\nmode=future-only`,
+      );
+      return;
+    }
+    await msg.reply("usage: !sync [status|on|off|reset]");
+  }
+
+  private resetExternalSyncCursorsToLatest(): number {
+    const threadIds = this.db.listActiveCodexThreadIds();
+    let anchored = 0;
+    for (const threadId of threadIds) {
+      const read = readCodexThreadEventsSinceLine(threadId, 0);
+      if (!read.sourceFound) continue;
+      this.db.setExternalSyncCursor(threadId, read.latestLineNo);
+      anchored += 1;
+    }
+    return anchored;
+  }
+
+  private normalizeSuppressionText(text: string): string {
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  private addLocalSyncSuppressionText(
+    codexThreadId: string,
+    itemType: "user_message" | "agent_message",
+    text: string,
+  ): void {
+    const normalized = this.normalizeSuppressionText(text);
+    if (!normalized) return;
+    const now = Date.now();
+    const expiresAtMs = now + (5 * 60 * 1000);
+    const current = this.localSyncSuppress.get(codexThreadId) ?? {
+      userTexts: new Set<string>(),
+      agentTexts: new Set<string>(),
+      expiresAtMs,
+    };
+    current.expiresAtMs = Math.max(current.expiresAtMs, expiresAtMs);
+    if (itemType === "user_message") {
+      current.userTexts.add(normalized);
+    } else {
+      current.agentTexts.add(normalized);
+    }
+    this.localSyncSuppress.set(codexThreadId, current);
+  }
+
+  private shouldSuppressLocalSyncEvent(
+    codexThreadId: string,
+    itemType: "user_message" | "agent_message",
+    text: string,
+  ): boolean {
+    const entry = this.localSyncSuppress.get(codexThreadId);
+    if (!entry) return false;
+    const now = Date.now();
+    if (entry.expiresAtMs <= now) {
+      this.localSyncSuppress.delete(codexThreadId);
+      return false;
+    }
+    const normalized = this.normalizeSuppressionText(text);
+    if (!normalized) return false;
+    if (itemType === "user_message") return entry.userTexts.has(normalized);
+    return entry.agentTexts.has(normalized);
+  }
+
+  private async runExternalSyncCycle(reason: string): Promise<void> {
+    if (!this.externalSyncEnabled) return;
+    if (this.externalSyncRunning) return;
+    this.externalSyncRunning = true;
+    try {
+      const threadIds = this.db.listActiveCodexThreadIds();
+      const collected: Array<{
+        codexThreadId: string;
+        contextKeys: string[];
+        latestLineNo: number;
+        event: { eventId: string; itemType: "user_message" | "agent_message"; text: string; lineNo: number; occurredAtMs: number | null };
+      }> = [];
+
+      for (const threadId of threadIds) {
+        const chunk = this.collectExternalEventsForThread(reason, threadId);
+        if (!chunk) continue;
+        collected.push(...chunk.events.map((event) => ({
+          codexThreadId: chunk.codexThreadId,
+          contextKeys: chunk.contextKeys,
+          latestLineNo: chunk.latestLineNo,
+          event,
+        })));
+      }
+
+      if (collected.length > 0) {
+        collected.sort((a, b) => {
+          const at = a.event.occurredAtMs ?? 0;
+          const bt = b.event.occurredAtMs ?? 0;
+          if (at !== bt) return at - bt;
+          return a.event.lineNo - b.event.lineNo;
+        });
+      }
+
+      const cap = appConfig.externalSyncMaxBurst;
+      const dropCount = Math.max(0, collected.length - cap);
+      if (dropCount > 0) {
+        for (let i = 0; i < dropCount; i += 1) {
+          const dropped = collected[i]!;
+          this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.eventId);
+        }
+        this.logger.info(
+          { reason, dropped: dropCount, sent: cap },
+          "external sync global cap applied",
+        );
+      }
+      const target = dropCount > 0 ? collected.slice(dropCount) : collected;
+      for (const row of target) {
+        await this.broadcastExternalEventToContexts(
+          row.codexThreadId,
+          row.contextKeys,
+          row.event.itemType,
+          row.event.text,
+        );
+        this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.eventId);
+      }
+
+      const latestByThread = new Map<string, number>();
+      for (const row of collected) {
+        const prev = latestByThread.get(row.codexThreadId) ?? 0;
+        if (row.latestLineNo > prev) latestByThread.set(row.codexThreadId, row.latestLineNo);
+      }
+      for (const [threadId, latestLineNo] of latestByThread.entries()) {
+        this.db.setExternalSyncCursor(threadId, latestLineNo);
+      }
+    } finally {
+      this.externalSyncRunning = false;
+    }
+  }
+
+  private collectExternalEventsForThread(
+    reason: string,
+    codexThreadId: string,
+  ): {
+    codexThreadId: string;
+    contextKeys: string[];
+    latestLineNo: number;
+    events: Array<{
+      eventId: string;
+      itemType: "user_message" | "agent_message";
+      text: string;
+      lineNo: number;
+      occurredAtMs: number | null;
+    }>;
+  } | null {
+    const cursor = this.db.getExternalSyncCursor(codexThreadId);
+    const read = readCodexThreadEventsSinceLine(codexThreadId, cursor ?? 0);
+    if (!read.sourceFound) return null;
+
+    if (cursor === null) {
+      this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+      this.logger.info(
+        { reason, codexThreadId, latestLineNo: read.latestLineNo },
+        "external sync anchored thread (future-only)",
+      );
+      return null;
+    }
+
+    if (read.latestLineNo < cursor) {
+      this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+      this.logger.warn(
+        { reason, codexThreadId, prevLineNo: cursor, latestLineNo: read.latestLineNo },
+        "external sync cursor moved backward; re-anchored to latest",
+      );
+      return null;
+    }
+
+    if (read.events.length === 0) {
+      if (read.latestLineNo !== cursor) {
+        this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+      }
+      return null;
+    }
+
+    const contextKeys = this.db.listContextKeysByCodexThreadId(codexThreadId);
+    if (contextKeys.length === 0) {
+      this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+      return null;
+    }
+
+    const pendingEvents = read.events.filter((event) => {
+      if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
+      if (this.shouldSuppressLocalSyncEvent(codexThreadId, event.itemType, event.text)) {
+        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+        return false;
+      }
+      return true;
+    });
+    if (pendingEvents.length === 0) {
+      this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+      return null;
+    }
+    return {
+      codexThreadId,
+      contextKeys,
+      latestLineNo: read.latestLineNo,
+      events: pendingEvents,
+    };
+  }
+
+  private async broadcastExternalEventToContexts(
+    codexThreadId: string,
+    contextKeys: string[],
+    itemType: "user_message" | "agent_message",
+    text: string,
+  ): Promise<void> {
+    const role = itemType === "user_message" ? "User" : "Codex";
+    const chunks = splitIntoChunks(text, EXTERNAL_SYNC_PREVIEW_MAX);
+    for (const contextKey of contextKeys) {
+      const channel = await this.resolveSendableChannelByContextKey(contextKey);
+      if (!channel) continue;
+      const header = `[External ${role}] codex_session: ${codexThreadId}`;
+      for (let i = 0; i < chunks.length; i += 1) {
+        const body = chunks[i];
+        if (i === 0) {
+          await channel.send(`${header}\n${body}`);
+          continue;
+        }
+        await channel.send(`[External ${role} cont.${i + 1}]\n${body}`);
+      }
+    }
+  }
+
+  private async resolveSendableChannelByContextKey(
+    contextKey: string,
+  ): Promise<SendableChannels | null> {
+    const parts = contextKey.split(":");
+    if (parts.length !== 2) return null;
+    const channelId = parts[1];
+    if (!channelId) return null;
+    const fetched = await this.client.channels.fetch(channelId);
+    if (!fetched || !fetched.isSendable()) return null;
+    return fetched;
   }
 
   private async saveIncomingAttachments(msg: Message, sessionId: string): Promise<string[]> {

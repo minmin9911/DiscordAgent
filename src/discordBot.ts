@@ -33,6 +33,7 @@ import {
   sanitizeAttachmentFileName,
 } from "./incomingAttachmentPolicy.js";
 import type { SessionRow } from "./types.js";
+import { truncateExternalUserMessage } from "./externalSyncText.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
@@ -1002,8 +1003,8 @@ export class DiscordCodexBot {
 
   private async handleQueueCommand(msg: Message, body: string): Promise<void> {
     const sub = body.trim().toLowerCase();
-    if (sub === "stopall") {
-      this.manager.drainPendingAll();
+    if (sub === "stopall" || sub === "allstop") {
+      const reset = this.manager.forceResetAll();
       const killed = this.codex.emergencyStopAllRunning();
       const canceled = this.db.cancelAllInFlightExecutions("ERR_EMERGENCY_STOP");
       this.logger.warn(
@@ -1011,6 +1012,7 @@ export class DiscordCodexBot {
           by: msg.author.id,
           canceled,
           killed,
+          reset,
         },
         "queue emergency stopall requested",
       );
@@ -1019,6 +1021,8 @@ export class DiscordCodexBot {
           "queue stopall executed",
           `cancelled_inflight: ${canceled}`,
           `killed_running_processes: ${killed}`,
+          `reset_locks: ${reset.clearedLocks}`,
+          `dropped_pending_queue: ${reset.droppedQueued}`,
         ].join("\n"),
       );
       return;
@@ -1034,12 +1038,26 @@ export class DiscordCodexBot {
         orphanIds,
         "ERR_QUEUE_FIXED_ORPHAN_RUNNING",
       );
+      const dbLockKeys = new Set(
+        inFlight.map((e) => (
+          e.codex_thread_id
+            ? `codex:${e.codex_thread_id}`
+            : `session:${e.session_id}`
+        )),
+      );
+      const staleLockKeys = this.manager
+        .getQueueSnapshots()
+        .map((v) => v.lockKey)
+        .filter((lockKey) => !dbLockKeys.has(lockKey));
+      const releasedLocks = this.manager.forceReleaseLocks(staleLockKeys);
       this.logger.warn(
         {
           by: msg.author.id,
           checkedRunning: running.length,
           fixed,
           activeThreads: [...activeThreadIds],
+          staleLockKeys,
+          releasedLocks,
         },
         "queue fix requested",
       );
@@ -1048,6 +1066,7 @@ export class DiscordCodexBot {
           "queue fix executed",
           `checked_running: ${running.length}`,
           `fixed_orphan_running: ${fixed}`,
+          `released_stale_locks: ${releasedLocks}`,
           `active_codex_threads: ${activeThreadIds.size}`,
         ].join("\n"),
       );
@@ -1213,7 +1232,12 @@ export class DiscordCodexBot {
           codexThreadId: chunk.codexThreadId,
           contextKeys: chunk.contextKeys,
           latestLineNo: chunk.latestLineNo,
-          event,
+          event: {
+            ...event,
+            text: event.itemType === "user_message"
+              ? truncateExternalUserMessage(event.text, appConfig.externalSyncUserMaxChars)
+              : event.text,
+          },
         })));
       }
 

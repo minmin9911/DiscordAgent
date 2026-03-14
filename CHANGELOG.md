@@ -2,6 +2,9 @@
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.44 (2026-03-14)
+- `!queue stopall` / `!queue fix` の復旧性を改善し、停止後に同一セッションのキューが詰まり続ける問題を修正。
+
 ## v0.1.0 build.43 (2026-03-08)
 - 他のクライアント（Codex CLI / Windows App）で同一 codex_thread_id が更新された場合に、Discordへ同期する !sync 機能を追加。
 - 同期モードは future-only 固定。初回起動時と !sync reset は現在位置へアンカーし、過去履歴は送信しない。

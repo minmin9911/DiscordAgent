@@ -21,6 +21,7 @@ const schema = z.object({
   EXTERNAL_SYNC_ENABLED: z.coerce.boolean().default(true),
   EXTERNAL_SYNC_POLL_SEC: z.coerce.number().int().min(5).max(300).default(15),
   EXTERNAL_SYNC_MAX_BURST: z.coerce.number().int().min(1).max(300).default(30),
+  EXTERNAL_SYNC_USER_MAX_CHARS: z.coerce.number().int().min(50).max(10000).default(300),
 });
 
 const parsed = schema.parse(process.env);
@@ -49,6 +50,7 @@ export const appConfig = {
   externalSyncEnabled: parsed.EXTERNAL_SYNC_ENABLED,
   externalSyncPollSec: parsed.EXTERNAL_SYNC_POLL_SEC,
   externalSyncMaxBurst: parsed.EXTERNAL_SYNC_MAX_BURST,
+  externalSyncUserMaxChars: parsed.EXTERNAL_SYNC_USER_MAX_CHARS,
   listDefaultLimit: 20,
   queueLimitPerSession: 20,
   progressIntervalSec: 30,

@@ -24,6 +24,8 @@ interface SessionQueue {
   running: boolean;
   runningSince: number | null;
   tasks: ExecutionTask[];
+  generation: number;
+  runningExecutionId: string | null;
 }
 
 export interface QueueSnapshot {
@@ -81,10 +83,36 @@ export class ExecutionManager {
     return drained;
   }
 
+  forceResetAll(): { clearedLocks: number; droppedQueued: number; resetRunning: number } {
+    let clearedLocks = 0;
+    let droppedQueued = 0;
+    let resetRunning = 0;
+    for (const [lockKey, queue] of this.queues.entries()) {
+      if (!queue.running && queue.tasks.length === 0) continue;
+      clearedLocks += 1;
+      droppedQueued += queue.tasks.length;
+      if (queue.running) resetRunning += 1;
+      this.resetQueue(lockKey, queue);
+    }
+    return { clearedLocks, droppedQueued, resetRunning };
+  }
+
+  forceReleaseLocks(lockKeys: string[]): number {
+    let released = 0;
+    for (const lockKey of lockKeys) {
+      const queue = this.queues.get(lockKey);
+      if (!queue) continue;
+      if (!queue.running && queue.tasks.length === 0) continue;
+      this.resetQueue(lockKey, queue);
+      released += 1;
+    }
+    return released;
+  }
+
   async enqueue(task: ExecutionTask): Promise<{ ok: true; position: number } | { ok: false; code: string }> {
     let queue = this.queues.get(task.lockKey);
     if (!queue) {
-      queue = { running: false, runningSince: null, tasks: [] };
+      queue = { running: false, runningSince: null, tasks: [], generation: 0, runningExecutionId: null };
       this.queues.set(task.lockKey, queue);
     }
 
@@ -113,6 +141,8 @@ export class ExecutionManager {
 
     queue.running = true;
     queue.runningSince = Date.now();
+    queue.runningExecutionId = task.executionId;
+    const generationAtStart = queue.generation;
 
     let retries = 0;
     let progressTimer: NodeJS.Timeout | null = setInterval(() => {
@@ -127,6 +157,13 @@ export class ExecutionManager {
     try {
       while (true) {
         const result = await this.runWithHardTimeout(task.run);
+        if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
+          this.logger.warn(
+            { lockKey, executionId: task.executionId },
+            "ignoring stale task completion after queue reset",
+          );
+          break;
+        }
         if (result.status === "error" && retries < task.maxRetries) {
           retries += 1;
           await new Promise((r) => setTimeout(r, 2000));
@@ -142,6 +179,13 @@ export class ExecutionManager {
       }
     } catch (err) {
       this.logger.error({ err }, "task run failed unexpectedly");
+      if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
+        this.logger.warn(
+          { lockKey, executionId: task.executionId },
+          "ignoring stale unexpected failure after queue reset",
+        );
+        return;
+      }
       await task.onFinish({
         status: "error",
         output: "unexpected error",
@@ -153,12 +197,33 @@ export class ExecutionManager {
         clearInterval(progressTimer);
         progressTimer = null;
       }
-      queue.running = false;
-      queue.runningSince = null;
-      if (queue.tasks.length > 0) {
+      const current = this.queues.get(lockKey);
+      if (!current) return;
+      if (current.generation !== generationAtStart || current.runningExecutionId !== task.executionId) {
+        return;
+      }
+      current.running = false;
+      current.runningSince = null;
+      current.runningExecutionId = null;
+      if (current.tasks.length > 0) {
         await this.startNext(lockKey);
       }
     }
+  }
+
+  private resetQueue(lockKey: string, queue: SessionQueue): void {
+    queue.running = false;
+    queue.runningSince = null;
+    queue.tasks = [];
+    queue.runningExecutionId = null;
+    queue.generation += 1;
+    this.logger.warn({ lockKey, generation: queue.generation }, "queue forcibly reset");
+  }
+
+  private isTaskStale(lockKey: string, generation: number, executionId: string): boolean {
+    const queue = this.queues.get(lockKey);
+    if (!queue) return true;
+    return queue.generation !== generation || queue.runningExecutionId !== executionId;
   }
 
   private async runWithHardTimeout(

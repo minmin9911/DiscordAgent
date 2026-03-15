@@ -2,6 +2,7 @@
 
 English README: [README.md](./README.md)
 
+
 Discord からPC上の Codex CLI を操作する Bot です。技術実証用であり常用することはお勧めしません。
 
 本ソフトは **Windows 用** です（Windows 上で動作する Node.js と OpenAI Codex を対象としています）。
@@ -21,18 +22,25 @@ Discordのチャンネルやスレッドごとに別のCodexのセッション�
 
 母艦PCから離れた状態で、Discordを通じて以下のことができます。
 
-・プログラムの開発（本ソフトもこれで開発しています）
-・Obsidianの司書として、文書整理、検索、指定URLのスクラップ（Webをmarkdown化するskillを別途作成して利用）
-・CodexのSkillを作成することで、機能を拡張可能です。そのSkillも、Codex Agentを通じて作成可能です。
-・Googleカレンダー、タスク、GMAILを参照するAI秘書（Google APIを利用して、それぞれを読み書きするSkillを別途作成して利用）
-・旅行の企画を行い、Google Docsに反映して共有し、参加者とディスカッション（Google Docsを更新・共有等するSkillを別途作成して利用）
-・Edgeブラウザのサイドバーでdiscord.comを開くことで、ブラウズしながら、いつでもCodexを秘書として活用できます。
+* プログラムの開発（本ソフトもこれで開発しています）
+
+* Obsidianの司書として、文書整理、検索、指定URLのスクラップ（Webをmarkdown化するskillを別途作成して利用）
+
+* CodexのSkillを作成することで、機能を拡張可能です。そのSkillも、Codex Agentを通じて作成可能です。
+
+* Googleカレンダー、タスク、GMAILを参照するAI秘書（Google APIを利用して、それぞれを読み書きするSkillを別途作成して利用）
+
+* 旅行の企画を行い、Google Docsに反映して共有し、参加者とディスカッション（Google Docsを更新・共有等するSkillを別途作成して利用）
+
+* Edgeブラウザのサイドバーでdiscord.comを開くことで、ブラウズしながら、いつでもCodexを秘書として活用できます。
 
 ## 前提
 
-・Node.js 20+（Windowsネイティブ）
-・Discord Bot（本ソフト）
-・ローカルで動作する Codex CLI（Windowsネイティブ）
+* Node.js 20+（Windowsネイティブ）
+
+* Discord Bot（本ソフト）
+
+* ローカルで動作する Codex CLI（Windowsネイティブ）
 
 ## 事前準備
 
@@ -44,14 +52,19 @@ Discordのチャンネルやスレッドごとに別のCodexのセッション�
 4. `Bot` タブでトークンを控え（発行済みの場合は再発行する）、また、`Public Bot` を OFF
 5. OAuth2 URL Generator で Bot を対象サーバーへ招待（下記の権限を参考に設定してください）
 
-   ・`SCOPES`: `bot`
-   ・`BOT PERMISSIONS`（最低限）:
-   ・`View Channels`
-   ・`Send Messages`
-   ・`Send Messages in Threads`
-   ・`Read Message History`
-   ・`Attach Files`
+   * `SCOPES`: `bot`
 
+   * `BOT PERMISSIONS`（最低限）:
+
+     * `View Channels`
+
+     * `Send Messages`
+
+     * `Send Messages in Threads`
+
+     * `Read Message History`
+
+     * `Attach Files`
 6. Discordクライアントの設定で「開発者モード」に変更し、利用するチャンネルを右クリックして、チャンネルIDをコピーし、メモに控えてください。
 
 ## スクリプト本体の準備
@@ -68,77 +81,157 @@ npm install
 
 ## `.env` 主な設定
 
-・`DISCORD_TOKEN`: Bot トークン
-・`ALLOWED_CHANNEL_IDS`: DiscordのチャンネルID（カンマ区切りで複数指定可能）
-・`ALLOWED_USER_IDS`: 実行可能ユーザーをIDで制限できます（カンマ区切り）
-・`ALLOWED_USER_IDS` が空の場合は全ユーザー許可
-・許可外ユーザーには `ERR_USER_NOT_ALLOWED` を返します
+* `DISCORD_TOKEN`: Bot トークン
+
+* `ALLOWED_CHANNEL_IDS`: DiscordのチャンネルID（カンマ区切りで複数指定可能）　←上記で控えたもの
+
+* `ALLOWED_USER_IDS`: 第三者によるBotの不正利用対策として、実行可能ユーザーをIDで制限できます（カンマ区切り）
+
+  * 例: `ALLOWED_USER_IDS=123456789012345678,234567890123456789`
+
+* `ALLOWED_USER_IDS` が空の場合は全ユーザー許可
+
+* 許可外ユーザーには `ERR_USER_NOT_ALLOWED` を返します
 
 ### その他の設定項目（原則変更不要）
 
-・`SQLITE_PATH`: DB パス
-・`CODEX_MODE`: `cli`（推奨）または `template`（非推奨・実験用）
-・`CODEX_TIMEOUT_SEC`: Codex 実行タイムアウト秒
-・`INCOMING_ATTACH_DIR`: Discord受信添付の保存先ディレクトリ
-・`INCOMING_ATTACH_TTL_HOURS`: 受信添付の保持時間（時間）
-・`INCOMING_ATTACH_MAX_BYTES`: 受信添付1ファイルあたりの最大サイズ（bytes）
-・`INSTANCE_LOCK_PORT`: 単一起動用ロックポート（二重起動防止の排他制御に使用しているポート）
-・`EXTERNAL_SYNC_ENABLED`: 起動時の外部同期有効フラグ（`true`/`false`）
-・`EXTERNAL_SYNC_POLL_SEC`: 同期間隔（秒、既定15）
-・`EXTERNAL_SYNC_MAX_BURST`: 1回の同期で送信する最大件数（既定30）
-・`EXTERNAL_SYNC_USER_MAX_CHARS`: 外部同期の user_message を送信前に切り詰める最大文字数（既定300）
+* `SQLITE_PATH`: DB パス
+
+* `CODEX_MODE`: `cli`（推奨）または `template`（非推奨・実験用）
+
+* `CODEX_TIMEOUT_SEC`: Codex 実行タイムアウト秒
+
+* `INCOMING_ATTACH_DIR`: Discord受信添付の保存先ディレクトリ
+
+* `INCOMING_ATTACH_TTL_HOURS`: 受信添付の保持時間（時間）
+
+* `INCOMING_ATTACH_MAX_BYTES`: 受信添付1ファイルあたりの最大サイズ（bytes）
+
+* `INSTANCE_LOCK_PORT`: 単一起動用ロックポート（二重起動防止の排他制御に使用しているポート）
+
+### `CODEX_MODE=template` について
+
+実験用の非推奨機能です。 `template` はテンプレート文字列をシェル実行するため、入力の扱い次第で **コマンドインジェクション** のリスクがあります。通常は `cli` を使ってください。ただし、 `Cli` でも、プロンプトに不正な指示を与えれば同様に危険な実行が可能ですので、注意してください。
 
 ## コマンド
 
 ### 基本
 
-・`!help`
-・`!ask <instruction>`
-  ・「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。
+* `!help`
+
+* `!ask <instruction>`
+
+  * 「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。
+
+  * 当該Discordスレッドに割り当てられているCodexセッションに対して、指示（Prompt）を送信します。Codexセッションが未指定の場合は、新規のセッションが割り当てられます。
 
 ### セッション管理
 
-・`!session new [name]`
-・`!session current`
-・`!codex [query]`
-・`!codex pick <no>`
-・`!codex session <codex_thread_id>`
+* `!codex session <codex_thread_id>` （推奨）
+
+  * 現在のDiscordスレッドに割り当てられているCodexセッションを、指定されたUUID（`codex_thread_id`）のCodexセッションに変更します。codex resume <UUID>`<UUID>` と同様の役割です。
+
+* `!codex [query]`
+
+  * Codexのセッションリストを検索します。`~/.codex/sessions` を検索して候補表示します。queryを指定しなかった場合は、最新セッションのリストが表示されます。
+
+* `!codex pick <no>`
+
+  * 直前の `!codex [query]` 検索結果から番号選択し、現在のDiscordスレッドに割り当てられているCodexセッションを、 `no` に対応するCodexセッションに変更します。
+
+* `!session new [name]`
+
+* <br />
+
+  * 現在のCodexセッションとの接続を切り、新規のCodexセッションを割り当てます。`[name]` はDiscord Agent内での管理用のセッション名称です（未使用）。
+
+* `!session current`
+
+  * 現在のDiscordスレッドに設定されているCodexの各種情報、`codex_thread_id` / `working_directory` / `status` / `queue` などを表示
 
 ### メンテナンスコマンド
 
-・`!queue`
-・`!queue stopall`
-・`!queue fix`
-・`!sync`
-・`!sync on` / `!sync off`
-・`!sync reset`
+* `!queue`
 
-## 添付ファイル
+  * 実行中・待機中のキュー状態を表示します（`!queue status` と同じ）。
 
-・Codex側から `!attach <absolute_path>` を返すことで、Discordにファイルを添付できます。
-・ユーザが投稿した添付ファイル（画像等）は `INCOMING_ATTACH_DIR` に一時保存され、次回のCodex実行時に絶対パスが自動でプロンプトへ付与されます。
-・添付ファイルだけの投稿も実行対象として扱われます。
+* `!queue stopall`
+
+  * 全キューを緊急停止します（待機中は取消、実行中は強制停止）。
+
+* `!queue fix`
+
+  * `running` となっているが、対応するプロセスの存在しない、「孤児実行」を修復します。
 
 ## ログ
 
-・`logs/last_run.log`: 起動ごとに上書き
-・`logs/history-YYYY-MM-DD.log`: 日次履歴
+* `logs/last_run.log`: 起動ごとに上書き
+
+* `logs/history-YYYY-MM-DD.log`: 日次履歴
+
+## 添付ファイル
+
+* Codex側から `!attach <absolute_path>` コマンドを送信することで、Discordに添付ファイルをつけることが可能です（ユーザからは、Discordを通じて「XXXXを添付して」などの指示を行って添付させます）。
+
+* ユーザ側からの `!attach` コマンドは無効です。
+
+* 上限: 8MB
+
+* ユーザが投稿した添付ファイル（画像等）は `INCOMING_ATTACH_DIR` に一時保存され、次回のCodex実行時に絶対パスが自動でプロンプトへ付与されます。
+
+* 一時保存ファイルは `INCOMING_ATTACH_TTL_HOURS` を過ぎると定期クリーンアップで削除されます。
 
 ## セキュリティ運用
 
 本アプリの最大の単一脆弱点は Discord Bot の経路です。以下を最優先で実施してください。
 
-・Bot を奪わせない
-・Discord 運用者アカウントを奪わせない
-・Bot トークンを奪わせない
-・実行環境を分離する
+* Bot を奪わせない
 
-## その他
+  * Discord Developer Portal の `Installation` で `Install Link = None` を維持
 
-`run_DiscordAgent.cmd` では、本ソフトが繰り返し起動するようになっています。
-このバッチファイルから起動し、Codex に `npm` プロセスを狙い撃ちで kill させることで、外出先から再起動させることが可能です。
+  * `Public Bot` を `OFF` に維持
+
+  * 招待URLを発行する場合は必要時のみ・最小権限で運用
+
+* Discord 運用者アカウントを奪わせない
+
+  * 2FA を必須化（可能ならパスキー）
+
+  * 開発者 / 管理者ロールを最小化
+
+* Bot トークンを奪わせない
+
+  * `.env` / ログ / 画面共有での漏えい防止
+
+  * 漏えい疑い時は即時 `Regenerate Token` と再配布
+
+* 実行環境を分離する
+
+  * Bot は専用の Windows PC 上で稼働させ、日常利用端末と分離
+
+# その他
+
+run\_DiscordAgent.cmd では、本ソフトが繰り返し起動するようになっています。
+（直接npmせず）このバッチファイルから起動し、Codexに「npmプロセスを狙い撃ちでKill」させることで、外出先から本ソフトを再起動させることが可能です。
+但し、意図せぬ挙動をした場合に、外出先から一切の操作ができなくなり、破壊的な影響が生じる可能性もありますので、リスクを理解して利用してください。
 
 ## 外部同期
 
-Codex CLI や VSCode 拡張などから同一 `codex_thread_id` が更新された場合、その履歴を Discord 側へフィードバックできます。
-過去履歴は送信せず、未来の更新のみ同期します。同期量が多い場合は最新メッセージを優先します。
+Codex CLIやVSCodeの拡張などからCodexに指示を与えた履歴をDiscord側にフィードバックします。
+但し、久しぶりに起動したときなどに同期量が爆発しないように、上限を超えた同期は切り捨てられます（最新メッセージを優先）。
+
+* `!sync` : 外部クライアント同期の状態表示
+
+* `!sync on` / `!sync off` : 外部同期の有効/無効
+
+* `!sync reset` : 現在位置を送信済みとして再アンカー（過去分は送信しない）
+
+関連する `.env` の項目は以下の通りです。
+
+* `EXTERNAL_SYNC_ENABLED` : 起動時の外部同期有効フラグ（`true`/`false`）
+
+* EXTERNAL\_SYNC\_POLL\_SEC : 同期間隔（秒、既定15）
+
+* EXTERNAL\_SYNC\_MAX\_BURST : 1回の同期で送信する最大件数（既定30、超過分は古い順に送信スキップ）
+
+* EXTERNAL\_SYNC\_USER\_MAX\_CHARS : 外部同期の user\_message を送信前に切り詰める最大文字数（既定300）

@@ -40,6 +40,10 @@ const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
 const EXTERNAL_SYNC_PREVIEW_MAX = 1500;
 type RecoveryChannel = TextChannel | NewsChannel | ThreadChannel;
 
+export function shouldProcessIncomingMessage(content: string, attachmentCount: number): boolean {
+  return content.trim().length > 0 || attachmentCount > 0;
+}
+
 function splitIntoChunks(text: string, size: number): string[] {
   if (!text) return ["(empty)"];
   const chunks: string[] = [];
@@ -221,16 +225,21 @@ export class DiscordCodexBot {
         return;
       }
       const content = msg.content.trim();
-      if (!content) return;
+      if (!shouldProcessIncomingMessage(content, msg.attachments.size)) return;
       this.logger.info(
         {
           guildId: msg.guildId,
           channelId: msg.channelId,
           messageId: msg.id,
           userId: msg.author.id,
+          attachmentCount: msg.attachments.size,
         },
         "message received",
       );
+      if (!content && msg.attachments.size > 0) {
+        await this.handleExecutionMessage(msg, "");
+        return;
+      }
       if (content === "!help") {
         await msg.reply(buildCommandReference());
         return;

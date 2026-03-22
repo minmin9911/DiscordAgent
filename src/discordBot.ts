@@ -130,6 +130,7 @@ export class DiscordCodexBot {
       appConfig.codexMode,
       appConfig.codexExecTemplate,
       appConfig.codexTimeoutSec * 1000,
+      appConfig.codexCloseGraceSec * 1000,
     );
     this.manager = new ExecutionManager(
       appConfig.queueLimitPerSession,
@@ -882,6 +883,23 @@ export class DiscordCodexBot {
               observedThreadId = event.threadId;
             }
             if (
+              event.type === "turn.started"
+              || event.type === "turn.completed"
+              || (event.type === "item.completed" && event.itemType === "agent_message")
+            ) {
+              this.logger.info(
+                {
+                  executionId,
+                  sessionId: session.id,
+                  eventType: event.type,
+                  itemType: event.itemType ?? null,
+                  itemId: event.itemId ?? null,
+                  codexThreadId: observedThreadId ?? session.codex_thread_id ?? null,
+                },
+                "codex json milestone",
+              );
+            }
+            if (
               event.type === "item.completed"
               && (event.itemType === "user_message" || event.itemType === "agent_message")
               && event.itemId
@@ -920,6 +938,31 @@ export class DiscordCodexBot {
             this.logger.debug(
               { executionId, sessionId: session.id, line },
               "codex stderr stream line",
+            );
+          },
+          onClose: async ({ code, signal }) => {
+            this.logger.info(
+              {
+                executionId,
+                sessionId: session.id,
+                codexThreadId: observedThreadId ?? session.codex_thread_id ?? null,
+                code,
+                signal,
+              },
+              "codex process closed",
+            );
+          },
+          onLifecycle: async ({ type, source, graceMs }) => {
+            this.logger.info(
+              {
+                executionId,
+                sessionId: session.id,
+                codexThreadId: observedThreadId ?? session.codex_thread_id ?? null,
+                type,
+                source: source ?? null,
+                graceMs: graceMs ?? null,
+              },
+              "codex lifecycle event",
             );
           },
         });

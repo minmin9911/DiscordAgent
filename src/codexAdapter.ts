@@ -31,6 +31,34 @@ export interface CodexStreamEvent {
   raw: Record<string, unknown>;
 }
 
+export function detectLogicalCompletionFromJsonlLine(
+  line: string,
+): "turn.completed" | "task_complete" | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  try {
+    const obj = JSON.parse(trimmed) as Record<string, unknown>;
+    if (obj.type === "turn.completed") {
+      return "turn.completed";
+    }
+    if (
+      obj.type === "event_msg"
+      && obj.payload
+      && typeof obj.payload === "object"
+      && (obj.payload as Record<string, unknown>).type === "task_complete"
+    ) {
+      return "task_complete";
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+
+export function decideCloseGraceAction(processAlive: boolean): "finalize" | "kill" {
+  return processAlive ? "kill" : "finalize";
+}
+
 export class CodexAdapter {
   private readonly activeChildPids = new Set<number>();
   private readonly pidToThreadId = new Map<number, string>();
@@ -39,6 +67,7 @@ export class CodexAdapter {
     private readonly mode: "cli" | "template",
     private readonly commandTemplate: string,
     private readonly timeoutMs: number,
+    private readonly closeGraceMs: number,
   ) {}
 
   async run(input: {
@@ -50,6 +79,14 @@ export class CodexAdapter {
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
     onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
     onStdErrLine?: (line: string) => void | Promise<void>;
+    onClose?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
+    onLifecycle?: (
+      info: {
+        type: "logical_complete" | "close_grace_expired";
+        source?: "turn.completed" | "task_complete";
+        graceMs?: number;
+      },
+    ) => void | Promise<void>;
   }): Promise<CodexResult> {
     const promptWithSystem = input.includeDiscordAgentSystemPrompt === false
       ? input.prompt
@@ -120,6 +157,14 @@ export class CodexAdapter {
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
     onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
     onStdErrLine?: (line: string) => void | Promise<void>;
+    onClose?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
+    onLifecycle?: (
+      info: {
+        type: "logical_complete" | "close_grace_expired";
+        source?: "turn.completed" | "task_complete";
+        graceMs?: number;
+      },
+    ) => void | Promise<void>;
   }): Promise<CodexResult> {
     const args: string[] = [];
     let resolvedCwd: string | undefined;
@@ -178,64 +223,33 @@ export class CodexAdapter {
       let stdoutLineBuffer = "";
       let stderrLineBuffer = "";
       let timedOut = false;
-      const timer = setTimeout(() => {
+      let logicalComplete = false;
+      let forcedCloseAfterLogicalComplete = false;
+      let settled = false;
+      let watchdogTimer: NodeJS.Timeout | null = setTimeout(() => {
         timedOut = true;
         this.killProcessTree(child.pid);
       }, this.timeoutMs);
+      let closeGraceTimer: NodeJS.Timeout | null = null;
 
-      child.stdout.on("data", (buf: Buffer) => {
-        const chunk = buf.toString("utf8");
-        stdout += chunk;
-        stdoutLineBuffer += chunk;
-        const lines = stdoutLineBuffer.split(/\r?\n/);
-        stdoutLineBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          this.handleStdoutJsonlLine(line, input.onEvent, input.onAgentMessage);
-        }
-      });
-      child.stderr.on("data", (buf: Buffer) => {
-        const chunk = buf.toString("utf8");
-        stderr += chunk;
-        stderrLineBuffer += chunk;
-        const lines = stderrLineBuffer.split(/\r?\n/);
-        stderrLineBuffer = lines.pop() ?? "";
-        for (const line of lines) {
-          const text = line.trim();
-          if (!text) continue;
-          if (input.onStdErrLine) {
-            void Promise.resolve(input.onStdErrLine(text)).catch(() => {});
-          }
-        }
-      });
-      if (child.stdin) {
-        child.stdin.write(input.prompt);
-        child.stdin.end();
-      }
-      child.on("error", (err) => {
-        clearTimeout(timer);
+      const clearWatchdog = (): void => {
+        if (!watchdogTimer) return;
+        clearTimeout(watchdogTimer);
+        watchdogTimer = null;
+      };
+      const clearCloseGrace = (): void => {
+        if (!closeGraceTimer) return;
+        clearTimeout(closeGraceTimer);
+        closeGraceTimer = null;
+      };
+      const finalize = (code: number | null): void => {
+        if (settled) return;
+        settled = true;
+        clearWatchdog();
+        clearCloseGrace();
         if (child.pid) {
           this.activeChildPids.delete(child.pid);
           this.pidToThreadId.delete(child.pid);
-        }
-        resolve({
-          ok: false,
-          output: err.message,
-          errorCode: "ERR_CODEX_EXEC_FAILED",
-        });
-      });
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        if (child.pid) {
-          this.activeChildPids.delete(child.pid);
-          this.pidToThreadId.delete(child.pid);
-        }
-        const lastStdoutLine = stdoutLineBuffer.trim();
-        if (lastStdoutLine) {
-          this.handleStdoutJsonlLine(lastStdoutLine, input.onEvent, input.onAgentMessage);
-        }
-        const lastStderrLine = stderrLineBuffer.trim();
-        if (lastStderrLine && input.onStdErrLine) {
-          void Promise.resolve(input.onStdErrLine(lastStderrLine)).catch(() => {});
         }
         if (timedOut) {
           resolve({
@@ -245,6 +259,20 @@ export class CodexAdapter {
             timedOut: true,
           });
           return;
+        }
+        const lastStdoutLine = stdoutLineBuffer.trim();
+        if (lastStdoutLine) {
+          this.handleStdoutJsonlLine(lastStdoutLine, input.onEvent, input.onAgentMessage);
+          const logicalCompletionSource = detectLogicalCompletionFromJsonlLine(lastStdoutLine);
+          if (logicalCompletionSource) {
+            logicalComplete = true;
+          }
+          stdoutLineBuffer = "";
+        }
+        const lastStderrLine = stderrLineBuffer.trim();
+        if (lastStderrLine && input.onStdErrLine) {
+          void Promise.resolve(input.onStdErrLine(lastStderrLine)).catch(() => {});
+          stderrLineBuffer = "";
         }
         const parsed = this.parseJsonl(stdout);
         const fallback = this.sanitizeOutput(
@@ -273,7 +301,7 @@ export class CodexAdapter {
           ? [...parsed.warnings, ...parsed.errors]
           : parsed.warnings;
         const output = this.selectUserOutput(parsed.agentMessages, fallback);
-        const outputWithCode = code && code !== 0
+        const outputWithCode = code && code !== 0 && !forcedCloseAfterLogicalComplete
           ? `${output}\n\n[warning] codex exited with code ${code}, but a response was received.`
           : output;
         resolve({
@@ -283,6 +311,89 @@ export class CodexAdapter {
           workingDirectoryUsed: resolvedCwd,
           warnings: mergedWarnings,
         });
+      };
+      const startLogicalCompletionGrace = (
+        source: "turn.completed" | "task_complete",
+      ): void => {
+        if (logicalComplete) return;
+        logicalComplete = true;
+        clearWatchdog();
+        if (input.onLifecycle) {
+          void Promise.resolve(
+            input.onLifecycle({ type: "logical_complete", source, graceMs: this.closeGraceMs }),
+          ).catch(() => {});
+        }
+        if (this.closeGraceMs <= 0) return;
+        closeGraceTimer = setTimeout(() => {
+          forcedCloseAfterLogicalComplete = true;
+          if (input.onLifecycle) {
+            void Promise.resolve(
+              input.onLifecycle({ type: "close_grace_expired", source, graceMs: this.closeGraceMs }),
+            ).catch(() => {});
+          }
+          const processAlive = child.pid ? this.isProcessAlive(child.pid) : false;
+          const action = decideCloseGraceAction(processAlive);
+          if (action === "finalize") {
+            finalize(null);
+            return;
+          }
+          this.killProcessTree(child.pid);
+          finalize(null);
+        }, this.closeGraceMs);
+      };
+
+      child.stdout.on("data", (buf: Buffer) => {
+        const chunk = buf.toString("utf8");
+        stdout += chunk;
+        stdoutLineBuffer += chunk;
+        const lines = stdoutLineBuffer.split(/\r?\n/);
+        stdoutLineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          this.handleStdoutJsonlLine(line, input.onEvent, input.onAgentMessage);
+          const logicalCompletionSource = detectLogicalCompletionFromJsonlLine(line);
+          if (logicalCompletionSource) {
+            startLogicalCompletionGrace(logicalCompletionSource);
+          }
+        }
+      });
+      child.stderr.on("data", (buf: Buffer) => {
+        const chunk = buf.toString("utf8");
+        stderr += chunk;
+        stderrLineBuffer += chunk;
+        const lines = stderrLineBuffer.split(/\r?\n/);
+        stderrLineBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const text = line.trim();
+          if (!text) continue;
+          if (input.onStdErrLine) {
+            void Promise.resolve(input.onStdErrLine(text)).catch(() => {});
+          }
+        }
+      });
+      if (child.stdin) {
+        child.stdin.write(input.prompt);
+        child.stdin.end();
+      }
+      child.on("error", (err) => {
+        if (settled) return;
+        settled = true;
+        clearWatchdog();
+        clearCloseGrace();
+        if (child.pid) {
+          this.activeChildPids.delete(child.pid);
+          this.pidToThreadId.delete(child.pid);
+        }
+        resolve({
+          ok: false,
+          output: err.message,
+          errorCode: "ERR_CODEX_EXEC_FAILED",
+        });
+      });
+      child.on("close", (code, signal) => {
+        if (input.onClose) {
+          void Promise.resolve(input.onClose({ code, signal })).catch(() => {});
+        }
+        finalize(code);
       });
     });
   }

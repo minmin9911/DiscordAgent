@@ -8,7 +8,7 @@ Discord からPC上の Codex CLI を操作する Bot です。技術実証用で
 本ソフトは **Windows 用** です（Windows 上で動作する Node.js と OpenAI Codex を対象としています）。
 本ソフトが呼び出す Node.js と Codex CLI は **Windows ネイティブで動作している環境** を前提にしています（WSLは使用しません）。そのため、**低性能の古いWindows PCを母艦として利用することができます** 。
 
-本ソフト（DiscordのBot）を自宅PCでを稼働させ、Discordから、自宅PCのCodexを遠隔操作します。リビングや外出先から簡単にCodexを操作できます。Discordはブラウザ上で動作するので、ChromeBookなど幅広いOSから、母艦のCodexを操作することも可能です。
+本ソフト（DiscordのBot）を自宅PCでを稼働させ、Discordから、自宅PCのCodexを遠隔操作します。リビングや外出先から簡単にCodexを操作できます。Discordはブラウザ上でも動作するので、ChromeBookなど幅広いOSから、母艦のCodexを操作することも可能です。
 
 Discordのチャンネルやスレッドごとに別のCodexのセッションを割り当てることができるので、複数のCodexセッションをDiscordに登録することができます。例えば、作成中のアプリケーションごとにスレッドを作成し、それぞれにCodexのセッションを割り当てて、操作することが可能です。
 

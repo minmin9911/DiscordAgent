@@ -1,4 +1,4 @@
-import { exec, spawn, type ExecException } from "node:child_process";
+import { exec, spawn, spawnSync, type ExecException } from "node:child_process";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
 import { existsSync } from "node:fs";
 import { ATTACH_MAX_BYTES } from "./attachPolicy.js";
@@ -55,8 +55,17 @@ export function detectLogicalCompletionFromJsonlLine(
   return null;
 }
 
-export function decideCloseGraceAction(processAlive: boolean): "finalize" | "kill" {
-  return processAlive ? "kill" : "finalize";
+export function decideCloseGraceAction(processAlive: boolean): "finalize" | "terminate_parent" {
+  return processAlive ? "terminate_parent" : "finalize";
+}
+
+export function isCodexRuntimeCommandLine(commandLine: string | null | undefined): boolean {
+  if (!commandLine) return false;
+  const normalized = commandLine.toLowerCase();
+  return normalized.includes("@openai\\codex\\bin\\codex.js")
+    || normalized.includes("@openai/codex/bin/codex.js")
+    || normalized.includes("codex.cmd exec")
+    || normalized.includes(" codex exec ");
 }
 
 export class CodexAdapter {
@@ -337,7 +346,7 @@ export class CodexAdapter {
             finalize(null);
             return;
           }
-          this.killProcessTree(child.pid);
+          this.terminateCodexProcesses(child.pid);
           finalize(null);
         }, this.closeGraceMs);
       };
@@ -423,6 +432,71 @@ export class CodexAdapter {
       if (this.isProcessAlive(pid)) continue;
       this.activeChildPids.delete(pid);
       this.pidToThreadId.delete(pid);
+    }
+  }
+
+  private terminateCodexProcesses(pid: number | undefined): void {
+    if (!pid) return;
+    if (process.platform === "win32") {
+      const directChildren = this.getDirectChildProcesses(pid);
+      const codexChildPids = directChildren
+        .filter((child) => isCodexRuntimeCommandLine(child.commandLine))
+        .map((child) => child.pid);
+      for (const targetPid of [pid, ...codexChildPids]) {
+        this.terminateProcess(targetPid);
+      }
+      return;
+    }
+    this.terminateProcess(pid);
+  }
+
+  private terminateProcess(pid: number): void {
+    if (!pid) return;
+    if (process.platform === "win32") {
+      const killer = spawn("taskkill", ["/PID", String(pid), "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.on("error", () => {
+        // taskkill が使えない環境のフォールバック。
+      });
+      return;
+    }
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // 既に終了済みの場合は無視。
+    }
+  }
+
+  private getDirectChildProcesses(pid: number): Array<{ pid: number; commandLine: string | null }> {
+    if (process.platform !== "win32") return [];
+    const ps = spawnSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-Command",
+        `$rows = Get-CimInstance Win32_Process -Filter "ParentProcessId = ${pid}" | Select-Object ProcessId, CommandLine; $rows | ConvertTo-Json -Compress`,
+      ],
+      {
+        windowsHide: true,
+        encoding: "utf8",
+      },
+    );
+    if (ps.status !== 0 || !ps.stdout) return [];
+    try {
+      const parsed = JSON.parse(ps.stdout) as
+        | { ProcessId?: unknown; CommandLine?: unknown }
+        | Array<{ ProcessId?: unknown; CommandLine?: unknown }>;
+      const rows = Array.isArray(parsed) ? parsed : [parsed];
+      return rows
+        .map((row) => ({
+          pid: typeof row.ProcessId === "number" ? row.ProcessId : Number(row.ProcessId),
+          commandLine: typeof row.CommandLine === "string" ? row.CommandLine : null,
+        }))
+        .filter((row) => Number.isInteger(row.pid) && row.pid > 0);
+    } catch {
+      return [];
     }
   }
 

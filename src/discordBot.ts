@@ -32,6 +32,12 @@ import {
   buildPromptWithIncomingAttachments,
   sanitizeAttachmentFileName,
 } from "./incomingAttachmentPolicy.js";
+import {
+  buildInvalidThreadNotice,
+  buildThreadSwitchNotice,
+  detectThreadBindingChange,
+  isMissingCodexThreadError,
+} from "./threadBinding.js";
 import type { SessionRow } from "./types.js";
 import { truncateExternalUserMessage } from "./externalSyncText.js";
 
@@ -823,7 +829,47 @@ export class DiscordCodexBot {
     const incomingPaths = await this.saveIncomingAttachments(msg, session.id);
     const prompt = buildPromptWithIncomingAttachments(content, incomingPaths);
     const executionLockKey = this.getExecutionLockKey(session);
-    let observedThreadId: string | null = session.codex_thread_id ?? null;
+    const storedThreadIdAtStart = session.codex_thread_id ?? null;
+    let observedThreadId: string | null = storedThreadIdAtStart;
+    let threadSwitchNotice: string | null = null;
+    let threadSwitchAnnounced = false;
+    const applyObservedThreadId = async (
+      nextThreadId: string | null | undefined,
+      source: "event" | "result",
+    ): Promise<void> => {
+      if (!nextThreadId) return;
+      observedThreadId = nextThreadId;
+      const change = detectThreadBindingChange(session.codex_thread_id, nextThreadId);
+      if (change.kind === "none") return;
+      this.db.setSessionCodexThreadId(session.id, change.nextThreadId);
+      session.codex_thread_id = change.nextThreadId;
+      this.addLocalSyncSuppressionText(change.nextThreadId, "user_message", content);
+      if (change.kind === "bound") {
+        this.logger.info(
+          { executionId, sessionId: session.id, threadId: change.nextThreadId, source },
+          "codex thread bound",
+        );
+        return;
+      }
+      threadSwitchNotice ??= buildThreadSwitchNotice(change.previousThreadId, change.nextThreadId);
+      this.logger.warn(
+        {
+          executionId,
+          sessionId: session.id,
+          source,
+          storedThreadId: change.previousThreadId,
+          observedThreadId: change.nextThreadId,
+        },
+        "codex thread id switched",
+      );
+      if (threadSwitchAnnounced) return;
+      threadSwitchAnnounced = true;
+      try {
+        await sendChannel.send(threadSwitchNotice);
+      } catch {
+        // ユーザー通知失敗は本体処理を止めない。
+      }
+    };
     if (observedThreadId) {
       this.addLocalSyncSuppressionText(observedThreadId, "user_message", content);
     }
@@ -880,7 +926,7 @@ export class DiscordCodexBot {
           onEvent: async (event) => {
             if (finalized) return;
             if (event.threadId) {
-              observedThreadId = event.threadId;
+              await applyObservedThreadId(event.threadId, "event");
             }
             if (
               event.type === "turn.started"
@@ -984,15 +1030,28 @@ export class DiscordCodexBot {
             "codex warnings",
           );
         }
-        if (runResult.threadId && !session.codex_thread_id) {
-          this.db.setSessionCodexThreadId(session.id, runResult.threadId);
-          session.codex_thread_id = runResult.threadId;
-          observedThreadId = runResult.threadId;
-          this.addLocalSyncSuppressionText(runResult.threadId, "user_message", content);
-          this.logger.info(
-            { executionId, sessionId: session.id, threadId: runResult.threadId },
-            "codex thread bound",
+        await applyObservedThreadId(runResult.threadId, "result");
+        if (
+          storedThreadIdAtStart
+          && !runResult.threadId
+          && observedThreadId === storedThreadIdAtStart
+          && isMissingCodexThreadError(runResult.output)
+        ) {
+          const invalidThreadNotice = buildInvalidThreadNotice(storedThreadIdAtStart);
+          this.logger.warn(
+            {
+              executionId,
+              sessionId: session.id,
+              codexThreadId: storedThreadIdAtStart,
+              errorCode: runResult.errorCode ?? null,
+            },
+            "stored codex thread id is invalid",
           );
+          return {
+            status: "error" as const,
+            output: invalidThreadNotice,
+            errorCode: "ERR_CODEX_THREAD_NOT_FOUND",
+          };
         }
         if (!runResult.ok) {
           this.logger.warn(
@@ -1033,8 +1092,9 @@ export class DiscordCodexBot {
         const historyBlock = historyLines.length > 0
           ? `stream_log:\n${historyLines.join("\n")}\n`
           : "";
+        const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
         await sendOrEditFinal(
-          `codex_session: ${sessionLabel}\n${historyBlock}complete: body is sent in next message(s)`,
+          `codex_session: ${sessionLabel}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)`,
         );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);

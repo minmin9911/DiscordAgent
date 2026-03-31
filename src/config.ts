@@ -4,6 +4,7 @@ import { z } from "zod";
 dotenv();
 
 const schema = z.object({
+  APP_LOCALE: z.enum(["ja", "en"]).optional(),
   DISCORD_TOKEN: z.string().min(1),
   ALLOWED_CHANNEL_IDS: z.string().min(1),
   ALLOWED_USER_IDS: z.string().optional().default(""),
@@ -28,6 +29,7 @@ const schema = z.object({
 const parsed = schema.parse(process.env);
 
 export const appConfig = {
+  appLocale: parsed.APP_LOCALE,
   discordToken: parsed.DISCORD_TOKEN,
   allowedChannelIds: new Set(
     parsed.ALLOWED_CHANNEL_IDS.split(",")

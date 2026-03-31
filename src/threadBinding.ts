@@ -1,3 +1,5 @@
+import type { AppLocale } from "./i18n.js";
+
 export type ThreadBindingChange =
   | { kind: "none" }
   | { kind: "bound"; nextThreadId: string }
@@ -19,7 +21,19 @@ export function detectThreadBindingChange(
   };
 }
 
-export function buildThreadSwitchNotice(previousThreadId: string, nextThreadId: string): string {
+export function buildThreadSwitchNotice(
+  previousThreadId: string,
+  nextThreadId: string,
+  locale: AppLocale = "ja",
+): string {
+  if (locale === "en") {
+    return [
+      "notice: Codex switched the linked thread_id.",
+      `old: ${previousThreadId}`,
+      `new: ${nextThreadId}`,
+      "Future runs will use the new thread_id.",
+    ].join("\n");
+  }
   return [
     "notice: Codex側で thread_id が切り替わりました。",
     `old: ${previousThreadId}`,
@@ -33,7 +47,21 @@ export function isMissingCodexThreadError(text: string | null | undefined): bool
   return text.toLowerCase().includes("thread/resume failed: no rollout found for thread id");
 }
 
-export function buildInvalidThreadNotice(codexThreadId: string): string {
+export function buildInvalidThreadNotice(codexThreadId: string, locale: AppLocale = "ja"): string {
+  if (locale === "en") {
+    return [
+      "notice: The Codex thread_id linked to this session is invalid.",
+      `stored thread_id: ${codexThreadId}`,
+      "",
+      "Codex cannot find this thread_id, so this session cannot continue processing.",
+      "",
+      "How to recover:",
+      "・Start with a new Codex thread: `!session new [name]`",
+      "・Rebind to an existing Codex thread: `!codex` or `!codex session <codex_thread_id>`",
+      "",
+      "See `!help` for details.",
+    ].join("\n");
+  }
   return [
     "notice: 現在このセッションに紐づいている Codex thread_id は無効です。",
     `stored thread_id: ${codexThreadId}`,

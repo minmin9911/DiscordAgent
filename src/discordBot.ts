@@ -21,6 +21,48 @@ import { CodexAdapter } from "./codexAdapter.js";
 import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
 import {
+  attachAbsolutePathRequired,
+  attachInvalidPath,
+  attachNotFile,
+  attachNotFound,
+  attachStatFailed,
+  attachTooLarge,
+  attachUploadFailed,
+  buildCommandReference,
+  codexSessionLine,
+  codexSessionListEmpty,
+  completeHeader,
+  dmDisabledVerbose,
+  noSummary,
+  notLinkedYet,
+  unknownValue,
+  queuedMessage,
+  resolveAppLocale,
+  runningElapsedMessage,
+  runningPhaseMessage,
+  sessionCreated,
+  sessionLinkedThread,
+  sessionsListEmpty,
+  sessionSwitchedThread,
+  syntaxUnknownCommand,
+  syncDisabled,
+  syncEnabled,
+  syncResetDone,
+  syncStatus,
+  unreadRecoveryLines,
+  usageCodexSession,
+  usageQueue,
+  usageSessionConnect,
+  usageSessionRoot,
+  usageSessionSwitch,
+  usageSync,
+  workingDirectoryInherited,
+  queueFixExecuted,
+  queueStatusEmpty,
+  queueStatusTitle,
+  queueStopallExecuted,
+} from "./i18n.js";
+import {
   resolveCodexSessionMetaByThreadId,
   resolveWorkingDirectoryFromThreadId,
   searchCodexSessions,
@@ -65,46 +107,6 @@ function isUuidLike(value: string): boolean {
   );
 }
 
-function buildCommandReference(): string {
-  const build = getBuildLabel();
-  return [
-    `${APP_NAME} Command Reference`,
-    `build: ${build}`,
-    "",
-    "## 基本コマンド",
-    "- !help",
-    "- !ask <instruction>",
-    "  - 「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。",
-    "- !queue",
-    "  - 実行キューの状況を表示します。",
-    "- !queue stopall",
-    "  - 全キューを緊急停止します（待機中は取消、実行中は強制停止）。",
-    "- !queue fix",
-    "  - running孤児（存在しないCodexプロセスを待機中のスレッド）を修復します。",
-    "- !sync",
-    "  - 他のクライアント更新の同期状態を表示します。",
-    "- !sync on|off",
-    "  - 他のクライアント更新の同期を有効/無効にします。",
-    "- !sync reset",
-    "  - 現時点でのCodexのメッセージを全て同期済みとして扱います。未来の更新のみ同期します。",
-    "",
-    "## セッション管理",
-    "- !session new [name]",
-    "  - 現在のセッションとの接続を切り、新しいセッションを始めます（Codexのスレッドも新しくなります）。",
-    "- !session current",
-    "  - 現在のセッションの codex_thread_id / working_directory / status / queue などを表示します。",
-    "- !codex [query]",
-    "  - ~/.codex/sessions を検索して候補表示します（省略時は最新候補）。",
-    "- !codex pick <no>",
-    "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
-    "  - 直前の !codex 結果から番号選択します。",
-    "- !codex session <codex_thread_id>",
-    "  - 【推奨】CodexのスレッドID（UUID）でスレッドを指定します。",
-    "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
-    "  - 直接 thread_id を指定します。",
-  ].join("\n");
-}
-
 export class DiscordCodexBot {
   private readonly logger: pino.Logger;
   private readonly client = new Client({
@@ -118,6 +120,7 @@ export class DiscordCodexBot {
   private readonly sessionService: SessionService;
   private readonly codex: CodexAdapter;
   private readonly manager: ExecutionManager;
+  private readonly locale = resolveAppLocale(appConfig.appLocale);
   private readonly processedMessageIds = new Set<string>();
   private readonly codexSearchCache = new Map<string, CodexSessionMeta[]>();
   private readonly localSyncSuppress = new Map<
@@ -212,7 +215,7 @@ export class DiscordCodexBot {
       if (first) this.processedMessageIds.delete(first);
     }
     if (!msg.guildId) {
-      await msg.reply("ERR_DM_DISABLED: このBotはDMでは使用できません。");
+      await msg.reply(dmDisabledVerbose(this.locale));
       return;
     }
     if (!this.isAllowedChannel(msg)) return;
@@ -248,7 +251,7 @@ export class DiscordCodexBot {
         return;
       }
       if (content === "!help") {
-        await msg.reply(buildCommandReference());
+        await msg.reply(buildCommandReference(this.locale, getBuildLabel(), APP_NAME));
         return;
       }
       if (content === "!codex") {
@@ -289,7 +292,10 @@ export class DiscordCodexBot {
       }
       if (content.startsWith("!")) {
         await msg.reply(
-          `Syntax Error: 不明なコマンドです。\n\n${buildCommandReference()}`,
+          syntaxUnknownCommand(
+            this.locale,
+            buildCommandReference(this.locale, getBuildLabel(), APP_NAME),
+          ),
         );
         return;
       }
@@ -393,12 +399,7 @@ export class DiscordCodexBot {
     }
 
     if (toProcess.length === 0 && dropped === 0) return;
-    const lines = [`未読回収: ${toProcess.length}件を処理しました。`];
-    if (dropped > 0) {
-      lines.push(
-        `キュー上限(${UNREAD_RECOVERY_LIMIT}件)超過により ${dropped}件を破棄しました。`,
-      );
-    }
+    const lines = unreadRecoveryLines(this.locale, toProcess.length, dropped, UNREAD_RECOVERY_LIMIT);
     await channel.send(lines.join("\n"));
     this.logger.info(
       {
@@ -429,14 +430,14 @@ export class DiscordCodexBot {
     const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
     const cacheKey = this.buildCodexSearchCacheKey(msg.author.id, contextKey);
     if (/^session$/i.test(arg)) {
-      await msg.reply("usage: !codex session <codex_thread_id>");
+      await msg.reply(usageCodexSession(this.locale));
       return;
     }
     const sessionMatch = arg.match(/^session\s+(.+)$/i);
     if (sessionMatch) {
       const codexThreadId = sessionMatch[1].trim();
       if (!isUuidLike(codexThreadId)) {
-        await msg.reply("usage: !codex session <codex_thread_id>");
+        await msg.reply(usageCodexSession(this.locale));
         return;
       }
       const res = this.sessionService.rebindCurrentSessionCodexThread({
@@ -450,8 +451,8 @@ export class DiscordCodexBot {
         await msg.reply(res.code);
         return;
       }
-      await msg.reply(`session switched: codex_thread_id=${codexThreadId}`);
-      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
+      await msg.reply(sessionSwitchedThread(this.locale, codexThreadId));
+      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
       return;
     }
     const pickMatch = arg.match(/^pick\s+(\d+)$/i);
@@ -474,20 +475,20 @@ export class DiscordCodexBot {
         await msg.reply(rebindRes.code);
         return;
       }
-      await msg.reply(`session switched: codex_thread_id=${selected.threadId}`);
-      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(rebindRes.session)}`);
+      await msg.reply(sessionSwitchedThread(this.locale, selected.threadId));
+      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(rebindRes.session)));
       return;
     }
 
     const results = searchCodexSessions(arg, appConfig.listDefaultLimit);
     this.codexSearchCache.set(cacheKey, results);
     if (results.length === 0) {
-      await msg.reply("codex sessions (max 20)\n(no matches)");
+      await msg.reply(codexSessionListEmpty(this.locale));
       return;
     }
     const lines = results.map((s, i) => {
-      const cwd = s.cwd ?? "(unknown)";
-      const summary = s.summary?.replace(/\s+/g, " ").slice(0, 60) ?? "(no summary)";
+      const cwd = s.cwd ?? unknownValue(this.locale);
+      const summary = s.summary?.replace(/\s+/g, " ").slice(0, 60) ?? noSummary(this.locale);
       return `${i + 1} | ${s.threadId} | ${this.formatDateTime(s.updatedAtMs)} | ${cwd} | ${summary}`;
     });
     await this.sendMultilineReply(
@@ -506,7 +507,7 @@ export class DiscordCodexBot {
     const shorthandId = subRaw?.trim() ?? "";
 
     if (sub === "help") {
-      await msg.reply(buildCommandReference());
+      await msg.reply(buildCommandReference(this.locale, getBuildLabel(), APP_NAME));
       return;
     }
 
@@ -519,10 +520,10 @@ export class DiscordCodexBot {
       });
       if (localRes.ok) {
         await msg.reply(
-          `session switched: codex_session=${this.getUserFacingCodexSessionLabel(localRes.session)}`,
+          codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(localRes.session)),
         );
         await msg.reply(
-          `codex_session: ${this.getUserFacingCodexSessionLabel(localRes.session)}`,
+          codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(localRes.session)),
         );
         return;
       }
@@ -540,21 +541,17 @@ export class DiscordCodexBot {
         return;
       }
       if (connectRes.created) {
-        await msg.reply(
-          `session linked: codex_thread_id=${shorthandId}`,
-        );
+        await msg.reply(sessionLinkedThread(this.locale, shorthandId));
       } else {
-        await msg.reply(
-          `session switched: codex_thread_id=${shorthandId}`,
-        );
+        await msg.reply(sessionSwitchedThread(this.locale, shorthandId));
       }
-      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(connectRes.session)}`);
+      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(connectRes.session)));
       return;
     }
 
     if (sub === "connect") {
       if (!arg || !isUuidLike(arg)) {
-        await msg.reply("usage: !session connect <codex_thread_id>");
+        await msg.reply(usageSessionConnect(this.locale));
         return;
       }
       const connectRes = this.sessionService.connectCodexThread({
@@ -570,15 +567,11 @@ export class DiscordCodexBot {
         return;
       }
       if (connectRes.created) {
-        await msg.reply(
-          `session linked: codex_thread_id=${arg}`,
-        );
+        await msg.reply(sessionLinkedThread(this.locale, arg));
       } else {
-        await msg.reply(
-          `session switched: codex_thread_id=${arg}`,
-        );
+        await msg.reply(sessionSwitchedThread(this.locale, arg));
       }
-      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(connectRes.session)}`);
+      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(connectRes.session)));
       return;
     }
 
@@ -594,11 +587,11 @@ export class DiscordCodexBot {
         name: arg || undefined,
         preferredWorkingDirectory: inheritedWorkingDirectory ?? undefined,
       });
-      await msg.reply("session created");
+      await msg.reply(sessionCreated(this.locale));
       if (inheritedWorkingDirectory) {
-        await msg.reply(`working_directory inherited: ${inheritedWorkingDirectory}`);
+        await msg.reply(workingDirectoryInherited(this.locale, inheritedWorkingDirectory));
       }
-      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(created)}`);
+      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(created)));
       return;
     }
 
@@ -609,20 +602,22 @@ export class DiscordCodexBot {
       );
       this.sessionService.cacheListResult(msg.author.id, contextKey, sessions);
       if (sessions.length === 0) {
-        await msg.reply("sessions (max 20)\n(no sessions)");
+        await msg.reply(sessionsListEmpty(this.locale));
         return;
       }
       const lines = sessions.map(
         (s, i) =>
           `${i + 1} | ${this.getUserFacingCodexSessionLabel(s)} | ${s.status} | ${s.last_used_at}`,
       );
-      await msg.reply(`sessions (max 20)\n${lines.join("\n")}`);
+      await msg.reply(
+        `${this.locale === "en" ? "sessions (max 20)" : "sessions (max 20)"}\n${lines.join("\n")}`,
+      );
       return;
     }
 
     if (sub === "switch") {
       if (!arg) {
-        await msg.reply("usage: !session switch <id|name|no>");
+        await msg.reply(usageSessionSwitch(this.locale));
         return;
       }
       const isNo = /^\d+$/.test(arg);
@@ -638,9 +633,9 @@ export class DiscordCodexBot {
           return;
         }
         await msg.reply(
-          `session switched: codex_session=${this.getUserFacingCodexSessionLabel(res.session)}`,
+          codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)),
         );
-        await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
+        await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
         return;
       }
       const looksLikeId = isUuidLike(arg);
@@ -653,9 +648,9 @@ export class DiscordCodexBot {
         });
         if (res.ok) {
           await msg.reply(
-            `session switched: codex_session=${this.getUserFacingCodexSessionLabel(res.session)}`,
+            codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)),
           );
-          await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
+          await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
           return;
         }
         const connectRes = this.sessionService.connectCodexThread({
@@ -671,9 +666,9 @@ export class DiscordCodexBot {
           return;
         }
         await msg.reply(
-          `session switched: codex_session=${this.getUserFacingCodexSessionLabel(connectRes.session)}`,
+          codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(connectRes.session)),
         );
-        await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(connectRes.session)}`);
+        await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(connectRes.session)));
         return;
       }
       const res = this.sessionService.switchByName({
@@ -689,7 +684,9 @@ export class DiscordCodexBot {
             .map((s, i) => `${i + 1} | ${s.id} | ${s.name} | ${s.last_used_at}`);
           this.sessionService.cacheListResult(msg.author.id, contextKey, res.candidates);
           await msg.reply(
-            `ERR_SESSION_NAME_AMBIGUOUS\n候補:\n${lines.join("\n")}\n再指定: !session switch <id|no>`,
+            this.locale === "en"
+              ? `ERR_SESSION_NAME_AMBIGUOUS\nCandidates:\n${lines.join("\n")}\nRetry: !session switch <id|no>`
+              : `ERR_SESSION_NAME_AMBIGUOUS\n候補:\n${lines.join("\n")}\n再指定: !session switch <id|no>`,
           );
           return;
         }
@@ -697,9 +694,9 @@ export class DiscordCodexBot {
         return;
       }
       await msg.reply(
-        `session switched: codex_session=${this.getUserFacingCodexSessionLabel(res.session)}`,
+        codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)),
       );
-      await msg.reply(`codex_session: ${this.getUserFacingCodexSessionLabel(res.session)}`);
+      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
       return;
     }
 
@@ -715,11 +712,11 @@ export class DiscordCodexBot {
         ? (
             resolveWorkingDirectoryFromThreadId(current.codex_thread_id)
             ?? current.preferred_working_directory
-            ?? "(unknown)"
+            ?? unknownValue(this.locale)
           )
-        : (current.preferred_working_directory ?? "(not linked yet)");
+        : (current.preferred_working_directory ?? notLinkedYet(this.locale));
       const lines = [
-        `codex_thread_id: ${current.codex_thread_id ?? "(not linked yet)"}`,
+        `codex_thread_id: ${current.codex_thread_id ?? notLinkedYet(this.locale)}`,
         `working_directory: ${workingDirectory}`,
         `queue_lock_key: ${lockKey}`,
         `status: ${current.status}`,
@@ -731,7 +728,7 @@ export class DiscordCodexBot {
       return;
     }
 
-    await msg.reply("usage: !session <new|current> ...");
+    await msg.reply(usageSessionRoot(this.locale));
   }
 
   private async handleExecutionMessage(msg: Message, content: string): Promise<void> {
@@ -851,7 +848,11 @@ export class DiscordCodexBot {
         );
         return;
       }
-      threadSwitchNotice ??= buildThreadSwitchNotice(change.previousThreadId, change.nextThreadId);
+      threadSwitchNotice ??= buildThreadSwitchNotice(
+        change.previousThreadId,
+        change.nextThreadId,
+        this.locale,
+      );
       this.logger.warn(
         {
           executionId,
@@ -891,7 +892,11 @@ export class DiscordCodexBot {
       text: content,
       maxRetries: 1,
       onQueued: async (position) => {
-        const text = `queued (#${position}) codex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
+        const text = queuedMessage(
+          this.locale,
+          position,
+          this.getUserFacingCodexSessionLabel(session),
+        );
         try {
           await msg.reply(text);
         } catch {
@@ -902,7 +907,12 @@ export class DiscordCodexBot {
         if (finalized) return;
         const progressText =
           composeStatusText(
-            `running... elapsed=${elapsedSec}s queue=${queueLength} codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+            runningElapsedMessage(
+              this.locale,
+              elapsedSec,
+              queueLength,
+              this.getUserFacingCodexSessionLabel(session),
+            ),
           );
         await editProgressMessage(progressText);
       },
@@ -956,7 +966,11 @@ export class DiscordCodexBot {
             if (event.type === "turn.started") {
               await editProgressMessage(
                 composeStatusText(
-                  `running... phase=turn.started codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+                  runningPhaseMessage(
+                    this.locale,
+                    "turn.started",
+                    this.getUserFacingCodexSessionLabel(session),
+                  ),
                 ),
               );
             }
@@ -976,7 +990,11 @@ export class DiscordCodexBot {
             addStreamHistory(previewText);
             await editProgressMessage(
               composeStatusText(
-                `running... phase=agent_message codex_session: ${this.getUserFacingCodexSessionLabel(session)}`,
+                runningPhaseMessage(
+                  this.locale,
+                  "agent_message",
+                  this.getUserFacingCodexSessionLabel(session),
+                ),
               ),
             );
           },
@@ -1037,7 +1055,7 @@ export class DiscordCodexBot {
           && observedThreadId === storedThreadIdAtStart
           && isMissingCodexThreadError(runResult.output)
         ) {
-          const invalidThreadNotice = buildInvalidThreadNotice(storedThreadIdAtStart);
+          const invalidThreadNotice = buildInvalidThreadNotice(storedThreadIdAtStart, this.locale);
           this.logger.warn(
             {
               executionId,
@@ -1094,7 +1112,7 @@ export class DiscordCodexBot {
           : "";
         const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
         await sendOrEditFinal(
-          `codex_session: ${sessionLabel}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)`,
+          completeHeader(this.locale, sessionLabel, switchBlock, historyBlock),
         );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
@@ -1129,13 +1147,13 @@ export class DiscordCodexBot {
         "queue emergency stopall requested",
       );
       await msg.reply(
-        [
-          "queue stopall executed",
-          `cancelled_inflight: ${canceled}`,
-          `killed_running_processes: ${killed}`,
-          `reset_locks: ${reset.clearedLocks}`,
-          `dropped_pending_queue: ${reset.droppedQueued}`,
-        ].join("\n"),
+        queueStopallExecuted(
+          this.locale,
+          canceled,
+          killed,
+          reset.clearedLocks,
+          reset.droppedQueued,
+        ),
       );
       return;
     }
@@ -1174,26 +1192,26 @@ export class DiscordCodexBot {
         "queue fix requested",
       );
       await msg.reply(
-        [
-          "queue fix executed",
-          `checked_running: ${running.length}`,
-          `fixed_orphan_running: ${fixed}`,
-          `released_stale_locks: ${releasedLocks}`,
-          `active_codex_threads: ${activeThreadIds.size}`,
-        ].join("\n"),
+        queueFixExecuted(
+          this.locale,
+          running.length,
+          fixed,
+          releasedLocks,
+          activeThreadIds.size,
+        ),
       );
       return;
     }
 
     if (sub.length > 0 && sub !== "status") {
-      await msg.reply("usage: !queue [status|stopall|fix]");
+      await msg.reply(usageQueue(this.locale));
       return;
     }
 
     const snapshots = this.manager.getQueueSnapshots();
     const inFlight = this.db.listInFlightExecutions(100);
     if (snapshots.length === 0 && inFlight.length === 0) {
-      await msg.reply("queue status\n(no queued/running tasks)");
+      await msg.reply(queueStatusEmpty(this.locale));
       return;
     }
 
@@ -1217,9 +1235,9 @@ export class DiscordCodexBot {
         ? (
             resolveWorkingDirectoryFromThreadId(e.codex_thread_id)
             ?? e.preferred_working_directory
-            ?? "(unknown)"
+            ?? unknownValue(this.locale)
           )
-        : (e.preferred_working_directory ?? "(not linked yet)");
+        : (e.preferred_working_directory ?? notLinkedYet(this.locale));
       lines.push(
         [
           e.result_status,
@@ -1232,39 +1250,38 @@ export class DiscordCodexBot {
         ].join(" | "),
       );
     }
-    await this.sendMultilineReply(msg, "queue status", lines);
+    await this.sendMultilineReply(msg, queueStatusTitle(this.locale), lines);
   }
 
   private async handleSyncCommand(msg: Message, body: string): Promise<void> {
     const arg = body.trim().toLowerCase();
     if (!arg || arg === "status") {
-      const lines = [
-        `sync_enabled: ${this.externalSyncEnabled ? "yes" : "no"}`,
-        `sync_poll_sec: ${appConfig.externalSyncPollSec}`,
-        `sync_max_burst_global: ${appConfig.externalSyncMaxBurst}`,
-        "mode: future-only",
-      ];
-      await msg.reply(lines.join("\n"));
+      await msg.reply(
+        syncStatus(
+          this.locale,
+          this.externalSyncEnabled,
+          appConfig.externalSyncPollSec,
+          appConfig.externalSyncMaxBurst,
+        ),
+      );
       return;
     }
     if (arg === "on") {
       this.externalSyncEnabled = true;
-      await msg.reply("sync enabled");
+      await msg.reply(syncEnabled(this.locale));
       return;
     }
     if (arg === "off") {
       this.externalSyncEnabled = false;
-      await msg.reply("sync disabled");
+      await msg.reply(syncDisabled(this.locale));
       return;
     }
     if (arg === "reset") {
       const anchored = this.resetExternalSyncCursorsToLatest();
-      await msg.reply(
-        `sync reset done: anchored_threads=${anchored}\nmode=future-only`,
-      );
+      await msg.reply(syncResetDone(this.locale, anchored));
       return;
     }
-    await msg.reply("usage: !sync [status|on|off|reset]");
+    await msg.reply(usageSync(this.locale));
   }
 
   private resetExternalSyncCursorsToLatest(): number {
@@ -1612,39 +1629,37 @@ export class DiscordCodexBot {
     for (const rawPath of paths) {
       const filePath = rawPath.trim();
       if (!filePath) {
-        await sendChannel.send("ERR_ATTACH_INVALID_PATH: empty");
+        await sendChannel.send(attachInvalidPath(this.locale));
         continue;
       }
       if (!isAbsolute(filePath)) {
-        await sendChannel.send(`ERR_ATTACH_ABSOLUTE_PATH_REQUIRED: ${filePath}`);
+        await sendChannel.send(attachAbsolutePathRequired(this.locale, filePath));
         continue;
       }
       if (!existsSync(filePath)) {
-        await sendChannel.send(`ERR_ATTACH_NOT_FOUND: ${filePath}`);
+        await sendChannel.send(attachNotFound(this.locale, filePath));
         continue;
       }
       let size = 0;
       try {
         const st = statSync(filePath);
         if (!st.isFile()) {
-          await sendChannel.send(`ERR_ATTACH_NOT_FILE: ${filePath}`);
+          await sendChannel.send(attachNotFile(this.locale, filePath));
           continue;
         }
         size = st.size;
       } catch {
-        await sendChannel.send(`ERR_ATTACH_STAT_FAILED: ${filePath}`);
+        await sendChannel.send(attachStatFailed(this.locale, filePath));
         continue;
       }
       if (size > ATTACH_MAX_BYTES) {
-        await sendChannel.send(
-          `ERR_ATTACH_TOO_LARGE: ${filePath} (${size} bytes > ${ATTACH_MAX_BYTES} bytes)`,
-        );
+        await sendChannel.send(attachTooLarge(this.locale, filePath, size, ATTACH_MAX_BYTES));
         continue;
       }
       try {
         await sendChannel.send({ files: [filePath] });
       } catch {
-        await sendChannel.send(`ERR_ATTACH_UPLOAD_FAILED: ${filePath}`);
+        await sendChannel.send(attachUploadFailed(this.locale, filePath));
       }
     }
   }
@@ -1657,7 +1672,7 @@ export class DiscordCodexBot {
   }
 
   private getUserFacingCodexSessionLabel(session: SessionRow): string {
-    return session.codex_thread_id ?? "(not linked yet)";
+    return session.codex_thread_id ?? notLinkedYet(this.locale);
   }
 
   private async sendMultilineReply(

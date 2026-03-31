@@ -29,9 +29,11 @@ Codex can also return files to Discord by emitting `!attach <absolute_path>`.
 - A Discord Bot application
 - A local Codex CLI running natively on Windows
 
-## Important Note About Language Support
+## Language
 
-Some runtime messages, including `!help`, are currently Japanese-only. This should not be a practical blocker for most users, but an English version of help and bot messages is planned for a future release. Sorry for the inconvenience.
+- `APP_LOCALE=ja|en` selects the bot language explicitly.
+- If `APP_LOCALE` is omitted, the bot falls back to the Windows OS locale.
+- Shared error codes such as `ERR_*` remain common across languages.
 
 ## Setup
 
@@ -51,8 +53,27 @@ Some runtime messages, including `!help`, are currently Japanese-only. This shou
 Then prepare the local environment:
 
 ```bash
+git clone https://github.com/minmin9911/DiscordAgent.git
+cd DiscordAgent
 copy .env.example .env
+```
+
+Edit `.env`, then install dependencies:
+
+```bash
 npm install
+```
+
+Then start the bot:
+
+```bat
+run_DiscordAgent.cmd
+```
+
+If DiscordAgent will not perform self-restart operations, you can also run it with:
+
+```bash
+npm start
 ```
 
 ## Main `.env` Settings
@@ -60,6 +81,7 @@ npm install
 - `DISCORD_TOKEN`: bot token
 - `ALLOWED_CHANNEL_IDS`: allowed Discord channel IDs
 - `ALLOWED_USER_IDS`: optional allowlist of user IDs
+- `APP_LOCALE`: bot language (`ja` or `en`)
 - `SQLITE_PATH`: SQLite database path
 - `CODEX_MODE`: usually `cli`
 - `CODEX_TIMEOUT_SEC`: Codex timeout in seconds

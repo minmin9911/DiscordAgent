@@ -48,7 +48,7 @@ Discordのチャンネルやスレッドごとに別のCodexのセッション�
 
 1. Discord で、自分専用のサーバーとチャンネルを作成します（既にある場合は省略可）
 2. Discord Developer Portal で Application / Bot を作成
-3. `Installation` タブで `Install Link = None` に設定（Public Botにするために必要）
+3. `Installation` タブで `Install Link = None` に設定（公開インストール導線を無効にするため）
 4. `Bot` タブでトークンを控え（発行済みの場合は再発行する）、また、`Public Bot` を OFF
 5. OAuth2 URL Generator で Bot を対象サーバーへ招待（下記の権限を参考に設定してください）
 
@@ -70,16 +70,37 @@ Discordのチャンネルやスレッドごとに別のCodexのセッション�
 ## スクリプト本体の準備
 
 次に母艦PC側での作業となります。
-git cloneし終わったら、Discordのトークンなどを.envファイルに設定します。
+リポジトリを取得し、`.env` を作成します。
 
 ```bash
+git clone https://github.com/minmin9911/DiscordAgent.git
+cd DiscordAgent
 copy .env.example .env
+```
+
+その後、`.env` に Discord のトークンなどを設定し、依存関係をインストールします。
+
+```bash
 npm install
 ```
 
 設定は.envファイルにて行います。設定テンプレート（.env.example）を.envとしてコピーし、そこに次項を参考に設定してください。
 
+Bot の起動は次です。
+
+```bat
+run_DiscordAgent.cmd
+```
+
+DiscordAgent が自らを再起動させる操作を行わない場合は、次でも起動できます。
+
+```bash
+npm start
+```
+
 ## `.env` 主な設定
+
+* `APP_LOCALE`: Botの表示言語（`ja` または `en`、省略時はWindowsのOSロケールから決定）
 
 * `DISCORD_TOKEN`: Bot トークン
 

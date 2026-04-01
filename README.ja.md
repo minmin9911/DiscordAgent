@@ -256,3 +256,49 @@ Codex CLIやVSCodeの拡張などからCodexに指示を与えた履歴をDiscor
 * EXTERNAL\_SYNC\_MAX\_BURST : 1回の同期で送信する最大件数（既定30、超過分は古い順に送信スキップ）
 
 * EXTERNAL\_SYNC\_USER\_MAX\_CHARS : 外部同期の user\_message を送信前に切り詰める最大文字数（既定300）
+
+## Skill による拡張例
+
+DiscordAgent は、Skill を追加することで用途を大きく広げられます。  
+Skill は Codex で各自が作成できるため、自分専用の秘書、音声窓口、ブラウザ自動化ツールとして育てていけます。以下は、私が実際に Codex に作成させて、DiscordAgent から呼び出している Skill の例となります。
+
+・名前: `local-voice-command-intake`  
+・機能: 音声ファイル（`*.ogg`）をローカルで文字起こしし、依頼文に整える  
+・用途: Discord に音声を送るだけで、話し言葉の依頼を Codex へ渡せる  
+・技術: `faster-whisper`
+
+・名前: `web2markdown-clip`  
+・機能: 指定した URL を Markdown 化して Obsidian の Vault に保存する  
+・用途: 気になった記事や資料を Discord からそのまま知識ベースへ蓄積できる  
+・技術: 
+
+・名前: `google-calendar-rw`  
+・機能: Google Calendar の参照、作成、更新、削除を自然言語で行う  
+・用途: 予定確認や日程調整を Discord 上の会話から進められる  
+・技術: `Google Calendar API`
+
+・名前: `google-gmail-rw`  
+・機能: Gmail の参照、送信、状態更新、ゴミ箱移動を自然言語で行う  
+・用途: メール確認や返信下書きを Discord から依頼できる  
+・技術: `Gmail API`
+
+・名前: `google-tasks-rw`  
+・機能: Google Tasks の参照、作成、更新、削除を自然言語で行う  
+・用途: やること整理やタスク追加を Discord の会話から進められる  
+・技術: `Google Tasks API`
+
+・名前: `edge-browser-operator`  
+・機能: Windows ネイティブの Microsoft Edge を Playwright で操作する  
+・用途: ブラウザ操作を伴う調査や定型作業を Discord から自動化できる  
+・技術: `Playwright`, `Microsoft Edge`
+
+・名前: `restart-discordagent-windows`  
+・機能: `run_DiscordAgent.cmd` から呼び出されている `node.exe` を狙い撃ちで終了し、DiscordAgent を再起動させる  
+・用途: 外出先からでも DiscordAgent を自殺的に再起動し、復旧につなげられる  
+・技術: 
+
+用意された Skill を使うだけでなく、「何をしたいか」「どう運用したいか」を Codex に伝えれば、自分に合った Skill を追加で開発させることもできます。  
+DiscordAgent は、その Skill を育てながら自分専用の作業環境へ近づけていくための入口になります。
+
+たとえば、Gmail で届いた会社からのメールに記載された予定をカレンダーに登録し、そのメールに記載された資料作成をタスクへ追加するといった複合的な依頼も可能です。  
+また、「予定変更の連絡がメールで来ているので、新しい時間に合わせてカレンダーに登録済みの『移動』予定の時間帯を変更してください」のように、メール確認と既存予定の更新を組み合わせた処理も行えます。

@@ -149,3 +149,49 @@ This works in future-only mode and does not replay older history.
 
 `run_DiscordAgent.cmd` is intended to keep restarting the app in a loop.
 That design allows remote restart by killing only the child `node` process while leaving the parent batch process alive.
+
+## Skill Extension Examples
+
+DiscordAgent becomes much more useful when extended with Skills.  
+Because Skills can be created by Codex itself, you can grow DiscordAgent into your own secretary, voice intake endpoint, or browser automation tool. Below are examples of Skills that I actually had Codex create and that I call through DiscordAgent.
+
+・Name: `local-voice-command-intake`  
+・Function: Transcribes voice files (`*.ogg`) locally and converts them into an executable request  
+・Use: You can send a voice message to Discord and have spoken requests passed to Codex  
+・Technology: `faster-whisper`
+
+・Name: `web2markdown-clip`  
+・Function: Converts a given URL into Markdown and saves it into an Obsidian Vault  
+・Use: You can send articles or reference pages from Discord directly into your knowledge base  
+・Technology: 
+
+・Name: `google-calendar-rw`  
+・Function: Reads, creates, updates, and deletes Google Calendar entries in natural language  
+・Use: You can check schedules and adjust plans directly from a Discord conversation  
+・Technology: `Google Calendar API`
+
+・Name: `google-gmail-rw`  
+・Function: Reads, sends, updates, and trashes Gmail messages in natural language  
+・Use: You can review email and draft replies from Discord  
+・Technology: `Gmail API`
+
+・Name: `google-tasks-rw`  
+・Function: Reads, creates, updates, and deletes Google Tasks in natural language  
+・Use: You can organize todos and add tasks from Discord conversations  
+・Technology: `Google Tasks API`
+
+・Name: `edge-browser-operator`  
+・Function: Operates native Microsoft Edge on Windows through Playwright  
+・Use: You can automate browser-based research and routine web tasks from Discord  
+・Technology: `Playwright`, `Microsoft Edge`
+
+・Name: `restart-discordagent-windows`  
+・Function: Targets and terminates the `node.exe` launched from `run_DiscordAgent.cmd` to restart DiscordAgent  
+・Use: You can force a remote, self-destructive restart of DiscordAgent and recover service while away from the machine  
+・Technology: 
+
+Using prepared Skills is only one side of the story. If you tell Codex what you want to do and how you want to operate, it can also create new Skills tailored to your workflow.  
+DiscordAgent is not just a finished bot, but a starting point for growing your own working environment through Skills.
+
+For example, you can ask it to read a company email from Gmail, register the schedule described there into Google Calendar, and add “prepare the attached materials” into your task list.  
+You can also ask for combined tasks such as checking a rescheduling email and updating an existing “travel” event in your calendar to match the new time.

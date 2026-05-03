@@ -1,4 +1,13 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -12,6 +21,16 @@ export interface CodexSessionMeta {
   summary: string | null;
   searchText: string | null;
   updatedAtMs: number;
+}
+
+export interface CodexUsageStatus {
+  planType: string | null;
+  primaryUsedPercent: number | null;
+  primaryWindowMinutes: number | null;
+  primaryResetsAt: number | null;
+  secondaryUsedPercent: number | null;
+  secondaryWindowMinutes: number | null;
+  secondaryResetsAt: number | null;
 }
 
 function findSessionFileByThreadId(rootDir: string, threadId: string): string | null {
@@ -33,6 +52,84 @@ function findSessionFileByThreadId(rootDir: string, threadId: string): string | 
     }
   }
   return null;
+}
+
+function readNullableNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function readNullableString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+function parseUsageStatusFromTokenCountLine(line: string): CodexUsageStatus | null {
+  try {
+    const obj = JSON.parse(line) as Record<string, unknown>;
+    if (obj.type !== "event_msg") return null;
+    const payload = obj.payload;
+    if (!payload || typeof payload !== "object") return null;
+    const payloadObj = payload as Record<string, unknown>;
+    if (payloadObj.type !== "token_count") return null;
+    const rateLimits = payloadObj.rate_limits;
+    if (!rateLimits || typeof rateLimits !== "object") return null;
+    const rateLimitsObj = rateLimits as Record<string, unknown>;
+    const primary = rateLimitsObj.primary && typeof rateLimitsObj.primary === "object"
+      ? rateLimitsObj.primary as Record<string, unknown>
+      : null;
+    const secondary = rateLimitsObj.secondary && typeof rateLimitsObj.secondary === "object"
+      ? rateLimitsObj.secondary as Record<string, unknown>
+      : null;
+    return {
+      planType: readNullableString(rateLimitsObj.plan_type),
+      primaryUsedPercent: readNullableNumber(primary?.used_percent),
+      primaryWindowMinutes: readNullableNumber(primary?.window_minutes),
+      primaryResetsAt: readNullableNumber(primary?.resets_at),
+      secondaryUsedPercent: readNullableNumber(secondary?.used_percent),
+      secondaryWindowMinutes: readNullableNumber(secondary?.window_minutes),
+      secondaryResetsAt: readNullableNumber(secondary?.resets_at),
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function readLatestCodexUsageStatusFromSessionFile(
+  sessionFile: string,
+): CodexUsageStatus | null {
+  const tailSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+  const fd = openSync(sessionFile, "r");
+  try {
+    const fileSize = fstatSync(fd).size;
+    for (const tailSize of tailSizes) {
+      const length = Math.min(fileSize, tailSize);
+      const start = Math.max(0, fileSize - length);
+      const buffer = Buffer.alloc(length);
+      readSync(fd, buffer, 0, length, start);
+      const text = buffer.toString("utf8");
+      const lines = text.split(/\r?\n/);
+      if (start > 0) lines.shift();
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i]?.trim();
+        if (!line || !line.includes('"token_count"')) continue;
+        const parsed = parseUsageStatusFromTokenCountLine(line);
+        if (parsed) return parsed;
+      }
+      if (length === fileSize) break;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return null;
+}
+
+export function readLatestCodexUsageStatusByThreadId(
+  threadId: string,
+): CodexUsageStatus | null {
+  const sessionsRoot = join(homedir(), ".codex", "sessions");
+  if (!existsSync(sessionsRoot)) return null;
+  const sessionFile = findSessionFileByThreadId(sessionsRoot, threadId);
+  if (!sessionFile) return null;
+  return readLatestCodexUsageStatusFromSessionFile(sessionFile);
 }
 
 function parseCwdFromSessionMeta(sessionFile: string): string | null {

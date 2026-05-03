@@ -3,6 +3,20 @@ import { z } from "zod";
 
 dotenv();
 
+function envBoolean(defaultValue: boolean) {
+  return z.string().optional().transform((value, ctx) => {
+    if (value == null || value.trim() === "") return defaultValue;
+    const normalized = value.trim().toLowerCase();
+    if (["true", "1", "yes", "on"].includes(normalized)) return true;
+    if (["false", "0", "no", "off"].includes(normalized)) return false;
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Expected boolean value: true/false, 1/0, yes/no, or on/off",
+    });
+    return z.NEVER;
+  });
+}
+
 const schema = z.object({
   APP_LOCALE: z.enum(["ja", "en"]).optional(),
   DISCORD_TOKEN: z.string().min(1),
@@ -20,10 +34,11 @@ const schema = z.object({
   INCOMING_ATTACH_TTL_HOURS: z.coerce.number().int().positive().default(72),
   INCOMING_ATTACH_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
   INSTANCE_LOCK_PORT: z.coerce.number().int().min(1024).max(65535).default(45991),
-  EXTERNAL_SYNC_ENABLED: z.coerce.boolean().default(true),
+  EXTERNAL_SYNC_ENABLED: envBoolean(true),
   EXTERNAL_SYNC_POLL_SEC: z.coerce.number().int().min(5).max(300).default(15),
   EXTERNAL_SYNC_MAX_BURST: z.coerce.number().int().min(1).max(300).default(30),
   EXTERNAL_SYNC_USER_MAX_CHARS: z.coerce.number().int().min(50).max(10000).default(300),
+  SHOW_FINAL_STREAM_LOG: envBoolean(true),
 });
 
 const parsed = schema.parse(process.env);
@@ -55,6 +70,7 @@ export const appConfig = {
   externalSyncPollSec: parsed.EXTERNAL_SYNC_POLL_SEC,
   externalSyncMaxBurst: parsed.EXTERNAL_SYNC_MAX_BURST,
   externalSyncUserMaxChars: parsed.EXTERNAL_SYNC_USER_MAX_CHARS,
+  showFinalStreamLog: parsed.SHOW_FINAL_STREAM_LOG,
   listDefaultLimit: 20,
   queueLimitPerSession: 20,
   progressIntervalSec: 30,

@@ -1,5 +1,15 @@
 export type AppLocale = "ja" | "en";
 
+type UsageLimitStatus = {
+  planType: string | null;
+  primaryUsedPercent: number | null;
+  primaryWindowMinutes: number | null;
+  primaryResetsAt: number | null;
+  secondaryUsedPercent: number | null;
+  secondaryWindowMinutes: number | null;
+  secondaryResetsAt: number | null;
+};
+
 export function resolveAppLocale(explicitLocale: string | null | undefined): AppLocale {
   if (explicitLocale === "ja" || explicitLocale === "en") return explicitLocale;
   const runtimeLocale = Intl.DateTimeFormat().resolvedOptions().locale.toLowerCase();
@@ -120,14 +130,62 @@ export function runningPhaseMessage(
   return `running... phase=${phase} codex_session: ${label}`;
 }
 
+function formatLimitLeft(
+  locale: AppLocale,
+  usedPercent: number | null,
+  windowMinutes: number | null,
+): string | null {
+  if (usedPercent == null) return null;
+  const leftPercent = Math.max(0, Math.min(100, Math.round(100 - usedPercent)));
+  if (windowMinutes === 300) {
+    return locale === "en" ? `\`5h=${leftPercent}%\`` : `\`5時間=${leftPercent}%\``;
+  }
+  if (windowMinutes === 10080) {
+    return locale === "en" ? `\`weekly=${leftPercent}%\`` : `\`週間=${leftPercent}%\``;
+  }
+  return `\`window${windowMinutes ?? "?"}m=${leftPercent}%\``;
+}
+
+export function codexUsageStatusLine(
+  locale: AppLocale,
+  status: UsageLimitStatus,
+): string {
+  const primary = formatLimitLeft(locale, status.primaryUsedPercent, status.primaryWindowMinutes);
+  const secondary = formatLimitLeft(locale, status.secondaryUsedPercent, status.secondaryWindowMinutes);
+  const parts = [primary, secondary].filter((v): v is string => Boolean(v));
+  const resetsAtEpochSec = status.secondaryResetsAt ?? status.primaryResetsAt;
+  if (resetsAtEpochSec != null) {
+    const resetAt = new Date(resetsAtEpochSec * 1000);
+    const formatted = new Intl.DateTimeFormat(
+      locale === "en" ? "en-US" : "ja-JP",
+      {
+        timeZone: "Asia/Tokyo",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      },
+    ).format(resetAt);
+    parts.push(locale === "en" ? `reset=${formatted} JST` : `リセット=${formatted} JST`);
+  }
+  if (status.planType) {
+    parts.push(`plan=${status.planType}`);
+  }
+  const prefix = locale === "en" ? "**Usage:**" : "**利用状況:**";
+  return `${prefix} ${parts.join(" ")}`;
+}
+
 export function completeHeader(
   _locale: AppLocale,
   label: string,
   switchBlock: string,
+  usageBlock: string,
   historyBlock: string,
 ): string {
   void _locale;
-  return `codex_session: ${label}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)`;
+  return `codex_session: ${label}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)\n${usageBlock}`.trimEnd();
 }
 
 export function usageCodexSession(locale: AppLocale): string {

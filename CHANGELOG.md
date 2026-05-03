@@ -1,55 +1,62 @@
 # CHANGELOG
 
-上が最新ビルド、下へ行くほど古いビルド。
+Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
+
+Newest builds are listed first.
+
+## v0.1.0 build.60 (2026-05-03)
+- Display 5-hour LIMIT and weekly LIMIT usage status in the completion header.
+- Add `SHOW_FINAL_STREAM_LOG`, allowing the `stream_log` section to be cleared after streaming completes so only the full body remains visible. The default keeps the stream log.
+- Fix a bug where `EXTERNAL_SYNC_ENABLED=false` was not applied correctly.
 
 ## v0.1.0 build.45 (2026-03-15)
-- 添付ファイルだけの投稿も実行対象として扱い、画像やファイルのみのメッセージでもCodexへ渡せるよう修正。
+- Treat attachment-only messages as executable requests, allowing images and files to be passed to Codex without accompanying text.
 
 ## v0.1.0 build.44 (2026-03-14)
-- `!queue stopall` / `!queue fix` の復旧性を改善し、停止後に同一セッションのキューが詰まり続ける問題を修正。
+- Improve recovery behavior for `!queue stopall` / `!queue fix`, fixing cases where a session queue could remain stuck after stopping.
 
 ## v0.1.0 build.43 (2026-03-08)
-- 他のクライアント（Codex CLI / Windows App）で同一 codex_thread_id が更新された場合に、Discordへ同期する !sync 機能を追加。
-- 同期モードは future-only 固定。初回起動時と !sync reset は現在位置へアンカーし、過去履歴は送信しない。
-- !sync / !sync on / !sync off / !sync reset を追加。
-- .env に EXTERNAL_SYNC_ENABLED と EXTERNAL_SYNC_POLL_SEC を追加。
+- Add the `!sync` feature to sync updates made to the same `codex_thread_id` from other clients such as Codex CLI or the Windows App back to Discord.
+- External sync is future-only. Startup and `!sync reset` anchor at the current position and do not send past history.
+- Add `!sync`, `!sync on`, `!sync off`, and `!sync reset`.
+- Add `EXTERNAL_SYNC_ENABLED` and `EXTERNAL_SYNC_POLL_SEC` to `.env`.
 
 ## v0.1.0 build.36 (2026-03-06)
-- Codex CLI (`--json`) の stdout JSONL を逐次読み取りできるようにし、ストリーミング表示に対応した。
-- `!queue` の status 出力に `working_directory` を追加。
-- `working_directory` は、`codex_thread_id` から解決できる場合はそれを優先し、解決できない場合は `preferred_working_directory` を表示。
+- Read Codex CLI (`--json`) stdout JSONL incrementally and support streaming display.
+- Add `working_directory` to `!queue` status output.
+- Prefer resolving `working_directory` from `codex_thread_id`; fall back to `preferred_working_directory` if it cannot be resolved.
 
 ## v0.1.0 build.32 (2026-03-05)
-- Discord添付ファイルを受信して保存し、Codexプロンプトへ絶対パスで連携する機能を追加。
-- `INCOMING_ATTACH_DIR` / `INCOMING_ATTACH_TTL_HOURS` / `INCOMING_ATTACH_MAX_BYTES` を追加。
-- 期限超過添付のクリーンアップ処理を追加。
-- 添付ファイル参照のプロンプト文言を改善し、`latest_attachment_path` を導入。
-- 「このファイル / これ / そのファイル」を `latest_attachment_path` に解決するルールを追加。
+- Save incoming Discord attachments and pass their absolute paths into the Codex prompt.
+- Add `INCOMING_ATTACH_DIR`, `INCOMING_ATTACH_TTL_HOURS`, and `INCOMING_ATTACH_MAX_BYTES`.
+- Add cleanup for expired incoming attachments.
+- Improve attachment-reference prompt text and introduce `latest_attachment_path`.
+- Resolve phrases such as "this file", "this", and "that file" to `latest_attachment_path`.
 
 ## v0.1.0 build.30 (2026-03-03)
-- `ALLOWED_USER_IDS` を実装し、許可ユーザーのみBot操作を許可。
-- `!queue` / `!queue status` / `!queue stopall` / `!queue fix` を追加。
-- Codexプロセスの緊急停止とキュー復旧手段を整備。
+- Implement `ALLOWED_USER_IDS` so only allowed users can operate the bot.
+- Add `!queue`, `!queue status`, `!queue stopall`, and `!queue fix`.
+- Add emergency Codex process stop and queue recovery mechanisms.
 
 ## v0.1.0 build.29 (2026-02-28)
-- Codex の WebSocket→HTTPS フォールバック時に、`agent_message` が取得できていれば成功扱いにする改善を実施。
-- `Falling back from WebSockets to HTTPS transport` / `stream disconnected before completion` を警告扱いへ統一。
+- Treat WebSocket-to-HTTPS fallback as successful when an `agent_message` is still obtained.
+- Normalize `Falling back from WebSockets to HTTPS transport` / `stream disconnected before completion` as warnings.
 
 ## v0.1.0 build.28 (2026-02-27)
-- `!help` と README の基本コマンド説明を整理。
-- `!ask <instruction>` と通常発話の関係を明確化。
+- Reorganize the basic command descriptions in `!help` and README.
+- Clarify the relationship between `!ask <instruction>` and normal messages.
 
 ## v0.1.0 build.26 (2026-02-24)
-- 履歴ログ `history-YYYY-MM-DD.log` を日次運用前提で整備。
-- 実行キューのロックキーを `codex:<codex_thread_id>` / `session:<session_id>` で明確化。
-- `!session current` に `queue_lock_key` 表示を追加。
+- Introduce daily history logs based on `history-YYYY-MM-DD.log`.
+- Clarify execution queue lock keys as `codex:<codex_thread_id>` / `session:<session_id>`.
+- Add `queue_lock_key` to `!session current`.
 
 ## v0.1.0 build.25 (2026-02-24)
-- `!codex session <codex_thread_id>` / `!codex pick <no>` を追加。
-- `SessionService.rebindCurrentSessionCodexThread()` を実装し、既存セッションへの thread 再紐付けを可能化。
-- セッション切替導線を整理し、運用時の誤操作を低減。
+- Add `!codex session <codex_thread_id>` and `!codex pick <no>`.
+- Implement `SessionService.rebindCurrentSessionCodexThread()` to rebind an existing session to a thread.
+- Reorganize the session switching flow to reduce operational mistakes.
 
 ## v0.1.0 build.19 (2026-02-14)
-- `!codex search/pick` と `!session new` の `working_directory` 引き継ぎを改善し、セッション運用を安定化。
-- AI出力の `!attach <absolute_path>` 指示（8MB制限）を整備し、ユーザー側 `!attach` は無効化。
-- `!help` と README を更新し、ビルド番号を `build.19` に更新。
+- Improve `working_directory` inheritance for `!codex search/pick` and `!session new` to stabilize session operation.
+- Add the AI output instruction for `!attach <absolute_path>` with an 8MB limit, while disabling user-side `!attach`.
+- Update `!help` and README, and bump the build number to `build.19`.

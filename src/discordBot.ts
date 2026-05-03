@@ -61,8 +61,10 @@ import {
   queueStatusEmpty,
   queueStatusTitle,
   queueStopallExecuted,
+  codexUsageStatusLine,
 } from "./i18n.js";
 import {
+  readLatestCodexUsageStatusByThreadId,
   resolveCodexSessionMetaByThreadId,
   resolveWorkingDirectoryFromThreadId,
   searchCodexSessions,
@@ -905,15 +907,14 @@ export class DiscordCodexBot {
       },
       onProgress: async (elapsedSec, queueLength) => {
         if (finalized) return;
-        const progressText =
-          composeStatusText(
-            runningElapsedMessage(
-              this.locale,
-              elapsedSec,
-              queueLength,
-              this.getUserFacingCodexSessionLabel(session),
-            ),
-          );
+        const progressText = composeStatusText(
+          runningElapsedMessage(
+            this.locale,
+            elapsedSec,
+            queueLength,
+            this.getUserFacingCodexSessionLabel(session),
+          ),
+        );
         await editProgressMessage(progressText);
       },
       run: async () => {
@@ -1106,13 +1107,34 @@ export class DiscordCodexBot {
         const body = streamBody || parsed.cleanedOutput || "(no output)";
         const chunks = splitIntoChunks(body, appConfig.messageChunkSize);
         const sessionLabel = this.getUserFacingCodexSessionLabel(session);
+        const usageStatus = observedThreadId
+          ? readLatestCodexUsageStatusByThreadId(observedThreadId)
+          : null;
+        const usageBlock = usageStatus ? `${codexUsageStatusLine(this.locale, usageStatus)}\n` : "";
+        if (usageStatus) {
+          this.logger.info(
+            {
+              executionId,
+              sessionId: session.id,
+              codexThreadId: observedThreadId,
+              planType: usageStatus.planType,
+              primaryUsedPercent: usageStatus.primaryUsedPercent,
+              primaryWindowMinutes: usageStatus.primaryWindowMinutes,
+              primaryResetsAt: usageStatus.primaryResetsAt,
+              secondaryUsedPercent: usageStatus.secondaryUsedPercent,
+              secondaryWindowMinutes: usageStatus.secondaryWindowMinutes,
+              secondaryResetsAt: usageStatus.secondaryResetsAt,
+            },
+            "codex usage status read from session jsonl",
+          );
+        }
         const historyLines = streamHistory.map((v, i) => `${i + 1}. ${v}`);
-        const historyBlock = historyLines.length > 0
+        const historyBlock = appConfig.showFinalStreamLog && historyLines.length > 0
           ? `stream_log:\n${historyLines.join("\n")}\n`
           : "";
         const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
         await sendOrEditFinal(
-          completeHeader(this.locale, sessionLabel, switchBlock, historyBlock),
+          completeHeader(this.locale, sessionLabel, switchBlock, usageBlock, historyBlock),
         );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);

@@ -2,7 +2,6 @@
 
 English README: [README.md](./README.md)
 
-
 Discord からPC上の Codex CLI を操作する Bot です。技術実証用であり常用することはお勧めしません。
 
 本ソフトは **Windows 用** です（Windows 上で動作する Node.js と OpenAI Codex を対象としています）。
@@ -130,6 +129,8 @@ npm start
 
 * `INSTANCE_LOCK_PORT`: 単一起動用ロックポート（二重起動防止の排他制御に使用しているポート）
 
+* `SHOW_FINAL_STREAM_LOG`: 完了ヘッダに `stream_log` を表示するか（既定 `true`）
+
 ### `CODEX_MODE=template` について
 
 実験用の非推奨機能です。 `template` はテンプレート文字列をシェル実行するため、入力の扱い次第で **コマンドインジェクション** のリスクがあります。通常は `cli` を使ってください。ただし、 `Cli` でも、プロンプトに不正な指示を与えれば同様に危険な実行が可能ですので、注意してください。
@@ -249,56 +250,55 @@ Codex CLIやVSCodeの拡張などからCodexに指示を与えた履歴をDiscor
 
 関連する `.env` の項目は以下の通りです。
 
-* `EXTERNAL_SYNC_ENABLED` : 起動時の外部同期有効フラグ（`true`/`false`）
+* `EXTERNAL_SYNC_ENABLED`: 起動時の外部同期有効フラグ（`true`/`false`）
 
-* EXTERNAL\_SYNC\_POLL\_SEC : 同期間隔（秒、既定15）
+* `EXTERNAL_SYNC_POLL_SEC`: 同期間隔（秒、既定15）
 
-* EXTERNAL\_SYNC\_MAX\_BURST : 1回の同期で送信する最大件数（既定30、超過分は古い順に送信スキップ）
+* `EXTERNAL_SYNC_MAX_BURST`: 1回の同期で送信する最大件数（既定30、超過分は古い順に送信スキップ）
 
-* EXTERNAL\_SYNC\_USER\_MAX\_CHARS : 外部同期の user\_message を送信前に切り詰める最大文字数（既定300）
+* `EXTERNAL_SYNC_USER_MAX_CHARS`: 外部同期の `user_message` を送信前に切り詰める最大文字数（既定300）
 
 ## Skill による拡張例
 
-DiscordAgent は、Skill を追加することで用途を大きく広げられます。  
-Skill は Codex で各自が作成できるため、自分専用の秘書、音声窓口、ブラウザ自動化ツールとして育てていけます。以下は、私が実際に Codex に作成させて、DiscordAgent から呼び出している Skill の例となります。
+DiscordAgent に限った話ではありませんが、Codexは、Skill を追加することで用途を大きく広げられます。\
+Skill は Codex に指示して、ユーザ自らで作成できるため、自分専用の秘書、音声窓口、ブラウザ自動化ツールとして育てていけます。以下は、私が実際に Codex に作成させて、DiscordAgent から呼び出している Skill の例となります。
 
-・名前: `local-voice-command-intake`  
-・機能: 音声ファイル（`*.ogg`）をローカルで文字起こしし、依頼文に整える  
-・用途: Discord に音声を送るだけで、話し言葉の依頼を Codex へ渡せる  
+・名前: `local-voice-command-intake`\
+・機能: 音声ファイル（`*.ogg`）をローカルで文字起こしし、依頼文に整える\
+・用途: Discord に音声を送るだけで、話し言葉の依頼を Codex へ渡せる\
 ・技術: `faster-whisper`
 
-・名前: `web2markdown-clip`  
-・機能: 指定した URL を Markdown 化して Obsidian の Vault に保存する  
-・用途: 気になった記事や資料を Discord からそのまま知識ベースへ蓄積できる  
-・技術: 
+・名前: `web2markdown-clip`\
+・機能: 指定した URL を Markdown 化して Obsidian の Vault に保存する\
+・用途: 気になった記事や資料を Discord からそのまま知識ベースへ蓄積できる\
+・技術: `PowerShell`, `Readability`, `Turndown`, `Playwright`
 
-・名前: `google-calendar-rw`  
-・機能: Google Calendar の参照、作成、更新、削除を自然言語で行う  
-・用途: 予定確認や日程調整を Discord 上の会話から進められる  
+・名前: `google-calendar-rw`\
+・機能: Google Calendar の参照、作成、更新、削除を自然言語で行う\
+・用途: 予定確認や日程調整を Discord 上の会話から進められる\
 ・技術: `Google Calendar API`
 
-・名前: `google-gmail-rw`  
-・機能: Gmail の参照、送信、状態更新、ゴミ箱移動を自然言語で行う  
-・用途: メール確認や返信下書きを Discord から依頼できる  
+・名前: `google-gmail-rw`\
+・機能: Gmail の参照、送信、状態更新、ゴミ箱移動を自然言語で行う\
+・用途: メール確認や返信下書きを Discord から依頼できる\
 ・技術: `Gmail API`
 
-・名前: `google-tasks-rw`  
-・機能: Google Tasks の参照、作成、更新、削除を自然言語で行う  
-・用途: やること整理やタスク追加を Discord の会話から進められる  
+・名前: `google-tasks-rw`\
+・機能: Google Tasks の参照、作成、更新、削除を自然言語で行う\
+・用途: やること整理やタスク追加を Discord の会話から進められる\
 ・技術: `Google Tasks API`
 
-・名前: `edge-browser-operator`  
-・機能: Windows ネイティブの Microsoft Edge を Playwright で操作する  
-・用途: ブラウザ操作を伴う調査や定型作業を Discord から自動化できる  
+・名前: `edge-browser-operator`\
+・機能: Windows ネイティブの Microsoft Edge を Playwright で操作する\
+・用途: ブラウザ操作を伴う調査や定型作業を Discord から自動化できる\
 ・技術: `Playwright`, `Microsoft Edge`
 
-・名前: `restart-discordagent-windows`  
-・機能: `run_DiscordAgent.cmd` から呼び出されている `node.exe` を狙い撃ちで終了し、DiscordAgent を再起動させる  
-・用途: 外出先からでも DiscordAgent を自殺的に再起動し、復旧につなげられる  
-・技術: 
+・名前: `restart-discordagent-windows`\
+・機能: `run_DiscordAgent.cmd` から呼び出されている `node.exe` を狙い撃ちで終了し、DiscordAgent を再起動させる\
+・用途: 外出先からでも DiscordAgent を自殺的に再起動し、復旧につなげられる\
+・技術: `PowerShell`, `Windows process control`
 
-用意された Skill を使うだけでなく、「何をしたいか」「どう運用したいか」を Codex に伝えれば、自分に合った Skill を追加で開発させることもできます。  
-DiscordAgent は、その Skill を育てながら自分専用の作業環境へ近づけていくための入口になります。
+「何をしたいか」「どう運用したいか」を Codex に伝えれば、Codexは自分に合った Skill を開発してくれます。
 
-たとえば、Gmail で届いた会社からのメールに記載された予定をカレンダーに登録し、そのメールに記載された資料作成をタスクへ追加するといった複合的な依頼も可能です。  
+たとえば、Gmail で届いた会社からのメールに記載された予定をカレンダーに登録し、そのメールに記載された「会議」について準備するというタスクをGoogleタスクに追加するといった複合的な依頼も可能です。\
 また、「予定変更の連絡がメールで来ているので、新しい時間に合わせてカレンダーに登録済みの『移動』予定の時間帯を変更してください」のように、メール確認と既存予定の更新を組み合わせた処理も行えます。

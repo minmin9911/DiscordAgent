@@ -93,6 +93,7 @@ npm start
 - `EXTERNAL_SYNC_POLL_SEC`: polling interval in seconds
 - `EXTERNAL_SYNC_MAX_BURST`: max externally synced messages per cycle
 - `EXTERNAL_SYNC_USER_MAX_CHARS`: max length for externally synced `user_message`
+- `SHOW_FINAL_STREAM_LOG`: show `stream_log` in the completion header (default: `true`)
 
 ## Commands
 
@@ -152,8 +153,8 @@ That design allows remote restart by killing only the child `node` process while
 
 ## Skill Extension Examples
 
-DiscordAgent becomes much more useful when extended with Skills.  
-Because Skills can be created by Codex itself, you can grow DiscordAgent into your own secretary, voice intake endpoint, or browser automation tool. Below are examples of Skills that I actually had Codex create and that I call through DiscordAgent.
+This is not limited to DiscordAgent, but Codex becomes much more useful when extended with Skills.  
+Because users can ask Codex to create Skills themselves, you can grow Codex into your own secretary, voice intake endpoint, or browser automation tool. Below are examples of Skills that I actually had Codex create and that I call through DiscordAgent.
 
 ・Name: `local-voice-command-intake`  
 ・Function: Transcribes voice files (`*.ogg`) locally and converts them into an executable request  
@@ -163,7 +164,7 @@ Because Skills can be created by Codex itself, you can grow DiscordAgent into yo
 ・Name: `web2markdown-clip`  
 ・Function: Converts a given URL into Markdown and saves it into an Obsidian Vault  
 ・Use: You can send articles or reference pages from Discord directly into your knowledge base  
-・Technology: 
+・Technology: `PowerShell`, `Readability`, `Turndown`, `Playwright`
 
 ・Name: `google-calendar-rw`  
 ・Function: Reads, creates, updates, and deletes Google Calendar entries in natural language  
@@ -188,10 +189,9 @@ Because Skills can be created by Codex itself, you can grow DiscordAgent into yo
 ・Name: `restart-discordagent-windows`  
 ・Function: Targets and terminates the `node.exe` launched from `run_DiscordAgent.cmd` to restart DiscordAgent  
 ・Use: You can force a remote, self-destructive restart of DiscordAgent and recover service while away from the machine  
-・Technology: 
+・Technology: `PowerShell`, `Windows process control`
 
-Using prepared Skills is only one side of the story. If you tell Codex what you want to do and how you want to operate, it can also create new Skills tailored to your workflow.  
-DiscordAgent is not just a finished bot, but a starting point for growing your own working environment through Skills.
+If you tell Codex what you want to do and how you want to operate, Codex can develop Skills tailored to your workflow.
 
-For example, you can ask it to read a company email from Gmail, register the schedule described there into Google Calendar, and add “prepare the attached materials” into your task list.  
-You can also ask for combined tasks such as checking a rescheduling email and updating an existing “travel” event in your calendar to match the new time.
+For example, you can ask it to read a company email from Gmail, register the schedule described there in Google Calendar, and add a Google Tasks item to prepare for the meeting described in that email.  
+You can also combine email review and calendar updates, such as: “A rescheduling email has arrived, so update the time block of the existing ‘travel’ event in my calendar to match the new time.”

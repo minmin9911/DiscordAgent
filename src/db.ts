@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   codex_thread_id TEXT,
+  model_override TEXT,
   preferred_working_directory TEXT,
   attach_instruction_sent_at TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'busy', 'error')),
@@ -70,6 +71,12 @@ CREATE TABLE IF NOT EXISTS list_context_cache (
 CREATE TABLE IF NOT EXISTS context_cursors (
   context_key TEXT PRIMARY KEY,
   last_message_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS app_state (
+  key TEXT PRIMARY KEY,
+  value TEXT,
   updated_at TEXT NOT NULL
 );
 
@@ -120,6 +127,10 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     );
     if (!hasAttachInstructionSentAt) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN attach_instruction_sent_at TEXT");
+    }
+    const hasModelOverride = columns.some((c) => c.name === "model_override");
+    if (!hasModelOverride) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN model_override TEXT");
     }
   }
 
@@ -246,6 +257,12 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     this.db
       .prepare("UPDATE sessions SET codex_thread_id = NULL WHERE id = ?")
       .run(sessionId);
+  }
+
+  setSessionModelOverride(sessionId: string, modelOverride: string | null): void {
+    this.db
+      .prepare("UPDATE sessions SET model_override = ? WHERE id = ?")
+      .run(modelOverride, sessionId);
   }
 
   setSessionPreferredWorkingDirectory(sessionId: string, workingDirectory: string): void {
@@ -418,6 +435,29 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
       .run({
         context_key: contextKey,
         last_message_id: messageId,
+        updated_at: nowIso(),
+      });
+  }
+
+  getAppState(key: string): string | null {
+    const row = this.db
+      .prepare("SELECT value FROM app_state WHERE key = ?")
+      .get(key) as { value: string | null } | undefined;
+    return row?.value ?? null;
+  }
+
+  setAppState(key: string, value: string | null): void {
+    this.db
+      .prepare(
+        `INSERT INTO app_state (key, value, updated_at)
+         VALUES (@key, @value, @updated_at)
+         ON CONFLICT(key) DO UPDATE SET
+           value = excluded.value,
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        key,
+        value,
         updated_at: nowIso(),
       });
   }

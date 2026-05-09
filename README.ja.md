@@ -171,6 +171,18 @@ npm start
 
   * 現在のDiscordスレッドに設定されているCodexの各種情報、`codex_thread_id` / `working_directory` / `status` / `queue` などを表示
 
+* `!model`
+
+  * このセッションで利用できるモデル一覧を表示します。
+
+* `!model <no>`
+
+  * このセッションで使うモデルを切り替えます。
+
+  * `0` は Codex の config.toml で指定されているモデル（デフォルトモデル）を使用します。
+
+  * data\models.yamlが一覧のソースです。残念ながら、Codexのexec機能にはモデル名一覧を取得する機能がないため、機能が提供されない限り、一覧表の更新は手動で行う必要があります。
+
 ### メンテナンスコマンド
 
 * `!queue`

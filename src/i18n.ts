@@ -10,6 +10,11 @@ type UsageLimitStatus = {
   secondaryResetsAt: number | null;
 };
 
+type LimitLeftInfo = {
+  leftPercent: number;
+  text: string;
+};
+
 export function resolveAppLocale(explicitLocale: string | null | undefined): AppLocale {
   if (explicitLocale === "ja" || explicitLocale === "en") return explicitLocale;
   const runtimeLocale = Intl.DateTimeFormat().resolvedOptions().locale.toLowerCase();
@@ -44,6 +49,10 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "  - Disconnect from the current session and start a new one (with a new Codex thread).",
       "- !session current",
       "  - Show the current session's codex_thread_id / working_directory / status / queue.",
+      "- !model",
+      "  - Show available model list for this session.",
+      "- !model <no>",
+      "  - Switch model for this session (0 = default).",
       "- !codex [query]",
       "  - Search ~/.codex/sessions and list candidates (latest first if omitted).",
       "- !codex pick <no>",
@@ -82,6 +91,10 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "  - 現在のセッションとの接続を切り、新しいセッションを始めます（Codexのスレッドも新しくなります）。",
     "- !session current",
     "  - 現在のセッションの codex_thread_id / working_directory / status / queue などを表示します。",
+    "- !model",
+    "  - このセッションで利用できるモデル一覧を表示します。",
+    "- !model <no>",
+    "  - このセッションのモデルを切り替えます（0 = default）。",
     "- !codex [query]",
     "  - ~/.codex/sessions を検索して候補表示します（省略時は最新候補）。",
     "- !codex pick <no>",
@@ -134,16 +147,25 @@ function formatLimitLeft(
   locale: AppLocale,
   usedPercent: number | null,
   windowMinutes: number | null,
-): string | null {
+): LimitLeftInfo | null {
   if (usedPercent == null) return null;
   const leftPercent = Math.max(0, Math.min(100, Math.round(100 - usedPercent)));
   if (windowMinutes === 300) {
-    return locale === "en" ? `\`5h=${leftPercent}%\`` : `\`5時間=${leftPercent}%\``;
+    return {
+      leftPercent,
+      text: locale === "en" ? `\`5h=${leftPercent}%\`` : `\`5時間=${leftPercent}%\``,
+    };
   }
   if (windowMinutes === 10080) {
-    return locale === "en" ? `\`weekly=${leftPercent}%\`` : `\`週間=${leftPercent}%\``;
+    return {
+      leftPercent,
+      text: locale === "en" ? `\`weekly=${leftPercent}%\`` : `\`週間=${leftPercent}%\``,
+    };
   }
-  return `\`window${windowMinutes ?? "?"}m=${leftPercent}%\``;
+  return {
+    leftPercent,
+    text: `\`window${windowMinutes ?? "?"}m=${leftPercent}%\``,
+  };
 }
 
 export function codexUsageStatusLine(
@@ -152,7 +174,8 @@ export function codexUsageStatusLine(
 ): string {
   const primary = formatLimitLeft(locale, status.primaryUsedPercent, status.primaryWindowMinutes);
   const secondary = formatLimitLeft(locale, status.secondaryUsedPercent, status.secondaryWindowMinutes);
-  const parts = [primary, secondary].filter((v): v is string => Boolean(v));
+  const limitInfos = [primary, secondary].filter((v): v is LimitLeftInfo => Boolean(v));
+  const parts = limitInfos.map((v) => v.text);
   const resetsAtEpochSec = status.secondaryResetsAt ?? status.primaryResetsAt;
   if (resetsAtEpochSec != null) {
     const resetAt = new Date(resetsAtEpochSec * 1000);
@@ -174,18 +197,54 @@ export function codexUsageStatusLine(
     parts.push(`plan=${status.planType}`);
   }
   const prefix = locale === "en" ? "**Usage:**" : "**利用状況:**";
-  return `${prefix} ${parts.join(" ")}`;
+  const plainLine = `${prefix} ${parts.join(" ")}`;
+
+  const leftPercents = limitInfos.map((v) => v.leftPercent);
+  if (leftPercents.length === 0) return plainLine;
+  const minLeft = Math.min(...leftPercents);
+  if (minLeft > 10) return plainLine;
+
+  const color = minLeft <= 5 ? 31 : 33;
+  const ansiLine = `\u001b[1;${color}m${plainLine}\u001b[0m`;
+  return `\`\`\`ansi\n${ansiLine}\n\`\`\``;
 }
 
 export function completeHeader(
   _locale: AppLocale,
   label: string,
   switchBlock: string,
+  modelBlock: string,
   usageBlock: string,
   historyBlock: string,
 ): string {
   void _locale;
-  return `codex_session: ${label}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)\n${usageBlock}`.trimEnd();
+  return `codex_session: ${label}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)\n${modelBlock}${usageBlock}`.trimEnd();
+}
+
+export function usageModel(locale: AppLocale): string {
+  return locale === "en"
+    ? "usage: !model [no]"
+    : "使い方: !model [no]";
+}
+
+export function modelSetDone(locale: AppLocale, modelLabel: string): string {
+  return locale === "en"
+    ? `model switched: ${modelLabel}`
+    : `モデルを切り替えました: ${modelLabel}`;
+}
+
+export function modelWarningLine(locale: AppLocale, modelLabel: string): string {
+  const plain = locale === "en"
+    ? `[MODEL WARNING] model=${modelLabel}`
+    : `[モデル警告] model=${modelLabel}`;
+  const ansi = `\u001b[1;31m${plain}\u001b[0m`;
+  return `\`\`\`ansi\n${ansi}\n\`\`\``;
+}
+
+export function modelListSourceLine(locale: AppLocale, sourcePath: string): string {
+  return locale === "en"
+    ? `model list source: ${sourcePath}`
+    : `モデル一覧の定義: ${sourcePath}`;
 }
 
 export function usageCodexSession(locale: AppLocale): string {

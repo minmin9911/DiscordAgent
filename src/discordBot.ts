@@ -62,9 +62,14 @@ import {
   queueStatusTitle,
   queueStopallExecuted,
   codexUsageStatusLine,
+  modelSetDone,
+  modelListSourceLine,
+  modelWarningLine,
+  usageModel,
 } from "./i18n.js";
 import {
   readLatestCodexUsageStatusByThreadId,
+  readLatestCodexResolvedModelByThreadId,
   resolveCodexSessionMetaByThreadId,
   resolveWorkingDirectoryFromThreadId,
   searchCodexSessions,
@@ -84,10 +89,12 @@ import {
 } from "./threadBinding.js";
 import type { SessionRow } from "./types.js";
 import { truncateExternalUserMessage } from "./externalSyncText.js";
+import { loadModelCatalog, type ModelCatalogItem } from "./modelCatalog.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
 const EXTERNAL_SYNC_PREVIEW_MAX = 1500;
+const APP_STATE_LAST_RESOLVED_DEFAULT_MODEL = "last_resolved_default_model";
 type RecoveryChannel = TextChannel | NewsChannel | ThreadChannel;
 
 export function shouldProcessIncomingMessage(content: string, attachmentCount: number): boolean {
@@ -286,6 +293,14 @@ export class DiscordCodexBot {
       }
       if (content.startsWith("!sync ")) {
         await this.handleSyncCommand(msg, content.slice("!sync ".length).trim());
+        return;
+      }
+      if (content === "!model") {
+        await this.handleModelCommand(msg, "");
+        return;
+      }
+      if (content.startsWith("!model ")) {
+        await this.handleModelCommand(msg, content.slice("!model ".length).trim());
         return;
       }
       if (content.startsWith("!attach ")) {
@@ -719,6 +734,7 @@ export class DiscordCodexBot {
         : (current.preferred_working_directory ?? notLinkedYet(this.locale));
       const lines = [
         `codex_thread_id: ${current.codex_thread_id ?? notLinkedYet(this.locale)}`,
+        `model: ${current.model_override ?? "default"}`,
         `working_directory: ${workingDirectory}`,
         `queue_lock_key: ${lockKey}`,
         `status: ${current.status}`,
@@ -932,6 +948,7 @@ export class DiscordCodexBot {
           prompt,
           sessionId: session.id,
           codexThreadId: session.codex_thread_id,
+          modelOverride: session.model_override,
           preferredWorkingDirectory: session.preferred_working_directory,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onEvent: async (event) => {
@@ -1110,6 +1127,15 @@ export class DiscordCodexBot {
         const usageStatus = observedThreadId
           ? readLatestCodexUsageStatusByThreadId(observedThreadId)
           : null;
+        if (observedThreadId && !session.model_override) {
+          const resolvedDefaultModel = readLatestCodexResolvedModelByThreadId(observedThreadId);
+          if (resolvedDefaultModel) {
+            this.db.setAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL, resolvedDefaultModel);
+          }
+        }
+        const modelBlock = session.model_override
+          ? `${modelWarningLine(this.locale, session.model_override)}\n`
+          : "";
         const usageBlock = usageStatus ? `${codexUsageStatusLine(this.locale, usageStatus)}\n` : "";
         if (usageStatus) {
           this.logger.info(
@@ -1134,7 +1160,7 @@ export class DiscordCodexBot {
           : "";
         const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
         await sendOrEditFinal(
-          completeHeader(this.locale, sessionLabel, switchBlock, usageBlock, historyBlock),
+          completeHeader(this.locale, sessionLabel, switchBlock, modelBlock, usageBlock, historyBlock),
         );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
@@ -1304,6 +1330,56 @@ export class DiscordCodexBot {
       return;
     }
     await msg.reply(usageSync(this.locale));
+  }
+
+  private modelOptionLabel(value: string): string {
+    if (value !== "default") return value;
+    const resolved = this.db.getAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL);
+    return resolved ? `default (${resolved})` : "default";
+  }
+
+  private formatModelLine(index: number, item: ModelCatalogItem, currentModel: string): string {
+    const currentMark = item.id === currentModel ? " <= current" : "";
+    const disabledMark = item.disabled ? " [disabled]" : "";
+    const label = this.modelOptionLabel(item.id);
+    const description = item.description ? ` | ${item.description}` : "";
+    return `${index} | ${label}${disabledMark}${currentMark}${description}`;
+  }
+
+  private async handleModelCommand(msg: Message, body: string): Promise<void> {
+    const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "model",
+    });
+    const arg = body.trim();
+    const catalog = loadModelCatalog();
+    const currentModel = session.model_override ?? "default";
+    if (!arg) {
+      const lines = catalog.items.map((item, index) => (
+        this.formatModelLine(index, item, currentModel)
+      ));
+      lines.push("---");
+      lines.push(modelListSourceLine(this.locale, "data/models.yaml"));
+      await msg.reply(`model list\n${lines.join("\n")}`);
+      return;
+    }
+    const index = Number(arg);
+    if (!Number.isInteger(index) || index < 0 || index >= catalog.items.length) {
+      await msg.reply(usageModel(this.locale));
+      return;
+    }
+    const selected = catalog.items[index]!;
+    if (selected.disabled) {
+      await msg.reply("ERR_MODEL_DISABLED");
+      return;
+    }
+    const override = selected.id === "default" ? null : selected.id;
+    this.db.setSessionModelOverride(session.id, override);
+    session.model_override = override;
+    const label = override ?? "default";
+    await msg.reply(modelSetDone(this.locale, label));
   }
 
   private resetExternalSyncCursorsToLatest(): number {

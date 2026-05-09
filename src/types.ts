@@ -12,6 +12,7 @@ export interface SessionRow {
   id: string;
   name: string;
   codex_thread_id: string | null;
+  model_override: string | null;
   preferred_working_directory: string | null;
   attach_instruction_sent_at: string | null;
   status: SessionStatus;

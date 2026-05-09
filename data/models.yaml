@@ -1,0 +1,19 @@
+models:
+  - id: default
+    description: Uses Codex default model(config.toml)
+    disabled: false
+  - id: gpt-5.5
+    description: Frontier model for complex coding, research, and real-world work.
+    disabled: false
+  - id: gpt-5.4
+    description: Strong model for everyday coding.
+    disabled: false
+  - id: gpt-5.4-mini
+    description: Small, fast, and cost-efficient model for simpler coding tasks.
+    disabled: false
+  - id: gpt-5.3-codex
+    description: Coding-optimized model.
+    disabled: false
+  - id: gpt-5.2
+    description: Optimized for professional work and long-running agents.
+    disabled: false

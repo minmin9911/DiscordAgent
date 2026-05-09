@@ -4,6 +4,10 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.63 (2026-05-04)
+- Emphasize usage status in the completion header when remaining quota enters a danger zone (red at 5% or below, yellow at 10% or below).
+- Add the `!model` command so the model can be switched per session.
+
 ## v0.1.0 build.60 (2026-05-03)
 - Display 5-hour LIMIT and weekly LIMIT usage status in the completion header.
 - Add `SHOW_FINAL_STREAM_LOG`, allowing the `stream_log` section to be cleared after streaming completes so only the full body remains visible. The default keeps the stream log.

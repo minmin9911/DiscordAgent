@@ -33,6 +33,10 @@ export interface CodexUsageStatus {
   secondaryResetsAt: number | null;
 }
 
+function readNullableModelString(value: unknown): string | null {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+}
+
 function findSessionFileByThreadId(rootDir: string, threadId: string): string | null {
   const stack: string[] = [rootDir];
   const suffix = `${threadId}.jsonl`;
@@ -130,6 +134,60 @@ export function readLatestCodexUsageStatusByThreadId(
   const sessionFile = findSessionFileByThreadId(sessionsRoot, threadId);
   if (!sessionFile) return null;
   return readLatestCodexUsageStatusFromSessionFile(sessionFile);
+}
+
+export function readLatestCodexResolvedModelFromSessionFile(
+  sessionFile: string,
+): string | null {
+  const tailSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
+  const fd = openSync(sessionFile, "r");
+  try {
+    const fileSize = fstatSync(fd).size;
+    for (const tailSize of tailSizes) {
+      const length = Math.min(fileSize, tailSize);
+      const start = Math.max(0, fileSize - length);
+      const buffer = Buffer.alloc(length);
+      readSync(fd, buffer, 0, length, start);
+      const text = buffer.toString("utf8");
+      const lines = text.split(/\r?\n/);
+      if (start > 0) lines.shift();
+      for (let i = lines.length - 1; i >= 0; i -= 1) {
+        const line = lines[i]?.trim();
+        if (!line || !line.includes('"turn_context"')) continue;
+        try {
+          const obj = JSON.parse(line) as Record<string, unknown>;
+          if (obj.type !== "turn_context") continue;
+          const payload = obj.payload;
+          if (!payload || typeof payload !== "object") continue;
+          const payloadObj = payload as Record<string, unknown>;
+          const directModel = readNullableModelString(payloadObj.model);
+          if (directModel) return directModel;
+          const collaborationMode = payloadObj.collaboration_mode;
+          if (!collaborationMode || typeof collaborationMode !== "object") continue;
+          const settings = (collaborationMode as Record<string, unknown>).settings;
+          if (!settings || typeof settings !== "object") continue;
+          const nestedModel = readNullableModelString((settings as Record<string, unknown>).model);
+          if (nestedModel) return nestedModel;
+        } catch {
+          // ignore non-json lines
+        }
+      }
+      if (length === fileSize) break;
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return null;
+}
+
+export function readLatestCodexResolvedModelByThreadId(
+  threadId: string,
+): string | null {
+  const sessionsRoot = join(homedir(), ".codex", "sessions");
+  if (!existsSync(sessionsRoot)) return null;
+  const sessionFile = findSessionFileByThreadId(sessionsRoot, threadId);
+  if (!sessionFile) return null;
+  return readLatestCodexResolvedModelFromSessionFile(sessionFile);
 }
 
 function parseCwdFromSessionMeta(sessionFile: string): string | null {

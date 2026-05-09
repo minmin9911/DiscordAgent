@@ -83,6 +83,7 @@ export class CodexAdapter {
     prompt: string;
     sessionId: string;
     codexThreadId?: string | null;
+    modelOverride?: string | null;
     preferredWorkingDirectory?: string | null;
     includeDiscordAgentSystemPrompt?: boolean;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
@@ -162,6 +163,7 @@ export class CodexAdapter {
   private async runWithCodexCli(input: {
     prompt: string;
     codexThreadId?: string | null;
+    modelOverride?: string | null;
     preferredWorkingDirectory?: string | null;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
     onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
@@ -208,6 +210,9 @@ export class CodexAdapter {
         "--json",
         "--skip-git-repo-check",
       );
+    }
+    if (input.modelOverride) {
+      args.push("--model", input.modelOverride);
     }
 
     return new Promise<CodexResult>((resolve) => {

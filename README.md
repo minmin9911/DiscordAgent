@@ -107,6 +107,13 @@ npm start
 
 - `!session new [name]`
 - `!session current`
+- `!model`
+  - Show available models for the current session.
+- `!model <no>`
+  - Switch the model for the current session.
+  - `0` uses the model specified in Codex `config.toml` (default model).
+  - The list source is `data/models.yaml`.
+  - Codex `exec` does not currently provide a model-list API, so this list must be maintained manually unless that feature is added.
 - `!codex [query]`
 - `!codex pick <no>`
 - `!codex session <codex_thread_id>`

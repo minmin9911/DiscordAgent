@@ -83,6 +83,7 @@ npm start
 - `ALLOWED_USER_IDS`: optional allowlist of user IDs
 - `APP_LOCALE`: bot language (`ja` or `en`)
 - `SQLITE_PATH`: SQLite database path
+- `DEFAULT_AGENT_WORKDIR_ROOT`: root directory for new session working directories (default: `./workspaces`)
 - `CODEX_MODE`: usually `cli`
 - `CODEX_TIMEOUT_SEC`: Codex timeout in seconds
 - `INCOMING_ATTACH_DIR`: temp storage directory for incoming attachments
@@ -94,6 +95,11 @@ npm start
 - `EXTERNAL_SYNC_MAX_BURST`: max externally synced messages per cycle
 - `EXTERNAL_SYNC_USER_MAX_CHARS`: max length for externally synced `user_message`
 - `SHOW_FINAL_STREAM_LOG`: show `stream_log` in the completion header (default: `true`)
+
+Each completion header includes the current sandbox and approval status for that execution.
+When `FORCE_LEGACY_FULL_ACCESS=true`, this status line is hidden.
+
+Newly created app sessions now use `DEFAULT_AGENT_WORKDIR_ROOT/<session_id>` as the default working directory.
 
 ## Commands
 
@@ -123,6 +129,16 @@ npm start
 - `!queue`
 - `!queue stopall`
 - `!queue fix`
+- `!sandbox on`
+  - Run this session with `workspace-write`. This is the default setting for work inside the current workspace.
+- `!sandbox off`
+  - Run this session with persistent `danger-full-access`.
+- `!ok`
+  - Retry the latest permission-limited request once with `danger-full-access`.
+- `!ok <minutes>`
+  - Temporarily run this session with `danger-full-access` for the specified number of minutes. The maximum is 60 minutes.
+- `!ng`
+  - Discard the latest permission-limited request.
 - `!sync`
 - `!sync on` / `!sync off`
 - `!sync reset`

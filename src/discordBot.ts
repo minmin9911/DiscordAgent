@@ -28,6 +28,8 @@ import {
   attachStatFailed,
   attachTooLarge,
   attachUploadFailed,
+  approvalStatusLine,
+  type ApprovalStatusView,
   buildCommandReference,
   codexSessionLine,
   codexSessionListEmpty,
@@ -65,7 +67,17 @@ import {
   modelSetDone,
   modelListSourceLine,
   modelWarningLine,
+  permissionRequestDiscarded,
+  permissionGrantedReexecutePrompt,
+  permissionRequestNotFound,
+  permissionRetryPrompt,
+  sandboxMigrationNotice,
+  sandboxModeSet,
+  temporaryFullAccessDisabled,
+  temporaryFullAccessEnabled,
   usageModel,
+  usageOk,
+  usageSandbox,
 } from "./i18n.js";
 import {
   readLatestCodexUsageStatusByThreadId,
@@ -88,6 +100,7 @@ import {
   isMissingCodexThreadError,
 } from "./threadBinding.js";
 import type { SessionRow } from "./types.js";
+import type { SandboxMode } from "./types.js";
 import { truncateExternalUserMessage } from "./externalSyncText.js";
 import { loadModelCatalog, type ModelCatalogItem } from "./modelCatalog.js";
 
@@ -95,7 +108,18 @@ const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
 const EXTERNAL_SYNC_PREVIEW_MAX = 1500;
 const APP_STATE_LAST_RESOLVED_DEFAULT_MODEL = "last_resolved_default_model";
+const APP_STATE_SANDBOX_NOTICE_STARTUP = "sandbox_notice_startup_once";
+const APP_STATE_SANDBOX_NOTICE_FIRST_COMPLETION = "sandbox_notice_first_completion_once";
+const TEMP_FULL_ACCESS_MAX_MINUTES = 60;
 type RecoveryChannel = TextChannel | NewsChannel | ThreadChannel;
+
+type PendingApproval = {
+  content: string;
+  prompt: string;
+  sessionId: string;
+  messageId: string;
+  createdAtMs: number;
+};
 
 export function shouldProcessIncomingMessage(content: string, attachmentCount: number): boolean {
   return content.trim().length > 0 || attachmentCount > 0;
@@ -132,6 +156,7 @@ export class DiscordCodexBot {
   private readonly locale = resolveAppLocale(appConfig.appLocale);
   private readonly processedMessageIds = new Set<string>();
   private readonly codexSearchCache = new Map<string, CodexSessionMeta[]>();
+  private readonly pendingApprovals = new Map<string, PendingApproval>();
   private readonly localSyncSuppress = new Map<
     string,
     { userTexts: Set<string>; agentTexts: Set<string>; expiresAtMs: number }
@@ -180,6 +205,9 @@ export class DiscordCodexBot {
       }, appConfig.externalSyncPollSec * 1000);
       this.runExternalSyncCycle("startup").catch((err) => {
         this.logger.warn({ err }, "external sync on startup failed");
+      });
+      this.sendSandboxStartupNoticeOnce().catch((err) => {
+        this.logger.warn({ err }, "sandbox startup notice failed");
       });
     });
     this.client.on("shardResume", () => {
@@ -256,6 +284,7 @@ export class DiscordCodexBot {
         "message received",
       );
       if (!content && msg.attachments.size > 0) {
+        this.discardPendingApprovalForNewPrompt(contextKey);
         await this.handleExecutionMessage(msg, "");
         return;
       }
@@ -276,6 +305,7 @@ export class DiscordCodexBot {
         return;
       }
       if (content.startsWith("!ask ")) {
+        this.discardPendingApprovalForNewPrompt(contextKey);
         await this.handleExecutionMessage(msg, content.slice("!ask ".length).trim());
         return;
       }
@@ -293,6 +323,18 @@ export class DiscordCodexBot {
       }
       if (content.startsWith("!sync ")) {
         await this.handleSyncCommand(msg, content.slice("!sync ".length).trim());
+        return;
+      }
+      if (content === "!sandbox" || content.startsWith("!sandbox ")) {
+        await this.handleSandboxCommand(msg, content === "!sandbox" ? "" : content.slice("!sandbox ".length).trim());
+        return;
+      }
+      if (content === "!ok" || content.startsWith("!ok ")) {
+        await this.handleOkCommand(msg, contextKey, content === "!ok" ? "" : content.slice("!ok ".length).trim());
+        return;
+      }
+      if (content === "!ng") {
+        await this.handleNgCommand(msg, contextKey);
         return;
       }
       if (content === "!model") {
@@ -316,6 +358,7 @@ export class DiscordCodexBot {
         );
         return;
       }
+      this.discardPendingApprovalForNewPrompt(contextKey);
       await this.handleExecutionMessage(msg, content);
     } finally {
       this.db.setContextCursor(contextKey, msg.id);
@@ -735,6 +778,8 @@ export class DiscordCodexBot {
       const lines = [
         `codex_thread_id: ${current.codex_thread_id ?? notLinkedYet(this.locale)}`,
         `model: ${current.model_override ?? "default"}`,
+        `sandbox: ${current.sandbox_mode ?? "workspace-write"}`,
+        `danger_full_access_until: ${current.danger_full_access_until ?? "-"}`,
         `working_directory: ${workingDirectory}`,
         `queue_lock_key: ${lockKey}`,
         `status: ${current.status}`,
@@ -749,7 +794,15 @@ export class DiscordCodexBot {
     await msg.reply(usageSessionRoot(this.locale));
   }
 
-  private async handleExecutionMessage(msg: Message, content: string): Promise<void> {
+  private async handleExecutionMessage(
+    msg: Message,
+    content: string,
+    options?: {
+      promptOverride?: string;
+      sandboxOverride?: SandboxMode;
+      approvalStatusOverride?: "one_shot";
+    },
+  ): Promise<void> {
     const stale = this.db.cancelStaleRunningExecutions(appConfig.codexTimeoutSec + 60);
     if (stale > 0) {
       this.logger.warn({ stale }, "stale running executions were timed out");
@@ -841,8 +894,13 @@ export class DiscordCodexBot {
         await sendChannel.send(text);
       }
     };
-    const incomingPaths = await this.saveIncomingAttachments(msg, session.id);
-    const prompt = buildPromptWithIncomingAttachments(content, incomingPaths);
+    const incomingPaths = options?.promptOverride
+      ? []
+      : await this.saveIncomingAttachments(msg, session.id);
+    const prompt = options?.promptOverride
+      ?? buildPromptWithIncomingAttachments(content, incomingPaths);
+    const sandboxMode = options?.sandboxOverride ?? this.resolveSandboxMode(session);
+    let permissionFailureDetected = false;
     const executionLockKey = this.getExecutionLockKey(session);
     const storedThreadIdAtStart = session.codex_thread_id ?? null;
     let observedThreadId: string | null = storedThreadIdAtStart;
@@ -941,7 +999,12 @@ export class DiscordCodexBot {
           session.attach_instruction_sent_at = new Date().toISOString();
         }
         this.logger.info(
-          { executionId, sessionId: session.id, codexThreadId: session.codex_thread_id },
+          {
+            executionId,
+            sessionId: session.id,
+            codexThreadId: session.codex_thread_id,
+            sandboxMode,
+          },
           "execution started",
         );
         const runResult = await this.codex.run({
@@ -949,6 +1012,7 @@ export class DiscordCodexBot {
           sessionId: session.id,
           codexThreadId: session.codex_thread_id,
           modelOverride: session.model_override,
+          sandboxMode,
           preferredWorkingDirectory: session.preferred_working_directory,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onEvent: async (event) => {
@@ -971,6 +1035,18 @@ export class DiscordCodexBot {
                   codexThreadId: observedThreadId ?? session.codex_thread_id ?? null,
                 },
                 "codex json milestone",
+              );
+            }
+            if (this.isPermissionDeniedCommandFailure(event.raw)) {
+              permissionFailureDetected = true;
+              this.logger.warn(
+                {
+                  executionId,
+                  sessionId: session.id,
+                  itemId: event.itemId ?? null,
+                  sandboxMode,
+                },
+                "codex command failed with permission denied",
               );
             }
             if (
@@ -1159,11 +1235,39 @@ export class DiscordCodexBot {
           ? `stream_log:\n${historyLines.join("\n")}\n`
           : "";
         const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
+        const approvalView = this.resolveApprovalStatusView(
+          session,
+          sandboxMode,
+          permissionFailureDetected,
+          options?.approvalStatusOverride,
+        );
+        const approvalBlock = approvalView
+          ? `${approvalStatusLine(this.locale, approvalView)}\n`
+          : "";
         await sendOrEditFinal(
-          completeHeader(this.locale, sessionLabel, switchBlock, modelBlock, usageBlock, historyBlock),
+          completeHeader(
+            this.locale,
+            sessionLabel,
+            switchBlock,
+            approvalBlock,
+            modelBlock,
+            usageBlock,
+            historyBlock,
+          ),
         );
         for (let i = 0; i < chunks.length; i += 1) {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
+        }
+        await this.sendSandboxFirstCompletionNoticeOnce(sendChannel);
+        if (permissionFailureDetected && sandboxMode === "workspace-write") {
+          this.pendingApprovals.set(contextKey, {
+            content,
+            prompt,
+            sessionId: session.id,
+            messageId: msg.id,
+            createdAtMs: Date.now(),
+          });
+          await sendChannel.send(permissionRetryPrompt(this.locale));
         }
         if (parsed.paths.length > 0) {
           await this.handleAttachCommands(sendChannel, parsed.paths);
@@ -1330,6 +1434,180 @@ export class DiscordCodexBot {
       return;
     }
     await msg.reply(usageSync(this.locale));
+  }
+
+  private discardPendingApprovalForNewPrompt(contextKey: string): void {
+    this.pendingApprovals.delete(contextKey);
+  }
+
+  private resolveSandboxMode(session: SessionRow): SandboxMode {
+    if (appConfig.forceLegacyFullAccess) return "danger-full-access";
+    if (session.sandbox_mode === "danger-full-access") return "danger-full-access";
+    if (session.danger_full_access_until) {
+      const untilMs = Date.parse(session.danger_full_access_until);
+      if (Number.isFinite(untilMs) && untilMs > Date.now()) return "danger-full-access";
+    }
+    return "workspace-write";
+  }
+
+  private isPermissionDeniedCommandFailure(raw: Record<string, unknown>): boolean {
+    if (raw.type !== "item.completed") return false;
+    const item = raw.item;
+    if (!item || typeof item !== "object") return false;
+    const itemObj = item as Record<string, unknown>;
+    if (itemObj.type !== "command_execution") return false;
+    if (itemObj.status !== "failed") return false;
+    const text = String(itemObj.aggregated_output ?? "").toLowerCase();
+    return [
+      "access denied",
+      "permission denied",
+      "unauthorizedaccessexception",
+      "アクセスが拒否されました",
+      "permissiondenied",
+    ].some((pattern) => text.includes(pattern.toLowerCase()));
+  }
+
+  private async handleSandboxCommand(msg: Message, body: string): Promise<void> {
+    const arg = body.trim().toLowerCase();
+    if (arg !== "on" && arg !== "off") {
+      await msg.reply(usageSandbox(this.locale));
+      return;
+    }
+    const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "sandbox",
+    });
+    const mode: SandboxMode = arg === "off" ? "danger-full-access" : "workspace-write";
+    this.db.setSessionSandboxMode(session.id, mode);
+    session.sandbox_mode = mode;
+    session.danger_full_access_until = null;
+    this.pendingApprovals.delete(contextKey);
+    await msg.reply(sandboxModeSet(this.locale, mode));
+  }
+
+  private async handleOkCommand(msg: Message, contextKey: string, body: string): Promise<void> {
+    const arg = body.trim();
+    if (arg) {
+      const minutes = Number(arg);
+      if (!Number.isInteger(minutes) || minutes <= 0 || minutes > TEMP_FULL_ACCESS_MAX_MINUTES) {
+        await msg.reply(usageOk(this.locale, TEMP_FULL_ACCESS_MAX_MINUTES));
+        return;
+      }
+      const session = this.sessionService.resolveOrCreateActiveSession({
+        contextKey,
+        requesterId: msg.author.id,
+        initialMessage: "ok",
+      });
+      const untilIso = new Date(Date.now() + minutes * 60 * 1000).toISOString();
+      this.db.setSessionDangerFullAccessUntil(session.id, untilIso);
+      session.danger_full_access_until = untilIso;
+      const pending = this.pendingApprovals.get(contextKey);
+      if (pending && pending.sessionId !== session.id) {
+        this.pendingApprovals.delete(contextKey);
+        await msg.reply(permissionRequestNotFound(this.locale));
+        return;
+      }
+      if (pending) {
+        this.pendingApprovals.delete(contextKey);
+        await msg.reply(temporaryFullAccessEnabled(this.locale, minutes));
+        await this.handleExecutionMessage(msg, pending.content, {
+          promptOverride: permissionGrantedReexecutePrompt(this.locale),
+          sandboxOverride: "danger-full-access",
+        });
+        return;
+      }
+      await msg.reply(temporaryFullAccessEnabled(this.locale, minutes));
+      return;
+    }
+
+    const pending = this.pendingApprovals.get(contextKey);
+    if (!pending) {
+      await msg.reply(permissionRequestNotFound(this.locale));
+      return;
+    }
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "ok",
+    });
+    if (session.id !== pending.sessionId) {
+      this.pendingApprovals.delete(contextKey);
+      await msg.reply(permissionRequestNotFound(this.locale));
+      return;
+    }
+    this.pendingApprovals.delete(contextKey);
+    await this.handleExecutionMessage(msg, pending.content, {
+      promptOverride: permissionGrantedReexecutePrompt(this.locale),
+      sandboxOverride: "danger-full-access",
+      approvalStatusOverride: "one_shot",
+    });
+  }
+
+  private async handleNgCommand(msg: Message, contextKey: string): Promise<void> {
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "ng",
+    });
+    const hadPending = this.pendingApprovals.delete(contextKey);
+    const hadTemporaryFullAccess = Boolean(session.danger_full_access_until);
+    if (hadTemporaryFullAccess) {
+      this.db.setSessionDangerFullAccessUntil(session.id, null);
+      session.danger_full_access_until = null;
+    }
+
+    if (!hadPending && !hadTemporaryFullAccess) {
+      await msg.reply(permissionRequestNotFound(this.locale));
+      return;
+    }
+
+    const replies: string[] = [];
+    if (hadPending) replies.push(permissionRequestDiscarded(this.locale));
+    if (hadTemporaryFullAccess) replies.push(temporaryFullAccessDisabled(this.locale));
+    await msg.reply(replies.join("\n"));
+  }
+
+  private async sendSandboxStartupNoticeOnce(): Promise<void> {
+    if (this.db.getAppState(APP_STATE_SANDBOX_NOTICE_STARTUP) === "done") return;
+    const contextKey = this.db.getMostRecentContextKey();
+    if (!contextKey) return;
+    const channel = await this.resolveSendableChannelByContextKey(contextKey);
+    if (!channel) return;
+    await channel.send(sandboxMigrationNotice(this.locale));
+    this.db.setAppState(APP_STATE_SANDBOX_NOTICE_STARTUP, "done");
+  }
+
+  private async sendSandboxFirstCompletionNoticeOnce(
+    sendChannel: SendableChannels,
+  ): Promise<void> {
+    if (this.db.getAppState(APP_STATE_SANDBOX_NOTICE_FIRST_COMPLETION) === "done") return;
+    await sendChannel.send(sandboxMigrationNotice(this.locale));
+    this.db.setAppState(APP_STATE_SANDBOX_NOTICE_FIRST_COMPLETION, "done");
+  }
+
+  private resolveApprovalStatusView(
+    session: SessionRow,
+    sandboxMode: SandboxMode,
+    permissionFailureDetected: boolean,
+    approvalStatusOverride?: "one_shot",
+  ): ApprovalStatusView | null {
+    if (appConfig.forceLegacyFullAccess) return null;
+    if (approvalStatusOverride === "one_shot") {
+      return { kind: "one_shot" };
+    }
+    if (sandboxMode === "workspace-write") {
+      if (permissionFailureDetected) return { kind: "pending", sandboxMode };
+      return { kind: "none", sandboxMode };
+    }
+    if (session.sandbox_mode === "danger-full-access") {
+      return { kind: "always_on" };
+    }
+    if (session.danger_full_access_until) {
+      return { kind: "temporary", untilIso: session.danger_full_access_until };
+    }
+    return { kind: "always_on" };
   }
 
   private modelOptionLabel(value: string): string {

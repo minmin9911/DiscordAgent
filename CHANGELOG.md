@@ -4,6 +4,13 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.68 (2026-05-11)
+- Add sandbox settings so each session can switch between `workspace-write` and `danger-full-access`.
+- Make sandbox-enabled execution the default behavior for this application (previously only sandbox-disabled behavior was used). You can restore previous behavior by setting `FORCE_LEGACY_FULL_ACCESS=true`.
+- Add `!ok` / `!ok <minutes>` / `!ng` handling for retrying, temporarily allowing, or discarding runs that may fail due to insufficient permissions.
+- Add per-execution sandbox/approval status line to the completion header.
+- Change the default working directory for app-created sessions to `DEFAULT_AGENT_WORKDIR_ROOT/<session_id>` (previously the app root directory was used, which allowed access to the application itself; this is now isolated).
+
 ## v0.1.0 build.63 (2026-05-04)
 - Emphasize usage status in the completion header when remaining quota enters a danger zone (red at 5% or below, yellow at 10% or below).
 - Add the `!model` command so the model can be switched per session.

@@ -43,6 +43,10 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "  - Enable or disable external client sync.",
       "- !sync reset",
       "  - Mark all current Codex messages as already synced. Only future updates will be synced.",
+      "- !sandbox on|off",
+      "  - Use workspace-write sandbox or full access for this session.",
+      "- !ok / !ok <minutes> / !ng",
+      "  - Retry the latest permission-limited request or temporarily allow full access.",
       "",
       "## Session Management",
       "- !session new [name]",
@@ -85,6 +89,10 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "  - 他のクライアント更新の同期を有効/無効にします。",
     "- !sync reset",
     "  - 現時点でのCodexのメッセージを全て同期済みとして扱います。未来の更新のみ同期します。",
+    "- !sandbox on|off",
+    "  - このセッションを workspace-write または full access で実行します。",
+    "- !ok / !ok <minutes> / !ng",
+    "  - 直近の権限不足リクエストを再実行、または一時的に full access を許可します。",
     "",
     "## セッション管理",
     "- !session new [name]",
@@ -213,12 +221,13 @@ export function completeHeader(
   _locale: AppLocale,
   label: string,
   switchBlock: string,
+  approvalBlock: string,
   modelBlock: string,
   usageBlock: string,
   historyBlock: string,
 ): string {
   void _locale;
-  return `codex_session: ${label}\n${switchBlock}${historyBlock}complete: body is sent in next message(s)\n${modelBlock}${usageBlock}`.trimEnd();
+  return `codex_session: ${label}\n${switchBlock}${historyBlock}${approvalBlock}complete: body is sent in next message(s)\n${modelBlock}${usageBlock}`.trimEnd();
 }
 
 export function usageModel(locale: AppLocale): string {
@@ -245,6 +254,126 @@ export function modelListSourceLine(locale: AppLocale, sourcePath: string): stri
   return locale === "en"
     ? `model list source: ${sourcePath}`
     : `モデル一覧の定義: ${sourcePath}`;
+}
+
+export function permissionRetryPrompt(locale: AppLocale): string {
+  return locale === "en"
+    ? "Permission may be insufficient. Reply `!ok` to retry once with full access, `!ok 10` to allow full access for 10 minutes, or `!ng` to discard."
+    : "権限不足の可能性があります。`!ok` で1回だけ full access で再実行、`!ok 10` で10分間 full access を許可、`!ng` で破棄します。";
+}
+
+export function permissionRequestDiscarded(locale: AppLocale): string {
+  return locale === "en"
+    ? "permission request discarded"
+    : "権限不足リクエストを破棄しました";
+}
+
+export function temporaryFullAccessDisabled(locale: AppLocale): string {
+  return locale === "en"
+    ? "temporary full access disabled"
+    : "一時的な full access を解除しました";
+}
+
+export function permissionRequestNotFound(locale: AppLocale): string {
+  return locale === "en"
+    ? "no pending permission request"
+    : "承認待ちのリクエストはありません";
+}
+
+export function permissionGrantedReexecutePrompt(locale: AppLocale): string {
+  return locale === "en"
+    ? "Permission has been granted. Continue as needed."
+    : "権限を付与しました。必要に応じて処理を続けてください。";
+}
+
+export function temporaryFullAccessEnabled(locale: AppLocale, minutes: number): string {
+  return locale === "en"
+    ? `temporary full access enabled for ${minutes} minute(s)`
+    : `${minutes}分間 full access を許可しました`;
+}
+
+export function sandboxModeSet(locale: AppLocale, mode: "workspace-write" | "danger-full-access"): string {
+  if (locale === "en") return `sandbox mode set: ${mode}`;
+  return `sandbox mode を設定しました: ${mode}`;
+}
+
+export function usageSandbox(locale: AppLocale): string {
+  return locale === "en"
+    ? "usage: !sandbox on|off"
+    : "使い方: !sandbox on|off";
+}
+
+export function sandboxMigrationNotice(locale: AppLocale): string {
+  if (locale === "en") {
+    return [
+      "[NOTICE] Sandbox default changed",
+      "All sessions now run with workspace-write by default.",
+      "If needed, use !ok <minutes> for temporary full access, or !sandbox off for persistent full access.",
+      "To fully revert behavior, set FORCE_LEGACY_FULL_ACCESS=true in .env and restart.",
+    ].join("\n");
+  }
+  return [
+    "[注意] サンドボックス既定値が変更されました",
+    "全セッションが既定で workspace-write で動作します。",
+    "必要に応じて !ok <minutes> で一時的に full access、または !sandbox off で恒久的に full access にできます。",
+    "挙動を完全に戻す場合は .env の FORCE_LEGACY_FULL_ACCESS=true を設定して再起動してください。",
+  ].join("\n");
+}
+
+export type ApprovalStatusView =
+  | { kind: "none"; sandboxMode: "workspace-write" }
+  | { kind: "pending"; sandboxMode: "workspace-write" }
+  | { kind: "one_shot" }
+  | { kind: "temporary"; untilIso: string }
+  | { kind: "always_on" };
+
+function formatJst(iso: string, locale: AppLocale): string {
+  const date = new Date(iso);
+  return new Intl.DateTimeFormat(
+    locale === "en" ? "en-US" : "ja-JP",
+    {
+      timeZone: "Asia/Tokyo",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    },
+  ).format(date);
+}
+
+export function approvalStatusLine(locale: AppLocale, view: ApprovalStatusView): string {
+  if (locale === "en") {
+    if (view.kind === "none") return "approval: sandbox=workspace-write | status=none";
+    if (view.kind === "pending") {
+      return "approval: sandbox=workspace-write | status=pending (!ok / !ok <minutes> / !ng)";
+    }
+    if (view.kind === "one_shot") {
+      return "approval: sandbox=workspace-write | status=full-access for this run only";
+    }
+    if (view.kind === "temporary") {
+      return `⚠ approval: sandbox=workspace-write | status=temporary full-access (until ${formatJst(view.untilIso, locale)} JST)`;
+    }
+    return "approval: sandbox=danger-full-access | status=always-on";
+  }
+  if (view.kind === "none") return "承諾状態: sandbox=workspace-write | 承諾=なし";
+  if (view.kind === "pending") {
+    return "承諾状態: sandbox=workspace-write | 承諾=待機中 (!ok / !ok <minutes> / !ng)";
+  }
+  if (view.kind === "one_shot") {
+    return "承諾状態: sandbox=workspace-write | 承諾=今回のみfull-access";
+  }
+  if (view.kind === "temporary") {
+    return `⚠ 承諾状態: sandbox=workspace-write | 承諾=一時full-access（有効期限: ${formatJst(view.untilIso, locale)} JST）`;
+  }
+  return "承諾状態: sandbox=danger-full-access | 承諾=恒久";
+}
+
+export function usageOk(locale: AppLocale, maxMinutes: number): string {
+  return locale === "en"
+    ? `usage: !ok [1-${maxMinutes}]`
+    : `使い方: !ok [1-${maxMinutes}]`;
 }
 
 export function usageCodexSession(locale: AppLocale): string {

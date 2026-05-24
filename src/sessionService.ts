@@ -1,5 +1,8 @@
 import { PermissionFlagsBits, type GuildMember } from "discord.js";
+import { mkdirSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { AppDb } from "./db.js";
+import { appConfig } from "./config.js";
 import type { SessionRow } from "./types.js";
 
 export class SessionService {
@@ -22,7 +25,7 @@ export class SessionService {
   }): SessionRow {
     const bound = this.db.getBoundSession(input.contextKey);
     if (bound) {
-      return bound;
+      return this.ensureDefaultWorkingDirectory(bound);
     }
     const created = this.db.createSession({
       name: this.generateSessionName(input.initialMessage),
@@ -30,7 +33,7 @@ export class SessionService {
       summary: this.buildSummary(input.initialMessage),
     });
     this.db.bindContext(input.contextKey, created.id);
-    return created;
+    return this.ensureDefaultWorkingDirectory(created);
   }
 
   createAndBindSession(input: {
@@ -49,7 +52,7 @@ export class SessionService {
       preferredWorkingDirectory: input.preferredWorkingDirectory,
     });
     this.db.bindContext(input.contextKey, created.id);
-    return created;
+    return this.ensureDefaultWorkingDirectory(created);
   }
 
   listSessions(query: string | undefined, limit: number): SessionRow[] {
@@ -153,7 +156,7 @@ export class SessionService {
 
     const refreshed = this.db.getSessionById(current.id);
     if (!refreshed) return { ok: false, code: "ERR_DB_READ_FAILED" };
-    return { ok: true, session: refreshed };
+    return { ok: true, session: this.ensureDefaultWorkingDirectory(refreshed) };
   }
 
   connectCodexThread(input: {
@@ -184,7 +187,11 @@ export class SessionService {
       this.db.bindContext(input.contextKey, existing.id);
       const refreshed = this.db.getSessionById(existing.id);
       if (!refreshed) return { ok: false, code: "ERR_DB_READ_FAILED" };
-      return { ok: true, session: refreshed, created: false };
+      return {
+        ok: true,
+        session: this.ensureDefaultWorkingDirectory(refreshed),
+        created: false,
+      };
     }
 
     const created = this.db.createSession({
@@ -199,7 +206,7 @@ export class SessionService {
       return { ok: false, code: "ERR_DB_READ_FAILED" };
     }
     this.db.bindContext(input.contextKey, withThread.id);
-    return { ok: true, session: withThread, created: true };
+    return { ok: true, session: this.ensureDefaultWorkingDirectory(withThread), created: true };
   }
 
   touchSession(sessionId: string): void {
@@ -229,5 +236,17 @@ export class SessionService {
     const h = String(d.getHours()).padStart(2, "0");
     const mi = String(d.getMinutes()).padStart(2, "0");
     return `session-${y}${mo}${da}-${h}${mi}`;
+  }
+
+  private ensureDefaultWorkingDirectory(session: SessionRow): SessionRow {
+    if (session.preferred_working_directory) return session;
+    const root = resolve(appConfig.defaultAgentWorkdirRoot);
+    const workingDirectory = join(root, session.id);
+    mkdirSync(workingDirectory, { recursive: true });
+    this.db.setSessionPreferredWorkingDirectory(session.id, workingDirectory);
+    return {
+      ...session,
+      preferred_working_directory: workingDirectory,
+    };
   }
 }

@@ -31,6 +31,8 @@ export interface CodexStreamEvent {
   raw: Record<string, unknown>;
 }
 
+export type CodexSandboxMode = "workspace-write" | "danger-full-access";
+
 export function detectLogicalCompletionFromJsonlLine(
   line: string,
 ): "turn.completed" | "task_complete" | null {
@@ -84,6 +86,7 @@ export class CodexAdapter {
     sessionId: string;
     codexThreadId?: string | null;
     modelOverride?: string | null;
+    sandboxMode?: CodexSandboxMode;
     preferredWorkingDirectory?: string | null;
     includeDiscordAgentSystemPrompt?: boolean;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
@@ -164,6 +167,7 @@ export class CodexAdapter {
     prompt: string;
     codexThreadId?: string | null;
     modelOverride?: string | null;
+    sandboxMode?: CodexSandboxMode;
     preferredWorkingDirectory?: string | null;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
     onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
@@ -194,7 +198,10 @@ export class CodexAdapter {
         "resume",
         input.codexThreadId,
         "-",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "-c",
+        `sandbox_mode="${input.sandboxMode ?? "workspace-write"}"`,
+        "-c",
+        "approval_policy=\"on-request\"",
         "-c",
         "suppress_unstable_features_warning=true",
         "--json",
@@ -204,7 +211,10 @@ export class CodexAdapter {
       args.push(
         "exec",
         "-",
-        "--dangerously-bypass-approvals-and-sandbox",
+        "-c",
+        `sandbox_mode="${input.sandboxMode ?? "workspace-write"}"`,
+        "-c",
+        "approval_policy=\"on-request\"",
         "-c",
         "suppress_unstable_features_warning=true",
         "--json",

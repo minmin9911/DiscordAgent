@@ -8,14 +8,15 @@ import {
 import { createAppLogger } from "./logger.js";
 import { getBuildLabel } from "./buildInfo.js";
 
-const logger = createAppLogger(appConfig.logLevel);
+const EXIT_SINGLE_INSTANCE = 10;
 
 async function main(): Promise<void> {
   const build = getBuildLabel();
   console.log(`build: ${build}`);
-  logger.info({ build }, "startup build");
 
   const releaseLock = await acquireSingleInstancePortLock(appConfig.instanceLockPort);
+  const logger = createAppLogger(appConfig.logLevel);
+  logger.info({ build }, "startup build");
   const shutdown = async (): Promise<void> => {
     try {
       await releaseLock();
@@ -50,17 +51,18 @@ async function main(): Promise<void> {
   const bot = new DiscordCodexBot({ db, logger });
   try {
     await bot.start();
-  } finally {
+  } catch (err) {
     await shutdown();
+    throw err;
   }
 }
 
 main().catch((err) => {
   if (err instanceof SingleInstanceError) {
-    logger.error({ msg: err.message }, "single-instance lock already in use");
-    process.exit(1);
+    console.error(`single-instance lock already in use: ${err.message}`);
+    process.exit(EXIT_SINGLE_INSTANCE);
     return;
   }
-  logger.error({ err }, "fatal error");
+  console.error(err);
   process.exit(1);
 });

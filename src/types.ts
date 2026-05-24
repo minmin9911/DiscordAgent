@@ -1,4 +1,5 @@
 export type SessionStatus = "active" | "archived" | "busy" | "error";
+export type SandboxMode = "workspace-write" | "danger-full-access";
 
 export type ExecutionStatus =
   | "queued"
@@ -13,6 +14,8 @@ export interface SessionRow {
   name: string;
   codex_thread_id: string | null;
   model_override: string | null;
+  sandbox_mode: SandboxMode | null;
+  danger_full_access_until: string | null;
   preferred_working_directory: string | null;
   attach_instruction_sent_at: string | null;
   status: SessionStatus;

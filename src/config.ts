@@ -23,6 +23,7 @@ const schema = z.object({
   ALLOWED_CHANNEL_IDS: z.string().min(1),
   ALLOWED_USER_IDS: z.string().optional().default(""),
   SQLITE_PATH: z.string().default("./data/app.db"),
+  DEFAULT_AGENT_WORKDIR_ROOT: z.string().default("./workspaces"),
   LOG_LEVEL: z.string().default("info"),
   CODEX_EXEC_TEMPLATE: z
     .string()
@@ -39,6 +40,7 @@ const schema = z.object({
   EXTERNAL_SYNC_MAX_BURST: z.coerce.number().int().min(1).max(300).default(30),
   EXTERNAL_SYNC_USER_MAX_CHARS: z.coerce.number().int().min(50).max(10000).default(300),
   SHOW_FINAL_STREAM_LOG: envBoolean(true),
+  FORCE_LEGACY_FULL_ACCESS: envBoolean(false),
 });
 
 const parsed = schema.parse(process.env);
@@ -57,6 +59,7 @@ export const appConfig = {
       .filter(Boolean),
   ),
   sqlitePath: parsed.SQLITE_PATH,
+  defaultAgentWorkdirRoot: parsed.DEFAULT_AGENT_WORKDIR_ROOT,
   logLevel: parsed.LOG_LEVEL,
   codexExecTemplate: parsed.CODEX_EXEC_TEMPLATE,
   codexMode: parsed.CODEX_MODE,
@@ -71,6 +74,7 @@ export const appConfig = {
   externalSyncMaxBurst: parsed.EXTERNAL_SYNC_MAX_BURST,
   externalSyncUserMaxChars: parsed.EXTERNAL_SYNC_USER_MAX_CHARS,
   showFinalStreamLog: parsed.SHOW_FINAL_STREAM_LOG,
+  forceLegacyFullAccess: parsed.FORCE_LEGACY_FULL_ACCESS,
   listDefaultLimit: 20,
   queueLimitPerSession: 20,
   progressIntervalSec: 30,

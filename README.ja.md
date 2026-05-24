@@ -117,6 +117,8 @@ npm start
 
 * `SQLITE_PATH`: DB パス
 
+* `DEFAULT_AGENT_WORKDIR_ROOT`: 新規セッションの既定 working_directory ルート（既定 `./workspaces`）
+
 * `CODEX_MODE`: `cli`（推奨）または `template`（非推奨・実験用）
 
 * `CODEX_TIMEOUT_SEC`: Codex 実行タイムアウト秒
@@ -130,6 +132,12 @@ npm start
 * `INSTANCE_LOCK_PORT`: 単一起動用ロックポート（二重起動防止の排他制御に使用しているポート）
 
 * `SHOW_FINAL_STREAM_LOG`: 完了ヘッダに `stream_log` を表示するか（既定 `true`）
+
+実行ごとの完了ヘッダには、その実行時点の sandbox / 承諾状態が表示されます。
+
+`FORCE_LEGACY_FULL_ACCESS=true` の場合、この承諾状態行は表示しません。
+
+新規作成されたアプリセッションは、既定で `DEFAULT_AGENT_WORKDIR_ROOT/<session_id>` を working_directory として使用します。
 
 ### `CODEX_MODE=template` について
 
@@ -196,6 +204,26 @@ npm start
 * `!queue fix`
 
   * `running` となっているが、対応するプロセスの存在しない、「孤児実行」を修復します。
+
+* `!sandbox on`
+
+  * このセッションを `workspace-write` で実行します。ワーキングディレクトリ内の操作を基本とする既定設定です。
+
+* `!sandbox off`
+
+  * このセッションを常時 `danger-full-access` で実行します。
+
+* `!ok`
+
+  * 直近の権限不足リクエストを1回だけ `danger-full-access` で再実行します。
+
+* `!ok <minutes>`
+
+  * 指定分数だけ、このセッションを一時的に `danger-full-access` で実行します。上限は60分です。
+
+* `!ng`
+
+  * 直近の権限不足リクエストを破棄します。
 
 ## ログ
 

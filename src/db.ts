@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ExecutionStatus, SessionRow } from "./types.js";
+import type { ExecutionStatus, SandboxMode, SessionRow } from "./types.js";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -25,6 +25,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   name TEXT NOT NULL,
   codex_thread_id TEXT,
   model_override TEXT,
+  sandbox_mode TEXT,
+  danger_full_access_until TEXT,
   preferred_working_directory TEXT,
   attach_instruction_sent_at TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'busy', 'error')),
@@ -131,6 +133,16 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     const hasModelOverride = columns.some((c) => c.name === "model_override");
     if (!hasModelOverride) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN model_override TEXT");
+    }
+    const hasSandboxMode = columns.some((c) => c.name === "sandbox_mode");
+    if (!hasSandboxMode) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN sandbox_mode TEXT");
+    }
+    const hasDangerFullAccessUntil = columns.some(
+      (c) => c.name === "danger_full_access_until",
+    );
+    if (!hasDangerFullAccessUntil) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN danger_full_access_until TEXT");
     }
   }
 
@@ -241,6 +253,20 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     return row ?? null;
   }
 
+  getMostRecentContextKey(): string | null {
+    const row = this.db
+      .prepare(
+        `SELECT cb.context_key
+         FROM context_bindings cb
+         JOIN sessions s ON s.id = cb.active_session_id
+         WHERE s.status != 'archived'
+         ORDER BY s.last_used_at DESC
+         LIMIT 1`,
+      )
+      .get() as { context_key: string } | undefined;
+    return row?.context_key ?? null;
+  }
+
   touchSession(sessionId: string): void {
     this.db
       .prepare("UPDATE sessions SET last_used_at = ? WHERE id = ?")
@@ -263,6 +289,18 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     this.db
       .prepare("UPDATE sessions SET model_override = ? WHERE id = ?")
       .run(modelOverride, sessionId);
+  }
+
+  setSessionSandboxMode(sessionId: string, sandboxMode: SandboxMode): void {
+    this.db
+      .prepare("UPDATE sessions SET sandbox_mode = ?, danger_full_access_until = NULL WHERE id = ?")
+      .run(sandboxMode, sessionId);
+  }
+
+  setSessionDangerFullAccessUntil(sessionId: string, untilIso: string | null): void {
+    this.db
+      .prepare("UPDATE sessions SET danger_full_access_until = ? WHERE id = ?")
+      .run(untilIso, sessionId);
   }
 
   setSessionPreferredWorkingDirectory(sessionId: string, workingDirectory: string): void {

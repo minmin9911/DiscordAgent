@@ -4,6 +4,9 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.69 (2026-05-11)
+- Improved `!ok` behavior by widening the range of permission-related errors that can be detected.
+
 ## v0.1.0 build.68 (2026-05-11)
 - Add sandbox settings so each session can switch between `workspace-write` and `danger-full-access`.
 - Make sandbox-enabled execution the default behavior for this application (previously only sandbox-disabled behavior was used). You can restore previous behavior by setting `FORCE_LEGACY_FULL_ACCESS=true`.

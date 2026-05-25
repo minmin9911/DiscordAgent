@@ -901,6 +901,7 @@ export class DiscordCodexBot {
       ?? buildPromptWithIncomingAttachments(content, incomingPaths);
     const sandboxMode = options?.sandboxOverride ?? this.resolveSandboxMode(session);
     let permissionFailureDetected = false;
+    let retryableSandboxFailureDetected = false;
     const executionLockKey = this.getExecutionLockKey(session);
     const storedThreadIdAtStart = session.codex_thread_id ?? null;
     let observedThreadId: string | null = storedThreadIdAtStart;
@@ -1049,6 +1050,18 @@ export class DiscordCodexBot {
                 "codex command failed with permission denied",
               );
             }
+            if (this.isRetryableSandboxSetupFailure(event.raw)) {
+              retryableSandboxFailureDetected = true;
+              this.logger.warn(
+                {
+                  executionId,
+                  sessionId: session.id,
+                  itemId: event.itemId ?? null,
+                  sandboxMode,
+                },
+                "codex command failed with retryable sandbox setup error",
+              );
+            }
             if (
               event.type === "item.completed"
               && (event.itemType === "user_message" || event.itemType === "agent_message")
@@ -1181,6 +1194,9 @@ export class DiscordCodexBot {
             errorCode: runResult.errorCode,
           };
         }
+        if (this.containsRetryableSandboxSetupFailureText(runResult.output)) {
+          retryableSandboxFailureDetected = true;
+        }
         return { status: "success" as const, output: runResult.output };
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
@@ -1235,10 +1251,11 @@ export class DiscordCodexBot {
           ? `stream_log:\n${historyLines.join("\n")}\n`
           : "";
         const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
+        const needsApprovalRetry = permissionFailureDetected || retryableSandboxFailureDetected;
         const approvalView = this.resolveApprovalStatusView(
           session,
           sandboxMode,
-          permissionFailureDetected,
+          needsApprovalRetry,
           options?.approvalStatusOverride,
         );
         const approvalBlock = approvalView
@@ -1259,7 +1276,7 @@ export class DiscordCodexBot {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
         }
         await this.sendSandboxFirstCompletionNoticeOnce(sendChannel);
-        if (permissionFailureDetected && sandboxMode === "workspace-write") {
+        if (needsApprovalRetry && sandboxMode === "workspace-write") {
           this.pendingApprovals.set(contextKey, {
             content,
             prompt,
@@ -1465,6 +1482,22 @@ export class DiscordCodexBot {
       "アクセスが拒否されました",
       "permissiondenied",
     ].some((pattern) => text.includes(pattern.toLowerCase()));
+  }
+
+  private isRetryableSandboxSetupFailure(raw: Record<string, unknown>): boolean {
+    if (raw.type !== "item.completed") return false;
+    const item = raw.item;
+    if (!item || typeof item !== "object") return false;
+    const itemObj = item as Record<string, unknown>;
+    if (itemObj.type !== "command_execution") return false;
+    if (itemObj.status !== "failed") return false;
+    const text = String(itemObj.aggregated_output ?? "").toLowerCase();
+    return this.containsRetryableSandboxSetupFailureText(text);
+  }
+
+  private containsRetryableSandboxSetupFailureText(text: string): boolean {
+    const normalized = String(text ?? "").toLowerCase();
+    return normalized.includes("windows sandbox: spawn setup refresh");
   }
 
   private async handleSandboxCommand(msg: Message, body: string): Promise<void> {

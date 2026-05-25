@@ -4,6 +4,9 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.69 (2026-05-11)
+- !okの改善を行いました（権限不足によるエラーを検出できる範囲を広げました）。
+
 ## v0.1.0 build.68 (2026-05-11)
 - サンドボックス設定を追加し、セッション単位で `workspace-write` / `danger-full-access` を切り替えられるようにした。
 - 本アプリケーションのデフォルトを、サンドボックス有効にした（従来は、サンドボックス無効のみ）。FORCE_LEGACY_FULL_ACCESS=trueとすることで、従来通りの動作にすることも可能。

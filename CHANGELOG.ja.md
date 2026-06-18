@@ -4,6 +4,17 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.76 (2026-06-19)
+- `!trigger` 機能を実装し、定期・単発実行の設定、一覧確認、詳細表示、停止、削除、編集に対応。（Agentからもユーザからも実行可能）
+- `!sandbox dir` を追加し、workspace-write 実行時にセッションごとの追加許可ディレクトリを設定できるようにした。
+- `!help agent` を追加し、Agent に DiscordAgent 専用コマンドの使い方を教えられるようにした。
+- DiscordAgent から Codex へ送る system prompt を整理し、詳細な運用説明を `!help agent` 側へ寄せて軽量化した。
+
+## v0.1.0 build.70 (2026-05-26)
+- `!trigger` コマンド（add/list/stop/delete）を追加し、daily/weekly の定期実行設定に対応。
+- Windows タスクスケジューラ連携を追加し、発火イベントをDA経由で取り込んで実行できるようにした。
+- トリガー実行結果を、対象 codex_thread_id に紐づくDiscord文脈へ投稿する処理を追加。
+
 ## v0.1.0 build.69 (2026-05-11)
 - !okの改善を行いました（権限不足によるエラーを検出できる範囲を広げました）。
 

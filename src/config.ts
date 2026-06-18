@@ -1,5 +1,6 @@
 import { config as dotenv } from "dotenv";
 import { z } from "zod";
+import { resolve } from "node:path";
 
 dotenv();
 
@@ -32,6 +33,7 @@ const schema = z.object({
   CODEX_TIMEOUT_SEC: z.coerce.number().int().positive().default(1800),
   CODEX_CLOSE_GRACE_SEC: z.coerce.number().int().min(0).max(300).default(10),
   INCOMING_ATTACH_DIR: z.string().default("./data/incoming_attachments"),
+  ATTACH_READ_DIRS: z.string().optional().default(""),
   INCOMING_ATTACH_TTL_HOURS: z.coerce.number().int().positive().default(72),
   INCOMING_ATTACH_MAX_BYTES: z.coerce.number().int().positive().default(20 * 1024 * 1024),
   INSTANCE_LOCK_PORT: z.coerce.number().int().min(1024).max(65535).default(45991),
@@ -44,6 +46,35 @@ const schema = z.object({
 });
 
 const parsed = schema.parse(process.env);
+
+function parseAttachReadDirs(raw: string, incomingAttachDir: string): string[] {
+  const values = raw
+    .split(";")
+    .map((v) => v.trim())
+    .filter(Boolean);
+  values.push(incomingAttachDir);
+  const seen = new Set<string>();
+  const unique: string[] = [];
+  for (const v of values) {
+    const normalized = resolve(v);
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(normalized);
+  }
+  // Prefer shorter (parent) paths first; skip descendants if parent is already present.
+  unique.sort((a, b) => a.length - b.length);
+  const kept: string[] = [];
+  for (const candidate of unique) {
+    const c = candidate.toLowerCase();
+    const covered = kept.some((parent) => {
+      const p = parent.toLowerCase();
+      return c === p || c.startsWith(`${p}\\`) || c.startsWith(`${p}/`);
+    });
+    if (!covered) kept.push(candidate);
+  }
+  return kept;
+}
 
 export const appConfig = {
   appLocale: parsed.APP_LOCALE,
@@ -66,6 +97,7 @@ export const appConfig = {
   codexTimeoutSec: Math.min(parsed.CODEX_TIMEOUT_SEC, 3600),
   codexCloseGraceSec: parsed.CODEX_CLOSE_GRACE_SEC,
   incomingAttachDir: parsed.INCOMING_ATTACH_DIR,
+  attachReadDirs: parseAttachReadDirs(parsed.ATTACH_READ_DIRS, parsed.INCOMING_ATTACH_DIR),
   incomingAttachTtlHours: parsed.INCOMING_ATTACH_TTL_HOURS,
   incomingAttachMaxBytes: parsed.INCOMING_ATTACH_MAX_BYTES,
   instanceLockPort: parsed.INSTANCE_LOCK_PORT,

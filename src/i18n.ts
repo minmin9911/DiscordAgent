@@ -29,6 +29,8 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "",
       "## Basic Commands",
       "- !help",
+      "- !help agent",
+      "  - Send DiscordAgent command guidance to Codex/agent context (for teaching DA-specific commands).",
       "- !ask <instruction>",
       "  - Sending a normal message without `!` works the same way.",
       "- !queue",
@@ -43,8 +45,16 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "  - Enable or disable external client sync.",
       "- !sync reset",
       "  - Mark all current Codex messages as already synced. Only future updates will be synced.",
+      "- !trigger add daily HH:mm <prompt>",
+      "- !trigger add weekly Mon,Wed HH:mm <prompt>",
+      "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
+      "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
+      "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
+      "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
       "- !sandbox on|off",
       "  - Use workspace-write sandbox or full access for this session.",
+      "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
+      "  - Manage extra directories allowed for this session's Codex thread.",
       "- !ok / !ok <minutes> / !ng",
       "  - Retry the latest permission-limited request or temporarily allow full access.",
       "",
@@ -75,6 +85,8 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "",
     "## 基本コマンド",
     "- !help",
+    "- !help agent",
+    "  - DiscordAgent専用コマンドをAgentに教え込むためのガイダンスを送信します。",
     "- !ask <instruction>",
     "  - 「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。",
     "- !queue",
@@ -89,8 +101,16 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "  - 他のクライアント更新の同期を有効/無効にします。",
     "- !sync reset",
     "  - 現時点でのCodexのメッセージを全て同期済みとして扱います。未来の更新のみ同期します。",
+    "- !trigger add daily HH:mm <prompt>",
+    "- !trigger add weekly Mon,Wed HH:mm <prompt>",
+    "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
+    "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
+    "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
+    "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
     "- !sandbox on|off",
     "  - このセッションを workspace-write または full access で実行します。",
+    "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
+    "  - このセッションのCodexスレッドに追加許可ディレクトリを設定します。",
     "- !ok / !ok <minutes> / !ng",
     "  - 直近の権限不足リクエストを再実行、または一時的に full access を許可します。",
     "",
@@ -256,10 +276,26 @@ export function modelListSourceLine(locale: AppLocale, sourcePath: string): stri
     : `モデル一覧の定義: ${sourcePath}`;
 }
 
-export function permissionRetryPrompt(locale: AppLocale): string {
-  return locale === "en"
-    ? "Permission may be insufficient. Reply `!ok` to retry once with full access, `!ok 10` to allow full access for 10 minutes, or `!ng` to discard."
-    : "権限不足の可能性があります。`!ok` で1回だけ full access で再実行、`!ok 10` で10分間 full access を許可、`!ng` で破棄します。";
+export function permissionRetryPrompt(
+  locale: AppLocale,
+  reason: "permission" | "runtime" | "mixed" = "permission",
+): string {
+  if (locale === "en") {
+    if (reason === "runtime") {
+      return "Execution runtime error occurred. Reply `!ok` to retry once with full access, `!ok 10` to allow full access for 10 minutes, or `!ng` to discard.";
+    }
+    if (reason === "mixed") {
+      return "Permission or execution runtime may be insufficient. Reply `!ok` to retry once with full access, `!ok 10` to allow full access for 10 minutes, or `!ng` to discard.";
+    }
+    return "Permission may be insufficient. Reply `!ok` to retry once with full access, `!ok 10` to allow full access for 10 minutes, or `!ng` to discard.";
+  }
+  if (reason === "runtime") {
+    return "実行基盤エラーの可能性があります。`!ok` で1回だけ full access で再実行、`!ok 10` で10分間 full access を許可、`!ng` で破棄します。";
+  }
+  if (reason === "mixed") {
+    return "権限不足または実行基盤エラーの可能性があります。`!ok` で1回だけ full access で再実行、`!ok 10` で10分間 full access を許可、`!ng` で破棄します。";
+  }
+  return "権限不足の可能性があります。`!ok` で1回だけ full access で再実行、`!ok 10` で10分間 full access を許可、`!ng` で破棄します。";
 }
 
 export function permissionRequestDiscarded(locale: AppLocale): string {
@@ -298,9 +334,78 @@ export function sandboxModeSet(locale: AppLocale, mode: "workspace-write" | "dan
 }
 
 export function usageSandbox(locale: AppLocale): string {
+  if (locale === "en") {
+    return [
+      "usage:",
+      "!sandbox on|off",
+      "!sandbox dir add <absolute_path>",
+      "!sandbox dir remove <absolute_path>",
+      "!sandbox dir list",
+      "!sandbox dir clear",
+    ].join("\n");
+  }
+  return [
+    "使い方:",
+    "!sandbox on|off",
+    "!sandbox dir add <absolute_path>",
+    "!sandbox dir remove <absolute_path>",
+    "!sandbox dir list",
+    "!sandbox dir clear",
+  ].join("\n");
+}
+
+export function sandboxDirListTitle(locale: AppLocale, codexThreadId: string): string {
   return locale === "en"
-    ? "usage: !sandbox on|off"
-    : "使い方: !sandbox on|off";
+    ? `sandbox extra dirs | codex_thread_id=${codexThreadId}`
+    : `sandbox 追加許可ディレクトリ | codex_thread_id=${codexThreadId}`;
+}
+
+export function sandboxDirListEmpty(locale: AppLocale): string {
+  return locale === "en"
+    ? "(no extra dirs)"
+    : "（追加許可ディレクトリはありません）";
+}
+
+export function sandboxDirAdded(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `sandbox dir added: ${path}`
+    : `sandbox dir を追加しました: ${path}`;
+}
+
+export function sandboxDirRemoved(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `sandbox dir removed: ${path}`
+    : `sandbox dir を削除しました: ${path}`;
+}
+
+export function sandboxDirNotFound(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `sandbox dir not found: ${path}`
+    : `sandbox dir が見つかりません: ${path}`;
+}
+
+export function sandboxDirCleared(locale: AppLocale, count: number): string {
+  return locale === "en"
+    ? `sandbox dirs cleared: ${count}`
+    : `sandbox dir を全削除しました: ${count}`;
+}
+
+export function sandboxDirPathMustBeAbsolute(locale: AppLocale): string {
+  return locale === "en"
+    ? "path must be absolute"
+    : "絶対パスを指定してください";
+}
+
+export function sandboxDirPathNotFound(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `path not found: ${path}`
+    : `パスが存在しません: ${path}`;
+}
+
+export function sandboxDirPathNotDirectory(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `path is not a directory: ${path}`
+    : `ディレクトリではありません: ${path}`;
 }
 
 export function sandboxMigrationNotice(locale: AppLocale): string {
@@ -317,6 +422,90 @@ export function sandboxMigrationNotice(locale: AppLocale): string {
     "全セッションが既定で workspace-write で動作します。",
     "必要に応じて !ok <minutes> で一時的に full access、または !sandbox off で恒久的に full access にできます。",
     "挙動を完全に戻す場合は .env の FORCE_LEGACY_FULL_ACCESS=true を設定して再起動してください。",
+  ].join("\n");
+}
+
+export function buildAgentCommandReference(locale: AppLocale): string {
+  if (locale === "en") {
+    return [
+      "Agent Operation Hints",
+      "",
+      "Command categories:",
+      "- Shared (User / Agent-intended): `!trigger ...`, `!help agent`",
+      "- Agent-only: `!attach <absolute_path>`",
+      "- User-only: all other `!` commands",
+      "",
+      "Priority order:",
+      "- 1) DiscordAgent dedicated commands (`!trigger`, `!attach`, `!help agent`)",
+      "- 2) Skills",
+      "- 3) Fallback reasoning",
+      "",
+      "Shared trigger commands:",
+      "- !trigger add daily HH:mm <prompt>",
+      "- !trigger add weekly Mon,Wed HH:mm <prompt>",
+      "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
+      "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
+      "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
+      "- !trigger list",
+      "- !trigger show <id>",
+      "- !trigger edit <id> <prompt>",
+      "- !trigger stop <id>",
+      "- !trigger delete <id>",
+      "- !help agent",
+      "",
+      "Agent-only attachment command:",
+      "- Output only one standalone line: `!attach <absolute_path>`",
+      "- Absolute path is required.",
+      "- Do not ask the user to run `!attach`; user-side `!attach` is disabled.",
+      "- File size limit: 8388608 bytes (8MB).",
+      "- If the file is larger than 8MB, suggest splitting or compressing first.",
+      "",
+      "Safety warning:",
+      "- Trigger commands execute when output as a standalone `!trigger ...` line.",
+      "- Do not print executable `!trigger ...` lines when only asking a question.",
+      "",
+      "For general commands, use `!help`.",
+    ].join("\n");
+  }
+
+  return [
+    "Agent向け操作ヒント",
+    "",
+    "コマンド分類:",
+    "- 共有（ユーザー/Agent想定）: `!trigger ...` / `!help agent`",
+    "- Agent専用: `!attach <absolute_path>`",
+    "- ユーザー専用: 上記以外の `!` コマンド",
+    "",
+    "優先順位:",
+    "- 1) DiscordAgent専用コマンド（`!trigger` / `!attach` / `!help agent`）",
+    "- 2) Skill",
+    "- 3) 自前推論",
+    "",
+    "共有 trigger コマンド:",
+    "- !trigger add daily HH:mm <prompt>",
+    "- !trigger add weekly Mon,Wed HH:mm <prompt>",
+    "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
+    "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
+    "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
+    "- !trigger list",
+    "- !trigger show <id>",
+    "- !trigger edit <id> <prompt>",
+    "- !trigger stop <id>",
+    "- !trigger delete <id>",
+    "- !help agent",
+    "",
+    "Agent専用 添付コマンド:",
+    "- `!attach <absolute_path>` の1行だけを出力",
+    "- 絶対パスが必須",
+    "- ユーザーに `!attach` の実行を依頼しない（ユーザー側 `!attach` は無効）",
+    "- ファイルサイズ上限は 8388608 bytes（8MB）",
+    "- 8MBを超える場合は、分割または圧縮を提案",
+    "",
+    "注意:",
+    "- `!trigger ...` を単独行で出力すると、そのまま実行されます。",
+    "- 質問や確認だけをしたい場面では、実行形式の `!trigger ...` 行を出力しないでください。",
+    "",
+    "通常のコマンド一覧は `!help` を参照してください。",
   ].join("\n");
 }
 
@@ -506,6 +695,52 @@ export function usageSync(locale: AppLocale): string {
   return locale === "en"
     ? "usage: !sync [status|on|off|reset]"
     : "使い方: !sync [status|on|off|reset]";
+}
+
+export function usageTrigger(locale: AppLocale): string {
+  return locale === "en"
+    ? "usage: !trigger add daily HH:mm <prompt> | !trigger add weekly Mon,Wed HH:mm <prompt> | !trigger add monthly <day(1-31)> HH:mm <prompt> | !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt> | !trigger add at YYYY-MM-DD HH:mm <prompt> | !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>"
+    : "使い方: !trigger add daily HH:mm <prompt> | !trigger add weekly Mon,Wed HH:mm <prompt> | !trigger add monthly <day(1-31)> HH:mm <prompt> | !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt> | !trigger add at YYYY-MM-DD HH:mm <prompt> | !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>";
+}
+
+export function triggerAdded(locale: AppLocale, id: string, name: string): string {
+  return locale === "en"
+    ? `trigger added: ${id} (${name})`
+    : `triggerを追加しました: ${id} (${name})`;
+}
+
+export function triggerNotFound(locale: AppLocale, id: string): string {
+  return locale === "en" ? `trigger not found: ${id}` : `triggerが見つかりません: ${id}`;
+}
+
+export function triggerStopped(locale: AppLocale, id: string): string {
+  return locale === "en" ? `trigger stopped: ${id}` : `triggerを停止しました: ${id}`;
+}
+
+export function triggerDeleted(locale: AppLocale, id: string): string {
+  return locale === "en" ? `trigger deleted: ${id}` : `triggerを削除しました: ${id}`;
+}
+
+export function triggerEdited(locale: AppLocale, id: string): string {
+  return locale === "en" ? `trigger prompt updated: ${id}` : `triggerのpromptを更新しました: ${id}`;
+}
+
+export function triggerListTitle(locale: AppLocale): string {
+  return locale === "en" ? "triggers:" : "トリガー一覧:";
+}
+
+export function triggerShowTitle(locale: AppLocale, id: string): string {
+  return locale === "en" ? `trigger detail: ${id}` : `トリガー詳細: ${id}`;
+}
+
+export function triggerListEmpty(locale: AppLocale): string {
+  return locale === "en" ? "no triggers" : "トリガーはありません";
+}
+
+export function helpAgentLoopDetected(locale: AppLocale): string {
+  return locale === "en"
+    ? "ERR_HELP_AGENT_LOOP: consecutive !help agent detected. Aborted and waiting for normal user input."
+    : "ERR_HELP_AGENT_LOOP: !help agent の連続実行を検出したため中断しました。通常のユーザー入力を待機します。";
 }
 
 export function syncStatus(locale: AppLocale, enabled: boolean, pollSec: number, maxBurst: number): string {

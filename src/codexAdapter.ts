@@ -1,15 +1,11 @@
 import { exec, spawn, spawnSync, type ExecException } from "node:child_process";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
 import { existsSync } from "node:fs";
-import { ATTACH_MAX_BYTES } from "./attachPolicy.js";
 const DISCORD_AGENT_SYSTEM_PROMPT = [
   "You are running through DiscordAgent.",
-  "DiscordAgent can upload local files to Discord on your behalf.",
-  "Do not ask the user to run !attach. User-side !attach is disabled.",
-  "When file upload is needed, output a standalone command line: !attach <absolute_path>.",
-  "absolute_path is required for reliable path resolution.",
-  `The file size limit is ${ATTACH_MAX_BYTES} bytes (8MB).`,
-  "If a file is larger than 8MB, suggest splitting or compressing first.",
+  "DiscordAgent hint commands: !attach (upload local file), !trigger (schedule prompt execution), !help agent (show DiscordAgent command help).",
+  "If command usage is unclear, you may run !help agent without asking the user first.",
+  "To run it, output a standalone command line: !help agent",
 ].join("\n");
 
 export interface CodexResult {
@@ -29,6 +25,22 @@ export interface CodexStreamEvent {
   itemId?: string;
   itemText?: string;
   raw: Record<string, unknown>;
+}
+
+function extractEventMsgAgentMessage(
+  obj: Record<string, unknown>,
+): { itemId: string; text: string } | null {
+  if (obj.type !== "event_msg") return null;
+  if (!obj.payload || typeof obj.payload !== "object") return null;
+  const payload = obj.payload as Record<string, unknown>;
+  if (payload.type !== "agent_message") return null;
+  const message = payload.message;
+  if (typeof message !== "string" || !message.trim()) return null;
+  const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "unknown";
+  return {
+    itemId: `event_msg:${timestamp}:${message.length}`,
+    text: message,
+  };
 }
 
 export type CodexSandboxMode = "workspace-write" | "danger-full-access";
@@ -87,6 +99,7 @@ export class CodexAdapter {
     codexThreadId?: string | null;
     modelOverride?: string | null;
     sandboxMode?: CodexSandboxMode;
+    additionalReadDirs?: string[];
     preferredWorkingDirectory?: string | null;
     includeDiscordAgentSystemPrompt?: boolean;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
@@ -168,6 +181,7 @@ export class CodexAdapter {
     codexThreadId?: string | null;
     modelOverride?: string | null;
     sandboxMode?: CodexSandboxMode;
+    additionalReadDirs?: string[];
     preferredWorkingDirectory?: string | null;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
     onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
@@ -181,6 +195,29 @@ export class CodexAdapter {
       },
     ) => void | Promise<void>;
   }): Promise<CodexResult> {
+    const commonOptions: string[] = [
+      "-c",
+      `sandbox_mode="${input.sandboxMode ?? "workspace-write"}"`,
+      "-c",
+      "approval_policy=\"on-request\"",
+      "-c",
+      "suppress_unstable_features_warning=true",
+      "--json",
+      "--skip-git-repo-check",
+    ];
+    const addDirOptions: string[] = [];
+    if ((input.sandboxMode ?? "workspace-write") === "workspace-write") {
+      for (const dir of input.additionalReadDirs ?? []) {
+        addDirOptions.push("--add-dir", dir);
+      }
+    }
+    const modelOptions = input.modelOverride ? ["--model", input.modelOverride] : [];
+    const rootOptions: string[] = [];
+    if ((input.sandboxMode ?? "workspace-write") === "workspace-write") {
+      for (const dir of input.additionalReadDirs ?? []) {
+        rootOptions.push("--add-dir", dir);
+      }
+    }
     const args: string[] = [];
     let resolvedCwd: string | undefined;
     if (input.codexThreadId) {
@@ -194,35 +231,22 @@ export class CodexAdapter {
     }
     if (input.codexThreadId) {
       args.push(
+        ...rootOptions,
         "exec",
         "resume",
+        ...commonOptions,
+        ...modelOptions,
         input.codexThreadId,
         "-",
-        "-c",
-        `sandbox_mode="${input.sandboxMode ?? "workspace-write"}"`,
-        "-c",
-        "approval_policy=\"on-request\"",
-        "-c",
-        "suppress_unstable_features_warning=true",
-        "--json",
-        "--skip-git-repo-check",
       );
     } else {
       args.push(
+        ...rootOptions,
         "exec",
+        ...commonOptions,
+        ...modelOptions,
         "-",
-        "-c",
-        `sandbox_mode="${input.sandboxMode ?? "workspace-write"}"`,
-        "-c",
-        "approval_policy=\"on-request\"",
-        "-c",
-        "suppress_unstable_features_warning=true",
-        "--json",
-        "--skip-git-repo-check",
       );
-    }
-    if (input.modelOverride) {
-      args.push("--model", input.modelOverride);
     }
 
     return new Promise<CodexResult>((resolve) => {
@@ -548,6 +572,11 @@ export class CodexAdapter {
           threadId = obj.thread_id;
           continue;
         }
+        const eventMsgAgent = extractEventMsgAgentMessage(obj);
+        if (eventMsgAgent) {
+          agentMessages.push(eventMsgAgent.text);
+          continue;
+        }
         if (obj.type === "item.completed" && obj.item && typeof obj.item === "object") {
           const item = obj.item as Record<string, unknown>;
           if (item.type === "agent_message" && typeof item.text === "string") {
@@ -618,6 +647,11 @@ export class CodexAdapter {
           raw: obj,
         }),
       ).catch(() => {});
+    }
+    const eventMsgAgent = extractEventMsgAgentMessage(obj);
+    if (onAgentMessage && eventMsgAgent) {
+      void Promise.resolve(onAgentMessage(eventMsgAgent)).catch(() => {});
+      return;
     }
     if (onAgentMessage && eventType === "item.completed" && itemType === "agent_message" && itemId && itemText) {
       void Promise.resolve(onAgentMessage({ itemId, text: itemText })).catch(() => {});

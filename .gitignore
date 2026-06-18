@@ -54,6 +54,7 @@ Desktop.ini
 # ---------------------------------
 docs/
 poc/
+workspaces/
 tmp_*.md
 /*.md
 !/README.md
@@ -67,3 +68,4 @@ gitleaks-report.json
 scripts/fix-*.mjs
 scripts/*
 !scripts/bump-build-number.cjs
+!scripts/trigger-fire.mjs

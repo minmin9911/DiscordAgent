@@ -4,6 +4,17 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.76 (2026-06-19)
+- Implement `!trigger` features for scheduled and one-shot execution, including list, show, stop, delete, and edit operations. (Available to both agents and users.)
+- Add `!sandbox dir` so each session can configure extra allowed directories for workspace-write runs.
+- Add `!help agent` so an agent can learn DiscordAgent-specific commands when needed.
+- Simplify the system prompt sent from DiscordAgent to Codex by moving detailed operational guidance into `!help agent`.
+
+## v0.1.0 build.70 (2026-05-26)
+- Add `!trigger` commands (add/list/stop/delete) with daily/weekly scheduling support.
+- Add Windows Task Scheduler integration so fired events are ingested and executed through DA.
+- Add trigger result posting to Discord contexts bound to the target codex_thread_id.
+
 ## v0.1.0 build.69 (2026-05-11)
 - Improved `!ok` behavior by widening the range of permission-related errors that can be detected.
 

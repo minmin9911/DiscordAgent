@@ -2,7 +2,15 @@ import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { ExecutionStatus, SandboxMode, SessionRow } from "./types.js";
+import type {
+  ExecutionStatus,
+  SandboxMode,
+  SessionRow,
+  TriggerFireRow,
+  TriggerRow,
+  TriggerStatus,
+  TriggerType,
+} from "./types.js";
 
 function nowIso(): string {
   return new Date().toISOString();
@@ -95,6 +103,39 @@ CREATE TABLE IF NOT EXISTS external_sync_seen_events (
   PRIMARY KEY (codex_thread_id, event_id)
 );
 
+CREATE TABLE IF NOT EXISTS triggers (
+  id TEXT PRIMARY KEY,
+  codex_thread_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('daily', 'weekly', 'at', 'monthly')),
+  time_hhmm TEXT NOT NULL,
+  days_csv TEXT,
+  prompt TEXT NOT NULL,
+  task_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS trigger_fires (
+  id TEXT PRIMARY KEY,
+  trigger_id TEXT NOT NULL,
+  fired_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'error')),
+  processed_at TEXT,
+  error_message TEXT,
+  FOREIGN KEY(trigger_id) REFERENCES triggers(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS sandbox_extra_dirs (
+  codex_thread_id TEXT NOT NULL,
+  dir_path TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (codex_thread_id, dir_path)
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used_at ON sessions(last_used_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name);
 CREATE INDEX IF NOT EXISTS idx_sessions_codex_thread_id ON sessions(codex_thread_id);
@@ -102,6 +143,9 @@ CREATE INDEX IF NOT EXISTS idx_executions_session_created ON executions(session_
 CREATE INDEX IF NOT EXISTS idx_executions_created_at ON executions(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_context_cursors_updated_at ON context_cursors(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_sync_seen_events(seen_at DESC);
+CREATE INDEX IF NOT EXISTS idx_triggers_codex_thread_id ON triggers(codex_thread_id);
+CREATE INDEX IF NOT EXISTS idx_trigger_fires_status_fired_at ON trigger_fires(status, fired_at);
+CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dirs(codex_thread_id);
 `;
     this.db.exec(sql);
     this.ensureColumns();
@@ -144,6 +188,68 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     if (!hasDangerFullAccessUntil) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN danger_full_access_until TEXT");
     }
+    this.ensureTriggerTypeSupportsMonthly();
+  }
+
+  private ensureTriggerTypeSupportsMonthly(): void {
+    const row = this.db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='triggers'")
+      .get() as { sql?: string } | undefined;
+    const sql = String(row?.sql ?? "").toLowerCase();
+    if (!sql.includes("trigger_type")) return;
+    if (sql.includes("'at'") && sql.includes("'monthly'")) return;
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("ALTER TABLE triggers RENAME TO triggers_old");
+      this.db.exec(`
+CREATE TABLE triggers (
+  id TEXT PRIMARY KEY,
+  codex_thread_id TEXT NOT NULL,
+  name TEXT NOT NULL,
+  trigger_type TEXT NOT NULL CHECK (trigger_type IN ('daily', 'weekly', 'at', 'monthly')),
+  time_hhmm TEXT NOT NULL,
+  days_csv TEXT,
+  prompt TEXT NOT NULL,
+  task_name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
+  created_by TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+)`);
+      this.db.exec(`
+INSERT INTO triggers (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, status, created_by, created_at, updated_at)
+SELECT id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, status, created_by, created_at, updated_at
+FROM triggers_old`);
+
+      this.db.exec("ALTER TABLE trigger_fires RENAME TO trigger_fires_old");
+      this.db.exec(`
+CREATE TABLE trigger_fires (
+  id TEXT PRIMARY KEY,
+  trigger_id TEXT NOT NULL,
+  fired_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'error')),
+  processed_at TEXT,
+  error_message TEXT,
+  FOREIGN KEY(trigger_id) REFERENCES triggers(id) ON DELETE CASCADE
+)`);
+      this.db.exec(`
+INSERT INTO trigger_fires (id, trigger_id, fired_at, status, processed_at, error_message)
+SELECT id, trigger_id, fired_at, status, processed_at, error_message
+FROM trigger_fires_old`);
+
+      this.db.exec("DROP TABLE trigger_fires_old");
+      this.db.exec("DROP TABLE triggers_old");
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_trigger_fires_status_fired_at ON trigger_fires(status, fired_at)",
+      );
+      this.db.exec("COMMIT");
+    } catch (err) {
+      this.db.exec("ROLLBACK");
+      this.db.exec("PRAGMA foreign_keys = ON");
+      throw err;
+    }
+    this.db.exec("PRAGMA foreign_keys = ON");
   }
 
   createSession(input: {
@@ -191,6 +297,14 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
         )
         .get(codexThreadId) as SessionRow | undefined) ?? null
     );
+  }
+
+  listSessionsByCodexThreadId(codexThreadId: string): SessionRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM sessions WHERE codex_thread_id = ? AND status != 'archived' ORDER BY last_used_at DESC",
+      )
+      .all(codexThreadId) as SessionRow[];
   }
 
   getSessionsByName(name: string): SessionRow[] {
@@ -265,6 +379,17 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
       )
       .get() as { context_key: string } | undefined;
     return row?.context_key ?? null;
+  }
+
+  listContextKeysBySessionIds(sessionIds: string[]): string[] {
+    if (sessionIds.length === 0) return [];
+    const placeholders = sessionIds.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT context_key FROM context_bindings WHERE active_session_id IN (${placeholders})`,
+      )
+      .all(...sessionIds) as Array<{ context_key: string }>;
+    return rows.map((v) => v.context_key);
   }
 
   touchSession(sessionId: string): void {
@@ -575,6 +700,50 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
     return rows.map((v) => v.context_key);
   }
 
+  listSandboxExtraDirs(codexThreadId: string): string[] {
+    return this.db
+      .prepare(
+        `SELECT dir_path
+         FROM sandbox_extra_dirs
+         WHERE codex_thread_id = ?
+         ORDER BY dir_path ASC`,
+      )
+      .all(codexThreadId)
+      .map((v) => (v as { dir_path: string }).dir_path);
+  }
+
+  addSandboxExtraDir(codexThreadId: string, dirPath: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO sandbox_extra_dirs (codex_thread_id, dir_path, created_at, updated_at)
+         VALUES (@codex_thread_id, @dir_path, @created_at, @updated_at)
+         ON CONFLICT(codex_thread_id, dir_path) DO UPDATE SET
+           updated_at = excluded.updated_at`,
+      )
+      .run({
+        codex_thread_id: codexThreadId,
+        dir_path: dirPath,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      });
+  }
+
+  removeSandboxExtraDir(codexThreadId: string, dirPath: string): number {
+    const result = this.db
+      .prepare(
+        "DELETE FROM sandbox_extra_dirs WHERE codex_thread_id = ? AND dir_path = ?",
+      )
+      .run(codexThreadId, dirPath);
+    return result.changes;
+  }
+
+  clearSandboxExtraDirs(codexThreadId: string): number {
+    const result = this.db
+      .prepare("DELETE FROM sandbox_extra_dirs WHERE codex_thread_id = ?")
+      .run(codexThreadId);
+    return result.changes;
+  }
+
   cancelInFlightExecutionsOnStartup(): number {
     const result = this.db
       .prepare(
@@ -600,6 +769,158 @@ CREATE INDEX IF NOT EXISTS idx_external_sync_seen_events_seen_at ON external_syn
       )
       .run(nowIso(), timeoutSec);
     return result.changes;
+  }
+
+  createTrigger(input: {
+    id?: string;
+    codexThreadId: string;
+    name: string;
+    triggerType: TriggerType;
+    timeHhmm: string;
+    daysCsv?: string | null;
+    prompt: string;
+    taskName: string;
+    createdBy: string;
+  }): TriggerRow {
+    const id = input.id ?? `trg-${randomUUID().replace(/-/g, "").slice(0, 8)}`;
+    const now = nowIso();
+    this.db.prepare(
+      `INSERT INTO triggers
+      (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, status, created_by, created_at, updated_at)
+      VALUES (@id, @codex_thread_id, @name, @trigger_type, @time_hhmm, @days_csv, @prompt, @task_name, 'enabled', @created_by, @created_at, @updated_at)`,
+    ).run({
+      id,
+      codex_thread_id: input.codexThreadId,
+      name: input.name,
+      trigger_type: input.triggerType,
+      time_hhmm: input.timeHhmm,
+      days_csv: input.daysCsv ?? null,
+      prompt: input.prompt,
+      task_name: input.taskName,
+      created_by: input.createdBy,
+      created_at: now,
+      updated_at: now,
+    });
+    return this.getTriggerById(id)!;
+  }
+
+  getTriggerById(id: string): TriggerRow | null {
+    return (
+      (this.db.prepare("SELECT * FROM triggers WHERE id = ?").get(id) as TriggerRow | undefined)
+      ?? null
+    );
+  }
+
+  listTriggers(limit: number): TriggerRow[] {
+    return this.db
+      .prepare("SELECT * FROM triggers ORDER BY created_at DESC LIMIT ?")
+      .all(limit) as TriggerRow[];
+  }
+
+  listAtTriggers(limit: number): TriggerRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM triggers WHERE trigger_type = 'at' ORDER BY created_at DESC LIMIT ?",
+      )
+      .all(limit) as TriggerRow[];
+  }
+
+  setTriggerStatus(id: string, status: TriggerStatus): void {
+    this.db
+      .prepare("UPDATE triggers SET status = ?, updated_at = ? WHERE id = ?")
+      .run(status, nowIso(), id);
+  }
+
+  updateTriggerPrompt(id: string, prompt: string): void {
+    this.db
+      .prepare("UPDATE triggers SET prompt = ?, updated_at = ? WHERE id = ?")
+      .run(prompt, nowIso(), id);
+  }
+
+  deleteTrigger(id: string): void {
+    this.db.prepare("DELETE FROM triggers WHERE id = ?").run(id);
+  }
+
+  enqueueTriggerFire(triggerId: string, firedAtIso?: string): TriggerFireRow {
+    const id = randomUUID();
+    const firedAt = firedAtIso ?? nowIso();
+    this.db.prepare(
+      `INSERT INTO trigger_fires (id, trigger_id, fired_at, status, processed_at, error_message)
+       VALUES (?, ?, ?, 'pending', NULL, NULL)`,
+    ).run(id, triggerId, firedAt);
+    return this.getTriggerFireById(id)!;
+  }
+
+  getTriggerFireById(id: string): TriggerFireRow | null {
+    return (
+      (this.db.prepare("SELECT * FROM trigger_fires WHERE id = ?").get(id) as TriggerFireRow | undefined)
+      ?? null
+    );
+  }
+
+  listPendingTriggerFires(limit: number): TriggerFireRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM trigger_fires WHERE status = 'pending' AND processed_at IS NULL ORDER BY fired_at ASC LIMIT ?",
+      )
+      .all(limit) as TriggerFireRow[];
+  }
+
+  claimPendingTriggerFires(limit: number): TriggerFireRow[] {
+    const tx = this.db.transaction((n: number) => {
+      const candidates = this.db
+        .prepare(
+          "SELECT * FROM trigger_fires WHERE status = 'pending' AND processed_at IS NULL ORDER BY fired_at ASC LIMIT ?",
+        )
+        .all(n) as TriggerFireRow[];
+      const claimAt = nowIso();
+      const update = this.db.prepare(
+        "UPDATE trigger_fires SET processed_at = ? WHERE id = ? AND status = 'pending' AND processed_at IS NULL",
+      );
+      const claimed: TriggerFireRow[] = [];
+      for (const fire of candidates) {
+        const result = update.run(claimAt, fire.id);
+        if (result.changes === 1) {
+          claimed.push({ ...fire, processed_at: claimAt });
+        }
+      }
+      return claimed;
+    });
+    return tx(limit);
+  }
+
+  markTriggerFireDone(id: string): void {
+    this.db
+      .prepare("UPDATE trigger_fires SET status = 'done', processed_at = ?, error_message = NULL WHERE id = ?")
+      .run(nowIso(), id);
+  }
+
+  markTriggerFireError(id: string, errorMessage: string): void {
+    this.db
+      .prepare("UPDATE trigger_fires SET status = 'error', processed_at = ?, error_message = ? WHERE id = ?")
+      .run(nowIso(), errorMessage, id);
+  }
+
+  getTriggerFireSummary(triggerId: string): {
+    pendingCount: number;
+    processedCount: number;
+  } {
+    const row = this.db
+      .prepare(
+        `SELECT
+           SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) AS pending_count,
+           SUM(CASE WHEN status IN ('done', 'error') THEN 1 ELSE 0 END) AS processed_count
+         FROM trigger_fires
+         WHERE trigger_id = ?`,
+      )
+      .get(triggerId) as {
+        pending_count?: number | null;
+        processed_count?: number | null;
+      } | undefined;
+    return {
+      pendingCount: Number(row?.pending_count ?? 0),
+      processedCount: Number(row?.processed_count ?? 0),
+    };
   }
 
   close(): void {

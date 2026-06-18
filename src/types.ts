@@ -1,5 +1,7 @@
 export type SessionStatus = "active" | "archived" | "busy" | "error";
 export type SandboxMode = "workspace-write" | "danger-full-access";
+export type TriggerStatus = "enabled" | "disabled";
+export type TriggerType = "daily" | "weekly" | "at" | "monthly";
 
 export type ExecutionStatus =
   | "queued"
@@ -24,6 +26,30 @@ export interface SessionRow {
   last_used_at: string;
   summary: string | null;
   archived_at: string | null;
+}
+
+export interface TriggerRow {
+  id: string;
+  codex_thread_id: string;
+  name: string;
+  trigger_type: TriggerType;
+  time_hhmm: string;
+  days_csv: string | null;
+  prompt: string;
+  task_name: string;
+  status: TriggerStatus;
+  created_by: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TriggerFireRow {
+  id: string;
+  trigger_id: string;
+  fired_at: string;
+  status: "pending" | "done" | "error";
+  processed_at: string | null;
+  error_message: string | null;
 }
 
 export interface ExecutionRow {

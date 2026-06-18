@@ -11,9 +11,3 @@ models:
   - id: gpt-5.4-mini
     description: Small, fast, and cost-efficient model for simpler coding tasks.
     disabled: false
-  - id: gpt-5.3-codex
-    description: Coding-optimized model.
-    disabled: false
-  - id: gpt-5.2
-    description: Optimized for professional work and long-running agents.
-    disabled: false

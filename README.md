@@ -103,6 +103,22 @@ Newly created app sessions now use `DEFAULT_AGENT_WORKDIR_ROOT/<session_id>` as 
 
 ## Commands
 
+### Purpose of `!help agent`
+
+Use `!help agent` to **teach DiscordAgent-specific commands (`!trigger` / `!attach`) to the agent**.  
+The agent may use this command proactively when needed. The user may also run it explicitly to teach the agent.
+
+- Main targets:
+  - `!trigger ...` (user-and-agent shared command)
+  - `!attach <absolute_path>` (agent-only command)
+- Main uses:
+  - before asking the agent to use DiscordAgent commands in a new conversation context
+  - when the agent keeps preferring Skills instead of DiscordAgent commands
+  - when the agent wants to check command usage by itself
+
+Notes:
+- Consecutive `!help agent` calls are blocked by loop protection.
+
 ### Basic
 
 - `!help`
@@ -124,6 +140,43 @@ Newly created app sessions now use `DEFAULT_AGENT_WORKDIR_ROOT/<session_id>` as 
 - `!codex pick <no>`
 - `!codex session <codex_thread_id>`
 
+### Triggers
+
+These commands are primarily intended for agent use, but users can run them directly as well.  
+Trigger firing is implemented through Windows Task Scheduler.
+
+- `!trigger add daily HH:mm <prompt>`
+  - Add a trigger that runs every day at the specified time.
+
+- `!trigger add weekly Mon,Wed HH:mm <prompt>`
+  - Add a trigger that runs every week on the specified day(s) and time.
+
+- `!trigger add monthly <day(1-31)> HH:mm <prompt>`
+  - Add a trigger that runs every month on the specified day and time.
+
+- `!trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>`
+  - Add a trigger that runs every month on the specified nth weekday or last weekday.
+
+- `!trigger add at YYYY-MM-DD HH:mm <prompt>`
+  - Add a trigger that runs only once at the specified date and time.
+
+- `!trigger list`
+  - Show the list of registered triggers.
+  - Disabled triggers are shown in the `[OFF]` section, and enabled triggers are shown in the `[ON]` section.
+
+- `!trigger show <id>`
+  - Show details for the specified trigger.
+  - The full stored `prompt` is also displayed.
+
+- `!trigger edit <id> <prompt>`
+  - Update the `prompt` of the specified trigger.
+
+- `!trigger stop <id>`
+  - Stop the specified trigger.
+
+- `!trigger delete <id>`
+  - Delete the specified trigger.
+
 ### Maintenance
 
 - `!queue`
@@ -133,6 +186,15 @@ Newly created app sessions now use `DEFAULT_AGENT_WORKDIR_ROOT/<session_id>` as 
   - Run this session with `workspace-write`. This is the default setting for work inside the current workspace.
 - `!sandbox off`
   - Run this session with persistent `danger-full-access`.
+- `!sandbox dir add <absolute_path>`
+  - Allow access to a folder outside the sandbox without additional approval by explicitly registering that folder.
+  - Add an extra allowed directory for this session's Codex thread.
+- `!sandbox dir remove <absolute_path>`
+  - Remove an extra allowed directory.
+- `!sandbox dir list`
+  - Show the currently configured extra allowed directories.
+- `!sandbox dir clear`
+  - Remove all extra allowed directories.
 - `!ok`
   - Retry the latest permission-limited request once with `danger-full-access`.
 - `!ok <minutes>`

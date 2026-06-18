@@ -12,6 +12,7 @@ import {
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import pino from "pino";
 import { AppDb } from "./db.js";
 import { SessionService } from "./sessionService.js";
@@ -31,6 +32,7 @@ import {
   approvalStatusLine,
   type ApprovalStatusView,
   buildCommandReference,
+  buildAgentCommandReference,
   codexSessionLine,
   codexSessionListEmpty,
   completeHeader,
@@ -73,11 +75,30 @@ import {
   permissionRetryPrompt,
   sandboxMigrationNotice,
   sandboxModeSet,
+  sandboxDirAdded,
+  sandboxDirCleared,
+  sandboxDirListEmpty,
+  sandboxDirListTitle,
+  sandboxDirNotFound,
+  sandboxDirPathMustBeAbsolute,
+  sandboxDirPathNotDirectory,
+  sandboxDirPathNotFound,
+  sandboxDirRemoved,
   temporaryFullAccessDisabled,
   temporaryFullAccessEnabled,
   usageModel,
   usageOk,
   usageSandbox,
+  usageTrigger,
+  triggerAdded,
+  triggerDeleted,
+  triggerEdited,
+  triggerListEmpty,
+  triggerListTitle,
+  triggerNotFound,
+  triggerShowTitle,
+  triggerStopped,
+  helpAgentLoopDetected,
 } from "./i18n.js";
 import {
   readLatestCodexUsageStatusByThreadId,
@@ -99,8 +120,7 @@ import {
   detectThreadBindingChange,
   isMissingCodexThreadError,
 } from "./threadBinding.js";
-import type { SessionRow } from "./types.js";
-import type { SandboxMode } from "./types.js";
+import type { SandboxMode, SessionRow, TriggerRow, TriggerStatus } from "./types.js";
 import { truncateExternalUserMessage } from "./externalSyncText.js";
 import { loadModelCatalog, type ModelCatalogItem } from "./modelCatalog.js";
 
@@ -111,6 +131,16 @@ const APP_STATE_LAST_RESOLVED_DEFAULT_MODEL = "last_resolved_default_model";
 const APP_STATE_SANDBOX_NOTICE_STARTUP = "sandbox_notice_startup_once";
 const APP_STATE_SANDBOX_NOTICE_FIRST_COMPLETION = "sandbox_notice_first_completion_once";
 const TEMP_FULL_ACCESS_MAX_MINUTES = 60;
+const TRIGGER_POLL_MS = 30 * 1000;
+const AT_TRIGGER_CLEANUP_SCAN_LIMIT = 200;
+const TRIGGER_MAX_PROMPT_LEN = 4000;
+const TRIGGER_COMMAND_PREFIX = "!trigger ";
+const HELP_AGENT_COMMAND = "!help agent";
+const INTERNAL_AGENT_CHAIN_MAX = 5;
+const INTERNAL_SYNC_MARKER = "__DA_INTERNAL__";
+const DISCORD_SNOWFLAKE_RE = /^\d{17,20}$/;
+const EXTERNAL_CHANNEL_VALID_CACHE_MS = 24 * 60 * 60 * 1000;
+const EXTERNAL_CHANNEL_INVALID_CACHE_MS = 60 * 60 * 1000;
 type RecoveryChannel = TextChannel | NewsChannel | ThreadChannel;
 
 type PendingApproval = {
@@ -121,8 +151,53 @@ type PendingApproval = {
   createdAtMs: number;
 };
 
+type ExternalChannelResolveCache = {
+  ok: boolean;
+  checkedAtMs: number;
+};
+
 export function shouldProcessIncomingMessage(content: string, attachmentCount: number): boolean {
   return content.trim().length > 0 || attachmentCount > 0;
+}
+
+export function isPermissionDeniedCommandFailureText(text: string): boolean {
+  const normalized = String(text ?? "").toLowerCase();
+  return [
+    "access denied",
+    "permission denied",
+    "unauthorizedaccessexception",
+    "アクセスが拒否されました",
+    "permissiondenied",
+    "operation not permitted",
+    "eperm",
+  ].some((pattern) => normalized.includes(pattern.toLowerCase()));
+}
+
+type AtTriggerCleanupDecision = "keep" | "cleanup_processed" | "cleanup_disabled_expired";
+
+export function parseAtTriggerScheduledAtMs(dateYmd: string | null, timeHhmm: string): number | null {
+  if (!dateYmd || !/^\d{4}-\d{2}-\d{2}$/.test(dateYmd)) return null;
+  if (!/^\d{2}:\d{2}$/.test(timeHhmm)) return null;
+  const iso = `${dateYmd}T${timeHhmm}:00+09:00`;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+export function decideAtTriggerCleanup(params: {
+  nowMs: number;
+  status: TriggerStatus;
+  dateYmd: string | null;
+  timeHhmm: string;
+  pendingCount: number;
+  processedCount: number;
+}): AtTriggerCleanupDecision {
+  if (params.pendingCount > 0) return "keep";
+  if (params.processedCount > 0) return "cleanup_processed";
+  const scheduledAtMs = parseAtTriggerScheduledAtMs(params.dateYmd, params.timeHhmm);
+  if (params.status === "disabled" && scheduledAtMs !== null && scheduledAtMs <= params.nowMs) {
+    return "cleanup_disabled_expired";
+  }
+  return "keep";
 }
 
 function splitIntoChunks(text: string, size: number): string[] {
@@ -138,6 +213,82 @@ function isUuidLike(value: string): boolean {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
     value.trim(),
   );
+}
+
+function extractTriggerCommands(output: string): { commands: string[]; cleanedOutput: string } {
+  const lines = output.split(/\r?\n/);
+  const commands: string[] = [];
+  const kept: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.toLowerCase().startsWith(TRIGGER_COMMAND_PREFIX)) {
+      commands.push(trimmed);
+      continue;
+    }
+    kept.push(line);
+  }
+  return {
+    commands,
+    cleanedOutput: kept.join("\n").trim(),
+  };
+}
+
+function formatTriggerSchedule(trigger: TriggerRow): string {
+  return trigger.trigger_type === "daily"
+    ? `daily ${trigger.time_hhmm}`
+    : trigger.trigger_type === "weekly"
+      ? `weekly ${trigger.days_csv ?? "-"} ${trigger.time_hhmm}`
+      : trigger.trigger_type === "monthly"
+        ? formatMonthlyTriggerSchedule(trigger.days_csv, trigger.time_hhmm)
+        : `at ${trigger.days_csv ?? "-"} ${trigger.time_hhmm}`;
+}
+
+type MonthlyWeekday = "Mon" | "Tue" | "Wed" | "Thu" | "Fri" | "Sat" | "Sun";
+type MonthlyNth = "1" | "2" | "3" | "4" | "last";
+type MonthlyTriggerSpec =
+  | { kind: "day"; day: number }
+  | { kind: "nth"; nth: MonthlyNth; weekday: MonthlyWeekday };
+
+export function parseMonthlyTriggerSpec(spec: string | null): MonthlyTriggerSpec | null {
+  const raw = String(spec ?? "").trim();
+  const dayMatch = /^day:(\d{1,2})$/i.exec(raw);
+  if (dayMatch) {
+    const day = Number(dayMatch[1]);
+    if (day >= 1 && day <= 31) return { kind: "day", day };
+    return null;
+  }
+  const nthMatch = /^nth:(1|2|3|4|last):(Mon|Tue|Wed|Thu|Fri|Sat|Sun)$/i.exec(raw);
+  if (nthMatch) {
+    const nth = nthMatch[1].toLowerCase() === "last" ? "last" : (nthMatch[1] as Exclude<MonthlyNth, "last">);
+    const weekday = nthMatch[2].slice(0, 1).toUpperCase() + nthMatch[2].slice(1).toLowerCase() as MonthlyWeekday;
+    return { kind: "nth", nth, weekday };
+  }
+  return null;
+}
+
+function formatMonthlyTriggerSchedule(spec: string | null, timeHhmm: string): string {
+  const parsed = parseMonthlyTriggerSpec(spec);
+  if (!parsed) return `monthly ${spec ?? "-"} ${timeHhmm}`;
+  if (parsed.kind === "day") return `monthly day ${parsed.day} ${timeHhmm}`;
+  return `monthly ${parsed.nth} ${parsed.weekday} ${timeHhmm}`;
+}
+
+function extractHelpAgentCommands(output: string): { commands: string[]; cleanedOutput: string } {
+  const lines = output.split(/\r?\n/);
+  const commands: string[] = [];
+  const kept: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim().toLowerCase();
+    if (trimmed === HELP_AGENT_COMMAND) {
+      commands.push(HELP_AGENT_COMMAND);
+      continue;
+    }
+    kept.push(line);
+  }
+  return {
+    commands,
+    cleanedOutput: kept.join("\n").trim(),
+  };
 }
 
 export class DiscordCodexBot {
@@ -157,10 +308,12 @@ export class DiscordCodexBot {
   private readonly processedMessageIds = new Set<string>();
   private readonly codexSearchCache = new Map<string, CodexSessionMeta[]>();
   private readonly pendingApprovals = new Map<string, PendingApproval>();
+  private readonly helpAgentStreakByContext = new Map<string, number>();
   private readonly localSyncSuppress = new Map<
     string,
     { userTexts: Set<string>; agentTexts: Set<string>; expiresAtMs: number }
   >();
+  private readonly externalChannelResolveCache = new Map<string, ExternalChannelResolveCache>();
   private externalSyncEnabled = appConfig.externalSyncEnabled;
   private externalSyncRunning = false;
   private recoveringUnread = false;
@@ -209,6 +362,14 @@ export class DiscordCodexBot {
       this.sendSandboxStartupNoticeOnce().catch((err) => {
         this.logger.warn({ err }, "sandbox startup notice failed");
       });
+      this.runTriggerMaintenanceCycle().catch((err) => {
+        this.logger.warn({ err }, "trigger maintenance on startup failed");
+      });
+      setInterval(() => {
+        this.runTriggerMaintenanceCycle().catch((err) => {
+          this.logger.warn({ err }, "trigger maintenance polling failed");
+        });
+      }, TRIGGER_POLL_MS);
     });
     this.client.on("shardResume", () => {
       this.recoverUnreadForAllContexts("shard_resume").catch((err) => {
@@ -283,6 +444,10 @@ export class DiscordCodexBot {
         },
         "message received",
       );
+      const isHelpAgent = content === HELP_AGENT_COMMAND;
+      if (!isHelpAgent) {
+        this.helpAgentStreakByContext.delete(contextKey);
+      }
       if (!content && msg.attachments.size > 0) {
         this.discardPendingApprovalForNewPrompt(contextKey);
         await this.handleExecutionMessage(msg, "");
@@ -290,6 +455,20 @@ export class DiscordCodexBot {
       }
       if (content === "!help") {
         await msg.reply(buildCommandReference(this.locale, getBuildLabel(), APP_NAME));
+        return;
+      }
+      if (isHelpAgent) {
+        const streak = (this.helpAgentStreakByContext.get(contextKey) ?? 0) + 1;
+        if (streak >= 2) {
+          this.helpAgentStreakByContext.delete(contextKey);
+          await msg.reply(helpAgentLoopDetected(this.locale));
+          return;
+        }
+        this.helpAgentStreakByContext.set(contextKey, streak);
+        this.discardPendingApprovalForNewPrompt(contextKey);
+        await this.handleExecutionMessage(msg, "help agent", {
+          promptOverride: buildAgentCommandReference(this.locale),
+        });
         return;
       }
       if (content === "!codex") {
@@ -323,6 +502,14 @@ export class DiscordCodexBot {
       }
       if (content.startsWith("!sync ")) {
         await this.handleSyncCommand(msg, content.slice("!sync ".length).trim());
+        return;
+      }
+      if (content === "!trigger") {
+        await this.handleTriggerCommand(msg, "");
+        return;
+      }
+      if (content.startsWith("!trigger ")) {
+        await this.handleTriggerCommand(msg, content.slice("!trigger ".length).trim());
         return;
       }
       if (content === "!sandbox" || content.startsWith("!sandbox ")) {
@@ -1014,6 +1201,7 @@ export class DiscordCodexBot {
           codexThreadId: session.codex_thread_id,
           modelOverride: session.model_override,
           sandboxMode,
+          additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
           preferredWorkingDirectory: session.preferred_working_directory,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onEvent: async (event) => {
@@ -1212,8 +1400,14 @@ export class DiscordCodexBot {
         );
 
         const parsed = extractAttachPaths(output);
+        const helpParsed = extractHelpAgentCommands(parsed.cleanedOutput);
+        const triggerParsed = extractTriggerCommands(helpParsed.cleanedOutput);
         const streamBody = streamAgentMessages.join("\n").trim();
-        const body = streamBody || parsed.cleanedOutput || "(no output)";
+        const effectiveOutput = streamBody || triggerParsed.cleanedOutput;
+        if (observedThreadId && effectiveOutput.trim()) {
+          this.addLocalSyncSuppressionText(observedThreadId, "agent_message", effectiveOutput);
+        }
+        const body = effectiveOutput || "(no output)";
         const chunks = splitIntoChunks(body, appConfig.messageChunkSize);
         const sessionLabel = this.getUserFacingCodexSessionLabel(session);
         const usageStatus = observedThreadId
@@ -1284,10 +1478,35 @@ export class DiscordCodexBot {
             messageId: msg.id,
             createdAtMs: Date.now(),
           });
-          await sendChannel.send(permissionRetryPrompt(this.locale));
+          const retryReason: "permission" | "runtime" | "mixed" = permissionFailureDetected
+            ? (retryableSandboxFailureDetected ? "mixed" : "permission")
+            : "runtime";
+          await sendChannel.send(permissionRetryPrompt(this.locale, retryReason));
         }
         if (parsed.paths.length > 0) {
           await this.handleAttachCommands(sendChannel, parsed.paths);
+        }
+        if (helpParsed.commands.length > 0) {
+          await this.handleHelpAgentCommandFromAgent(
+            sendChannel,
+            contextKey,
+            msg.guildId!,
+            msg.channelId,
+            msg.author.id,
+            1,
+          );
+        }
+        if (triggerParsed.commands.length > 0) {
+          for (const cmd of triggerParsed.commands) {
+            const bodyArg = cmd.slice(TRIGGER_COMMAND_PREFIX.length).trim();
+            await this.handleTriggerCommandFromAgent(
+              sendChannel,
+              bodyArg,
+              msg.guildId!,
+              msg.channelId,
+              msg.author.id,
+            );
+          }
         }
       },
     });
@@ -1422,6 +1641,801 @@ export class DiscordCodexBot {
     await this.sendMultilineReply(msg, queueStatusTitle(this.locale), lines);
   }
 
+  private buildTriggerListLines(triggers: TriggerRow[], listFull: boolean): string[] {
+    const disabled = triggers.filter((t) => t.status === "disabled");
+    const enabled = triggers.filter((t) => t.status !== "disabled");
+    const sections: Array<{ label: string; mark: "[OFF]" | "[ON]"; items: TriggerRow[] }> = [
+      { label: "OFF", mark: "[OFF]", items: disabled },
+      { label: "ON", mark: "[ON]", items: enabled },
+    ];
+    const lines: string[] = [];
+    let index = 1;
+    for (const section of sections) {
+      if (section.items.length === 0) continue;
+      lines.push(`${section.mark} ${section.label} (${section.items.length})`);
+      for (const trigger of section.items) {
+        const codex = listFull
+          ? trigger.codex_thread_id
+          : `...${trigger.codex_thread_id.slice(-8)}`;
+        const promptHead = trigger.prompt.replace(/\s+/g, " ").slice(0, 60);
+        lines.push(
+          `#${index} | ${trigger.id} | ${trigger.name} | ${formatTriggerSchedule(trigger)} | codex=${codex} | ${promptHead}`,
+        );
+        index += 1;
+      }
+    }
+    return lines;
+  }
+
+  private buildTriggerShowLines(trigger: TriggerRow): string[] {
+    return [
+      `id: ${trigger.id}`,
+      `name: ${trigger.name}`,
+      `schedule: ${formatTriggerSchedule(trigger)}`,
+      `status: ${trigger.status}`,
+      `codex_thread_id: ${trigger.codex_thread_id}`,
+      `task_name: ${trigger.task_name}`,
+      "prompt:",
+      trigger.prompt,
+    ];
+  }
+
+  private async handleTriggerCommand(msg: Message, body: string): Promise<void> {
+    const raw = body.trim();
+    if (!raw) {
+      await msg.reply(usageTrigger(this.locale));
+      return;
+    }
+    const parts = raw.split(/\s+/);
+    const sub = (parts[0] ?? "").toLowerCase();
+    const listFull = (parts[1] ?? "").toLowerCase() === "full";
+    if (sub === "list") {
+      const triggers = this.db.listTriggers(100);
+      if (triggers.length === 0) {
+        await msg.reply(triggerListEmpty(this.locale));
+        return;
+      }
+      const lines = this.buildTriggerListLines(triggers, listFull);
+      await this.sendMultilineReply(msg, triggerListTitle(this.locale), lines);
+      return;
+    }
+    if (sub === "show") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await msg.reply(triggerNotFound(this.locale, id));
+        return;
+      }
+      await this.sendMultilineReply(msg, triggerShowTitle(this.locale, id), this.buildTriggerShowLines(trg));
+      return;
+    }
+    if (sub === "edit") {
+      const id = parts[1] ?? "";
+      const newPrompt = raw.split(/\s+/).slice(2).join(" ").trim();
+      if (!id || !newPrompt) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await msg.reply(triggerNotFound(this.locale, id));
+        return;
+      }
+      this.db.updateTriggerPrompt(id, newPrompt.slice(0, TRIGGER_MAX_PROMPT_LEN));
+      await msg.reply(triggerEdited(this.locale, id));
+      return;
+    }
+    if (sub === "stop") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await msg.reply(triggerNotFound(this.locale, id));
+        return;
+      }
+      this.db.setTriggerStatus(id, "disabled");
+      this.disableScheduledTask(trg.task_name);
+      await msg.reply(triggerStopped(this.locale, id));
+      return;
+    }
+    if (sub === "delete") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await msg.reply(triggerNotFound(this.locale, id));
+        return;
+      }
+      this.deleteScheduledTask(trg.task_name);
+      this.db.deleteTrigger(id);
+      await msg.reply(triggerDeleted(this.locale, id));
+      return;
+    }
+    if (sub !== "add") {
+      await msg.reply(usageTrigger(this.locale));
+      return;
+    }
+
+    const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "trigger add",
+    });
+    const threadId = session.codex_thread_id?.trim();
+    if (!threadId) {
+      await msg.reply(notLinkedYet(this.locale));
+      return;
+    }
+
+    const kind = (parts[1] ?? "").toLowerCase();
+    if (kind === "daily") {
+      const timeHhmm = parts[2] ?? "";
+      const prompt = raw.split(/\s+/).slice(3).join(" ").trim();
+      if (!this.isValidHhmm(timeHhmm) || !prompt) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      await this.createTrigger(msg, threadId, "daily", timeHhmm, null, prompt);
+      return;
+    }
+    if (kind === "weekly") {
+      const daysCsv = parts[2] ?? "";
+      const timeHhmm = parts[3] ?? "";
+      const prompt = raw.split(/\s+/).slice(4).join(" ").trim();
+      if (!this.isValidWeeklyDays(daysCsv) || !this.isValidHhmm(timeHhmm) || !prompt) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      await this.createTrigger(msg, threadId, "weekly", timeHhmm, daysCsv, prompt);
+      return;
+    }
+    if (kind === "at") {
+      const dateYmd = parts[2] ?? "";
+      const timeHhmm = parts[3] ?? "";
+      const prompt = raw.split(/\s+/).slice(4).join(" ").trim();
+      if (!this.isValidDateYmd(dateYmd) || !this.isValidHhmm(timeHhmm) || !prompt) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      await this.createTrigger(msg, threadId, "at", timeHhmm, dateYmd, prompt);
+      return;
+    }
+    if (kind === "monthly") {
+      const monthlySpec = this.parseMonthlySpecFromParts(parts);
+      if (!monthlySpec) {
+        await msg.reply(usageTrigger(this.locale));
+        return;
+      }
+      await this.createTrigger(msg, threadId, "monthly", monthlySpec.timeHhmm, monthlySpec.spec, monthlySpec.prompt);
+      return;
+    }
+    await msg.reply(usageTrigger(this.locale));
+  }
+
+  private async handleTriggerCommandFromAgent(
+    sendChannel: SendableChannels,
+    body: string,
+    guildId: string,
+    channelId: string,
+    requesterId: string,
+    chainDepth = 0,
+  ): Promise<void> {
+    const raw = body.trim();
+    const commandText = `!trigger ${raw}`.trim();
+    if (!raw) {
+      await sendChannel.send(usageTrigger(this.locale));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: false,
+        command: commandText,
+        reason: "invalid_usage",
+      });
+      return;
+    }
+    const parts = raw.split(/\s+/);
+    const sub = (parts[0] ?? "").toLowerCase();
+    const listFull = (parts[1] ?? "").toLowerCase() === "full";
+    if (sub === "list") {
+      const triggers = this.db.listTriggers(100);
+      if (triggers.length === 0) {
+        await sendChannel.send(triggerListEmpty(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: true,
+          command: commandText,
+          message: "no_triggers",
+        });
+        const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_list",
+        "trigger list result: no triggers",
+        chainDepth + 1,
+      );
+        return;
+      }
+      const lines = this.buildTriggerListLines(triggers, listFull);
+      await this.sendMultilineReplyByChannel(sendChannel, triggerListTitle(this.locale), lines);
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        message: `listed=${triggers.length}`,
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      const listBody = [
+        `trigger list result: ${triggers.length} item(s)`,
+        ...lines,
+      ].join("\n");
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_list",
+        listBody,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (sub === "show") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await sendChannel.send(triggerNotFound(this.locale, id));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          trigger_id: id,
+          reason: "not_found",
+        });
+        return;
+      }
+      const lines = this.buildTriggerShowLines(trg);
+      await this.sendMultilineReplyByChannel(sendChannel, triggerShowTitle(this.locale, id), lines);
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: id,
+        message: "shown",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      const showBody = [
+        `trigger show result: ${id}`,
+        ...lines,
+      ].join("\n");
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_show",
+        showBody,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (sub === "edit") {
+      const id = parts[1] ?? "";
+      const newPrompt = raw.split(/\s+/).slice(2).join(" ").trim();
+      if (!id || !newPrompt) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await sendChannel.send(triggerNotFound(this.locale, id));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          trigger_id: id,
+          reason: "not_found",
+        });
+        return;
+      }
+      this.db.updateTriggerPrompt(id, newPrompt.slice(0, TRIGGER_MAX_PROMPT_LEN));
+      await sendChannel.send(triggerEdited(this.locale, id));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: id,
+        message: "prompt_updated",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_edit",
+        `trigger edit result: id=${id} updated`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (sub === "stop") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await sendChannel.send(triggerNotFound(this.locale, id));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          trigger_id: id,
+          reason: "not_found",
+        });
+        return;
+      }
+      this.db.setTriggerStatus(id, "disabled");
+      this.disableScheduledTask(trg.task_name);
+      await sendChannel.send(triggerStopped(this.locale, id));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: id,
+        message: "stopped",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_stop",
+        `trigger stop result: id=${id} stopped`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (sub === "delete") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const trg = this.db.getTriggerById(id);
+      if (!trg) {
+        await sendChannel.send(triggerNotFound(this.locale, id));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          trigger_id: id,
+          reason: "not_found",
+        });
+        return;
+      }
+      this.deleteScheduledTask(trg.task_name);
+      this.db.deleteTrigger(id);
+      await sendChannel.send(triggerDeleted(this.locale, id));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: id,
+        message: "deleted",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_delete",
+        `trigger delete result: id=${id} deleted`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (sub !== "add") {
+      await sendChannel.send(usageTrigger(this.locale));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: false,
+        command: commandText,
+        reason: "invalid_usage",
+      });
+      return;
+    }
+    const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId,
+      initialMessage: "trigger add",
+    });
+    const threadId = session.codex_thread_id?.trim();
+    if (!threadId) {
+      await sendChannel.send(notLinkedYet(this.locale));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: false,
+        command: commandText,
+        reason: "not_linked",
+      });
+      return;
+    }
+    const kind = (parts[1] ?? "").toLowerCase();
+    if (kind === "daily") {
+      const timeHhmm = parts[2] ?? "";
+      const prompt = raw.split(/\s+/).slice(3).join(" ").trim();
+      if (!this.isValidHhmm(timeHhmm) || !prompt) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const row = await this.createTriggerByParams(sendChannel, requesterId, threadId, "daily", timeHhmm, null, prompt);
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: row.id,
+        message: "added",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_add_daily",
+        `trigger add result: id=${row.id} type=daily time=${timeHhmm}`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (kind === "weekly") {
+      const daysCsv = parts[2] ?? "";
+      const timeHhmm = parts[3] ?? "";
+      const prompt = raw.split(/\s+/).slice(4).join(" ").trim();
+      if (!this.isValidWeeklyDays(daysCsv) || !this.isValidHhmm(timeHhmm) || !prompt) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const row = await this.createTriggerByParams(sendChannel, requesterId, threadId, "weekly", timeHhmm, daysCsv, prompt);
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: row.id,
+        message: "added",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_add_weekly",
+        `trigger add result: id=${row.id} type=weekly days=${daysCsv} time=${timeHhmm}`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (kind === "at") {
+      const dateYmd = parts[2] ?? "";
+      const timeHhmm = parts[3] ?? "";
+      const prompt = raw.split(/\s+/).slice(4).join(" ").trim();
+      if (!this.isValidDateYmd(dateYmd) || !this.isValidHhmm(timeHhmm) || !prompt) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const row = await this.createTriggerByParams(sendChannel, requesterId, threadId, "at", timeHhmm, dateYmd, prompt);
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: row.id,
+        message: "added",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_add_at",
+        `trigger add result: id=${row.id} type=at date=${dateYmd} time=${timeHhmm}`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    if (kind === "monthly") {
+      const monthlySpec = this.parseMonthlySpecFromParts(parts);
+      if (!monthlySpec) {
+        await sendChannel.send(usageTrigger(this.locale));
+        await this.sendAgentTriggerCommandResult(sendChannel, {
+          ok: false,
+          command: commandText,
+          reason: "invalid_usage",
+        });
+        return;
+      }
+      const row = await this.createTriggerByParams(
+        sendChannel,
+        requesterId,
+        threadId,
+        "monthly",
+        monthlySpec.timeHhmm,
+        monthlySpec.spec,
+        monthlySpec.prompt,
+      );
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: true,
+        command: commandText,
+        trigger_id: row.id,
+        message: "added",
+      });
+      const contextKey = this.sessionService.buildContextKey(guildId, channelId);
+      await this.injectAgentCommandResultAsUserPrompt(
+        contextKey,
+        guildId,
+        channelId,
+        requesterId,
+        "trigger_add_monthly",
+        `trigger add result: id=${row.id} type=monthly spec=${monthlySpec.spec} time=${monthlySpec.timeHhmm}`,
+        chainDepth + 1,
+      );
+      return;
+    }
+    await sendChannel.send(usageTrigger(this.locale));
+    await this.sendAgentTriggerCommandResult(sendChannel, {
+      ok: false,
+      command: commandText,
+      reason: "invalid_usage",
+    });
+  }
+
+  private async createTrigger(
+    msg: Message,
+    codexThreadId: string,
+    triggerType: "daily" | "weekly" | "at" | "monthly",
+    timeHhmm: string,
+    daysCsv: string | null,
+    prompt: string,
+  ): Promise<void> {
+    await this.createTriggerByParams(msg.channel as SendableChannels, msg.author.id, codexThreadId, triggerType, timeHhmm, daysCsv, prompt);
+  }
+
+  private async createTriggerByParams(
+    sendChannel: SendableChannels,
+    requesterId: string,
+    codexThreadId: string,
+    triggerType: "daily" | "weekly" | "at" | "monthly",
+    timeHhmm: string,
+    daysCsv: string | null,
+    prompt: string,
+  ): Promise<TriggerRow> {
+    const safePrompt = prompt.slice(0, TRIGGER_MAX_PROMPT_LEN);
+    const name = this.suggestTriggerName(triggerType, timeHhmm, daysCsv, safePrompt);
+    const triggerId = `trg-${Date.now().toString(36).slice(-8)}`;
+    const taskName = this.buildTaskName(name, triggerId);
+    this.registerScheduledTask(taskName, triggerType, timeHhmm, daysCsv, triggerId);
+    const row = this.db.createTrigger({
+      id: triggerId,
+      codexThreadId,
+      name,
+      triggerType,
+      timeHhmm,
+      daysCsv,
+      prompt: safePrompt,
+      taskName,
+      createdBy: requesterId,
+    });
+    await sendChannel.send(triggerAdded(this.locale, row.id, row.name));
+    return row;
+  }
+
+  private async sendAgentTriggerCommandResult(
+    channel: SendableChannels,
+    payload: {
+      ok: boolean;
+      command: string;
+      trigger_id?: string;
+      message?: string;
+      reason?: string;
+    },
+  ): Promise<void> {
+    await channel.send(`[agent-cmd] ${JSON.stringify(payload)}`);
+  }
+
+  private async injectAgentCommandResultAsUserPrompt(
+    contextKey: string,
+    guildId: string,
+    channelId: string,
+    requesterId: string,
+    initialMessage: string,
+    promptText: string,
+    chainDepth = 0,
+  ): Promise<void> {
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId,
+      initialMessage,
+    });
+    const threadId = session.codex_thread_id?.trim();
+    if (!threadId) return;
+    const sandboxMode = this.resolveSandboxMode(session);
+    const executionId = this.db.insertExecution({
+      sessionId: session.id,
+      discordMessageId: `agentcmd-${Date.now()}`,
+      discordChannelId: channelId,
+      requestedBy: requesterId,
+      commandTextMasked: "[agent-cmd-internal]",
+    });
+    const lockKey = `codex:${threadId}`;
+    const result = await this.manager.enqueue({
+      executionId,
+      sessionId: session.id,
+      lockKey,
+      text: `${INTERNAL_SYNC_MARKER}\n${promptText}`,
+      maxRetries: 0,
+      onQueued: async () => {},
+      onProgress: async () => {},
+      run: async () => {
+        this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
+        const runResult = await this.codex.run({
+          prompt: promptText,
+          sessionId: session.id,
+          codexThreadId: threadId,
+          modelOverride: session.model_override,
+          sandboxMode,
+          additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
+          preferredWorkingDirectory: session.preferred_working_directory,
+          includeDiscordAgentSystemPrompt: false,
+        });
+        if (!runResult.ok) {
+          return {
+            status: runResult.timedOut ? ("timeout" as const) : ("error" as const),
+            output: runResult.output,
+            errorCode: runResult.errorCode,
+          };
+        }
+        return { status: "success" as const, output: runResult.output };
+      },
+      onFinish: async ({ status, output, retries, errorCode }) => {
+        this.db.updateExecutionStatus(executionId, status, {
+          errorCode,
+          retryCount: retries,
+        });
+        this.sessionService.touchSession(session.id);
+        this.logger.info(
+          {
+            executionId,
+            sessionId: session.id,
+            guildId,
+            channelId,
+            codexThreadId: threadId,
+            status,
+            errorCode,
+          },
+          "agent command result injected as user prompt",
+        );
+        if (status !== "success") return;
+        if (chainDepth >= INTERNAL_AGENT_CHAIN_MAX) {
+          this.logger.warn(
+            {
+              executionId,
+              sessionId: session.id,
+              codexThreadId: threadId,
+              chainDepth,
+              maxDepth: INTERNAL_AGENT_CHAIN_MAX,
+            },
+            "internal agent command chain limit reached",
+          );
+          return;
+        }
+        const parsed = extractAttachPaths(output);
+        const helpParsed = extractHelpAgentCommands(parsed.cleanedOutput);
+        const triggerParsed = extractTriggerCommands(helpParsed.cleanedOutput);
+        const sendChannel = await this.resolveSendableChannelByContextKey(contextKey);
+        if (!sendChannel) return;
+        if (parsed.paths.length > 0) {
+          await this.handleAttachCommands(sendChannel, parsed.paths);
+        }
+        if (helpParsed.commands.length > 0) {
+          await this.handleHelpAgentCommandFromAgent(
+            sendChannel,
+            contextKey,
+            guildId,
+            channelId,
+            requesterId,
+            chainDepth + 1,
+          );
+        }
+        if (triggerParsed.commands.length > 0) {
+          for (const cmd of triggerParsed.commands) {
+            const bodyArg = cmd.slice(TRIGGER_COMMAND_PREFIX.length).trim();
+            await this.handleTriggerCommandFromAgent(
+              sendChannel,
+              bodyArg,
+              guildId,
+              channelId,
+              requesterId,
+              chainDepth + 1,
+            );
+          }
+        }
+      },
+    });
+    if (!result.ok) {
+      this.db.updateExecutionStatus(executionId, "cancelled", {
+        errorCode: result.code,
+      });
+    }
+  }
+
+  private async handleHelpAgentCommandFromAgent(
+    sendChannel: SendableChannels,
+    contextKey: string,
+    guildId: string,
+    channelId: string,
+    requesterId: string,
+    chainDepth: number,
+  ): Promise<void> {
+    const streak = (this.helpAgentStreakByContext.get(contextKey) ?? 0) + 1;
+    if (streak >= 2 || chainDepth > INTERNAL_AGENT_CHAIN_MAX) {
+      this.helpAgentStreakByContext.delete(contextKey);
+      await sendChannel.send(helpAgentLoopDetected(this.locale));
+      return;
+    }
+    this.helpAgentStreakByContext.set(contextKey, streak);
+    await this.injectAgentCommandResultAsUserPrompt(
+      contextKey,
+      guildId,
+      channelId,
+      requesterId,
+      "help agent",
+      buildAgentCommandReference(this.locale),
+      chainDepth,
+    );
+  }
+
   private async handleSyncCommand(msg: Message, body: string): Promise<void> {
     const arg = body.trim().toLowerCase();
     if (!arg || arg === "status") {
@@ -1457,6 +2471,218 @@ export class DiscordCodexBot {
     this.pendingApprovals.delete(contextKey);
   }
 
+  private isValidHhmm(value: string): boolean {
+    return /^([01]\d|2[0-3]):([0-5]\d)$/.test(value);
+  }
+
+  private isValidWeeklyDays(value: string): boolean {
+    const parts = value.split(",").map((v) => v.trim()).filter(Boolean);
+    if (parts.length === 0) return false;
+    return parts.every((d) => ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].includes(d));
+  }
+
+  private isValidMonthlyDay(value: string): boolean {
+    return /^(?:[1-9]|[12]\d|3[01])$/.test(value);
+  }
+
+  private isValidWeekday(value: string): value is MonthlyWeekday {
+    return ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].includes(value);
+  }
+
+  private parseMonthlySpecFromParts(parts: string[]): { spec: string; timeHhmm: string; prompt: string } | null {
+    const mode = parts[2] ?? "";
+    if (this.isValidMonthlyDay(mode)) {
+      const timeHhmm = parts[3] ?? "";
+      const prompt = parts.slice(4).join(" ").trim();
+      if (!this.isValidHhmm(timeHhmm) || !prompt) return null;
+      return { spec: `day:${Number(mode)}`, timeHhmm, prompt };
+    }
+    const nthRaw = mode.toLowerCase();
+    const weekday = parts[3] ?? "";
+    const timeHhmm = parts[4] ?? "";
+    const prompt = parts.slice(5).join(" ").trim();
+    if (!(["1", "2", "3", "4", "last"].includes(nthRaw)) || !this.isValidWeekday(weekday) || !this.isValidHhmm(timeHhmm) || !prompt) {
+      return null;
+    }
+    return {
+      spec: `nth:${nthRaw}:${weekday}`,
+      timeHhmm,
+      prompt,
+    };
+  }
+
+  private isValidDateYmd(value: string): boolean {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+    const d = new Date(`${value}T00:00:00`);
+    if (Number.isNaN(d.getTime())) return false;
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return `${y}-${m}-${day}` === value;
+  }
+
+  private suggestTriggerName(
+    triggerType: "daily" | "weekly" | "at" | "monthly",
+    timeHhmm: string,
+    daysCsv: string | null,
+    prompt: string,
+  ): string {
+    const base = prompt
+      .replace(/[^\p{L}\p{N}\s_-]/gu, " ")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "")
+      .slice(0, 32);
+    if (triggerType === "daily") return `daily-${timeHhmm.replace(":", "")}-${base || "task"}`;
+    if (triggerType === "at") return `at-${(daysCsv ?? "").replace(/-/g, "")}-${timeHhmm.replace(":", "")}-${base || "task"}`;
+    if (triggerType === "monthly") {
+      const parsed = parseMonthlyTriggerSpec(daysCsv);
+      if (parsed?.kind === "day") {
+        return `monthly-day${String(parsed.day).padStart(2, "0")}-${timeHhmm.replace(":", "")}-${base || "task"}`;
+      }
+      if (parsed?.kind === "nth") {
+        return `monthly-${parsed.nth}${parsed.weekday}-${timeHhmm.replace(":", "")}-${base || "task"}`;
+      }
+      return `monthly-${timeHhmm.replace(":", "")}-${base || "task"}`;
+    }
+    return `weekly-${(daysCsv ?? "").replace(/,/g, "")}-${timeHhmm.replace(":", "")}-${base || "task"}`;
+  }
+
+  private buildTaskName(name: string, triggerId: string): string {
+    const safeName = name.replace(/[\\/:*?"<>|]/g, "_").slice(0, 40);
+    return `\\DiscordAgent\\${safeName}__${triggerId}`;
+  }
+
+  private registerScheduledTask(
+    taskName: string,
+    triggerType: "daily" | "weekly" | "at" | "monthly",
+    timeHhmm: string,
+    daysCsv: string | null,
+    triggerId: string,
+  ): void {
+    const scriptPath = resolve(process.cwd(), "scripts", "trigger-fire.mjs");
+    const dbPath = resolve(appConfig.sqlitePath);
+    const tr = triggerType === "daily"
+      ? "DAILY"
+      : triggerType === "weekly"
+        ? "WEEKLY"
+        : triggerType === "monthly"
+          ? "MONTHLY"
+          : "ONCE";
+    const args = [
+      "/Create",
+      "/TN",
+      taskName,
+      "/TR",
+      `node "${scriptPath}" --db "${dbPath}" --trigger-id "${triggerId}"`,
+      "/SC",
+      tr,
+      "/ST",
+      timeHhmm,
+      "/F",
+    ];
+    if (triggerType === "weekly" && daysCsv) {
+      args.push("/D", this.toSchtasksWeeklyDays(daysCsv));
+    }
+    if (triggerType === "at" && daysCsv) {
+      args.push("/SD", this.toSchtasksDate(daysCsv));
+    }
+    if (triggerType === "monthly") {
+      const monthlySpec = parseMonthlyTriggerSpec(daysCsv);
+      if (!monthlySpec) {
+        throw new Error(`invalid monthly trigger spec: ${daysCsv ?? "(null)"}`);
+      }
+      args.push("/M", "*");
+      if (monthlySpec.kind === "day") {
+        args.push("/D", String(monthlySpec.day));
+      } else {
+        args.push("/MO", this.toSchtasksMonthlyModifier(monthlySpec.nth));
+        args.push("/D", this.toSchtasksWeeklyDays(monthlySpec.weekday));
+      }
+    }
+    const run = spawnSync("schtasks.exe", args, { windowsHide: true, encoding: "utf8" });
+    if (run.status !== 0) {
+      throw new Error(`schtasks create failed: ${run.stderr || run.stdout || run.status}`);
+    }
+  }
+
+  private toSchtasksMonthlyModifier(nth: MonthlyNth): string {
+    const map: Record<MonthlyNth, string> = {
+      "1": "FIRST",
+      "2": "SECOND",
+      "3": "THIRD",
+      "4": "FOURTH",
+      last: "LAST",
+    };
+    return map[nth];
+  }
+
+  private toSchtasksWeeklyDays(daysCsv: string): string {
+    const map: Record<string, string> = {
+      Mon: "MON",
+      Tue: "TUE",
+      Wed: "WED",
+      Thu: "THU",
+      Fri: "FRI",
+      Sat: "SAT",
+      Sun: "SUN",
+    };
+    return daysCsv
+      .split(",")
+      .map((v) => map[v.trim()] ?? v.trim().toUpperCase())
+      .filter(Boolean)
+      .join(",");
+  }
+
+  private toSchtasksDate(ymd: string): string {
+    const [y, m, d] = ymd.split("-");
+    return `${y}/${m}/${d}`;
+  }
+
+  private disableScheduledTask(taskName: string): void {
+    const run = spawnSync(
+      "schtasks.exe",
+      ["/Change", "/TN", taskName, "/Disable"],
+      { windowsHide: true, encoding: "utf8" },
+    );
+    if (run.status !== 0) {
+      throw new Error(`schtasks disable failed: ${run.stderr || run.stdout || run.status}`);
+    }
+  }
+
+  private deleteScheduledTask(taskName: string): void {
+    const run = spawnSync(
+      "schtasks.exe",
+      ["/Delete", "/TN", taskName, "/F"],
+      { windowsHide: true, encoding: "utf8" },
+    );
+    if (run.status !== 0) {
+      throw new Error(`schtasks delete failed: ${run.stderr || run.stdout || run.status}`);
+    }
+  }
+
+  private tryDeleteScheduledTask(taskName: string): {
+    ok: boolean;
+    missing: boolean;
+    detail?: string;
+  } {
+    const run = spawnSync(
+      "schtasks.exe",
+      ["/Delete", "/TN", taskName, "/F"],
+      { windowsHide: true, encoding: "utf8" },
+    );
+    if (run.status === 0) {
+      return { ok: true, missing: false };
+    }
+    const detail = String(run.stderr || run.stdout || run.status || "").trim();
+    const normalized = detail.toLowerCase();
+    const missing =
+      normalized.includes("cannot find the file") ||
+      normalized.includes("the system cannot find the file specified") ||
+      normalized.includes("指定されたファイルが見つかりません");
+    return { ok: false, missing, detail };
+  }
+
   private resolveSandboxMode(session: SessionRow): SandboxMode {
     if (appConfig.forceLegacyFullAccess) return "danger-full-access";
     if (session.sandbox_mode === "danger-full-access") return "danger-full-access";
@@ -1475,13 +2701,7 @@ export class DiscordCodexBot {
     if (itemObj.type !== "command_execution") return false;
     if (itemObj.status !== "failed") return false;
     const text = String(itemObj.aggregated_output ?? "").toLowerCase();
-    return [
-      "access denied",
-      "permission denied",
-      "unauthorizedaccessexception",
-      "アクセスが拒否されました",
-      "permissiondenied",
-    ].some((pattern) => text.includes(pattern.toLowerCase()));
+    return isPermissionDeniedCommandFailureText(text);
   }
 
   private isRetryableSandboxSetupFailure(raw: Record<string, unknown>): boolean {
@@ -1500,24 +2720,151 @@ export class DiscordCodexBot {
     return normalized.includes("windows sandbox: spawn setup refresh");
   }
 
-  private async handleSandboxCommand(msg: Message, body: string): Promise<void> {
-    const arg = body.trim().toLowerCase();
-    if (arg !== "on" && arg !== "off") {
-      await msg.reply(usageSandbox(this.locale));
-      return;
+  private resolveAdditionalReadDirsForSession(session: SessionRow): string[] {
+    const merged = new Set<string>();
+    for (const dir of appConfig.attachReadDirs) {
+      merged.add(resolve(dir));
     }
+    const threadId = session.codex_thread_id?.trim();
+    if (!threadId) return [...merged];
+    for (const dir of this.db.listSandboxExtraDirs(threadId)) {
+      merged.add(resolve(dir));
+    }
+    return [...merged];
+  }
+
+  private normalizeAbsoluteDirPath(rawPath: string): string {
+    const resolved = resolve(rawPath.trim());
+    const isDriveRoot = /^[A-Za-z]:\\$/.test(resolved);
+    if (isDriveRoot) return resolved;
+    return resolved.replace(/[\\\/]+$/, "");
+  }
+
+  private resolveSandboxDirSession(
+    msg: Message,
+    initialMessage: string,
+  ): { session: SessionRow; threadId: string } | null {
     const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
     const session = this.sessionService.resolveOrCreateActiveSession({
       contextKey,
       requesterId: msg.author.id,
-      initialMessage: "sandbox",
+      initialMessage,
     });
-    const mode: SandboxMode = arg === "off" ? "danger-full-access" : "workspace-write";
-    this.db.setSessionSandboxMode(session.id, mode);
-    session.sandbox_mode = mode;
-    session.danger_full_access_until = null;
-    this.pendingApprovals.delete(contextKey);
-    await msg.reply(sandboxModeSet(this.locale, mode));
+    const threadId = session.codex_thread_id?.trim();
+    if (!threadId) return null;
+    return { session, threadId };
+  }
+
+  private async handleSandboxCommand(msg: Message, body: string): Promise<void> {
+    const raw = body.trim();
+    const parts = raw.split(/\s+/).filter(Boolean);
+    const arg = (parts[0] ?? "").toLowerCase();
+
+    if (arg === "on" || arg === "off") {
+      const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
+      const session = this.sessionService.resolveOrCreateActiveSession({
+        contextKey,
+        requesterId: msg.author.id,
+        initialMessage: "sandbox",
+      });
+      const mode: SandboxMode = arg === "off" ? "danger-full-access" : "workspace-write";
+      this.db.setSessionSandboxMode(session.id, mode);
+      session.sandbox_mode = mode;
+      session.danger_full_access_until = null;
+      this.pendingApprovals.delete(contextKey);
+      await msg.reply(sandboxModeSet(this.locale, mode));
+      return;
+    }
+
+    if (arg !== "dir") {
+      await msg.reply(usageSandbox(this.locale));
+      return;
+    }
+
+    const op = (parts[1] ?? "").toLowerCase();
+    if (!op) {
+      await msg.reply(usageSandbox(this.locale));
+      return;
+    }
+
+    if (op === "list") {
+      const resolvedSession = this.resolveSandboxDirSession(msg, "sandbox dir list");
+      if (!resolvedSession) {
+        await msg.reply(notLinkedYet(this.locale));
+        return;
+      }
+      const dirs = this.db.listSandboxExtraDirs(resolvedSession.threadId);
+      if (dirs.length === 0) {
+        await msg.reply(`${sandboxDirListTitle(this.locale, resolvedSession.threadId)}\n${sandboxDirListEmpty(this.locale)}`);
+        return;
+      }
+      await this.sendMultilineReply(
+        msg,
+        sandboxDirListTitle(this.locale, resolvedSession.threadId),
+        dirs.map((v, i) => `${i + 1}. ${v}`),
+      );
+      return;
+    }
+
+    if (op === "clear") {
+      const resolvedSession = this.resolveSandboxDirSession(msg, "sandbox dir clear");
+      if (!resolvedSession) {
+        await msg.reply(notLinkedYet(this.locale));
+        return;
+      }
+      const removed = this.db.clearSandboxExtraDirs(resolvedSession.threadId);
+      await msg.reply(sandboxDirCleared(this.locale, removed));
+      return;
+    }
+
+    if (op !== "add" && op !== "remove") {
+      await msg.reply(usageSandbox(this.locale));
+      return;
+    }
+
+    const rawPath = raw.split(/\s+/).slice(2).join(" ").trim();
+    if (!rawPath) {
+      await msg.reply(usageSandbox(this.locale));
+      return;
+    }
+    if (!isAbsolute(rawPath)) {
+      await msg.reply(sandboxDirPathMustBeAbsolute(this.locale));
+      return;
+    }
+
+    const resolvedSession = this.resolveSandboxDirSession(msg, `sandbox dir ${op}`);
+    if (!resolvedSession) {
+      await msg.reply(notLinkedYet(this.locale));
+      return;
+    }
+
+    const normalizedPath = this.normalizeAbsoluteDirPath(rawPath);
+    if (op === "add") {
+      if (!existsSync(normalizedPath)) {
+        await msg.reply(sandboxDirPathNotFound(this.locale, normalizedPath));
+        return;
+      }
+      try {
+        const st = statSync(normalizedPath);
+        if (!st.isDirectory()) {
+          await msg.reply(sandboxDirPathNotDirectory(this.locale, normalizedPath));
+          return;
+        }
+      } catch {
+        await msg.reply(sandboxDirPathNotFound(this.locale, normalizedPath));
+        return;
+      }
+      this.db.addSandboxExtraDir(resolvedSession.threadId, normalizedPath);
+      await msg.reply(sandboxDirAdded(this.locale, normalizedPath));
+      return;
+    }
+
+    const removed = this.db.removeSandboxExtraDir(resolvedSession.threadId, normalizedPath);
+    if (removed === 0) {
+      await msg.reply(sandboxDirNotFound(this.locale, normalizedPath));
+      return;
+    }
+    await msg.reply(sandboxDirRemoved(this.locale, normalizedPath));
   }
 
   private async handleOkCommand(msg: Message, contextKey: string, body: string): Promise<void> {
@@ -1876,6 +3223,10 @@ export class DiscordCodexBot {
 
     const pendingEvents = read.events.filter((event) => {
       if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
+      if (event.text.includes(INTERNAL_SYNC_MARKER)) {
+        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+        return false;
+      }
       if (this.shouldSuppressLocalSyncEvent(codexThreadId, event.itemType, event.text)) {
         this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
         return false;
@@ -1924,9 +3275,35 @@ export class DiscordCodexBot {
     if (parts.length !== 2) return null;
     const channelId = parts[1];
     if (!channelId) return null;
-    const fetched = await this.client.channels.fetch(channelId);
-    if (!fetched || !fetched.isSendable()) return null;
-    return fetched;
+    if (!DISCORD_SNOWFLAKE_RE.test(channelId)) return null;
+
+    const now = Date.now();
+    const cached = this.externalChannelResolveCache.get(contextKey);
+    if (cached) {
+      const ttl = cached.ok ? EXTERNAL_CHANNEL_VALID_CACHE_MS : EXTERNAL_CHANNEL_INVALID_CACHE_MS;
+      if (now - cached.checkedAtMs < ttl) {
+        if (!cached.ok) return null;
+      } else {
+        this.externalChannelResolveCache.delete(contextKey);
+      }
+    }
+
+    try {
+      const fetched = await this.client.channels.fetch(channelId);
+      if (!fetched || !fetched.isSendable()) {
+        this.externalChannelResolveCache.set(contextKey, { ok: false, checkedAtMs: now });
+        return null;
+      }
+      this.externalChannelResolveCache.set(contextKey, { ok: true, checkedAtMs: now });
+      return fetched;
+    } catch (err) {
+      this.externalChannelResolveCache.set(contextKey, { ok: false, checkedAtMs: now });
+      this.logger.debug(
+        { err, contextKey, channelId },
+        "external sync channel resolve failed",
+      );
+      return null;
+    }
   }
 
   private async saveIncomingAttachments(msg: Message, sessionId: string): Promise<string[]> {
@@ -2031,6 +3408,153 @@ export class DiscordCodexBot {
     }
   }
 
+  private async runTriggerMaintenanceCycle(): Promise<void> {
+    await this.runPendingTriggerFires();
+    this.cleanupObsoleteAtTriggers();
+  }
+
+  private cleanupObsoleteAtTriggers(): void {
+    const nowMs = Date.now();
+    const atTriggers = this.db.listAtTriggers(AT_TRIGGER_CLEANUP_SCAN_LIMIT);
+    for (const trigger of atTriggers) {
+      const summary = this.db.getTriggerFireSummary(trigger.id);
+      const decision = decideAtTriggerCleanup({
+        nowMs,
+        status: trigger.status,
+        dateYmd: trigger.days_csv,
+        timeHhmm: trigger.time_hhmm,
+        pendingCount: summary.pendingCount,
+        processedCount: summary.processedCount,
+      });
+      if (decision === "keep") continue;
+
+      const deleteResult = this.tryDeleteScheduledTask(trigger.task_name);
+      if (!deleteResult.ok && !deleteResult.missing) {
+        this.logger.warn(
+          {
+            triggerId: trigger.id,
+            taskName: trigger.task_name,
+            decision,
+            detail: deleteResult.detail,
+          },
+          "at trigger cleanup skipped due to scheduled task delete failure",
+        );
+        continue;
+      }
+
+      this.db.deleteTrigger(trigger.id);
+      this.logger.info(
+        {
+          triggerId: trigger.id,
+          taskName: trigger.task_name,
+          decision,
+          schedulerTaskMissing: deleteResult.missing,
+        },
+        "at trigger cleanup completed",
+      );
+    }
+  }
+
+  private async runPendingTriggerFires(): Promise<void> {
+    const fires = this.db.claimPendingTriggerFires(20);
+    for (const fire of fires) {
+      const trigger = this.db.getTriggerById(fire.trigger_id);
+      if (!trigger) {
+        this.db.markTriggerFireError(fire.id, "trigger not found");
+        continue;
+      }
+      if (trigger.status !== "enabled") {
+        this.db.markTriggerFireError(fire.id, "trigger disabled");
+        continue;
+      }
+      try {
+        await this.executeTrigger(trigger);
+        this.db.markTriggerFireDone(fire.id);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.db.markTriggerFireError(fire.id, message);
+      }
+    }
+  }
+
+  private async executeTrigger(trigger: TriggerRow): Promise<void> {
+    const sessions = this.db.listSessionsByCodexThreadId(trigger.codex_thread_id);
+    if (sessions.length === 0) {
+      throw new Error("no active session for codex_thread_id");
+    }
+    const contextKeys = this.db.listContextKeysBySessionIds(sessions.map((s) => s.id));
+    if (contextKeys.length === 0) {
+      throw new Error("no bound discord context");
+    }
+    const session = sessions[0]!;
+    this.addLocalSyncSuppressionText(trigger.codex_thread_id, "user_message", trigger.prompt);
+    const lockKey = this.getExecutionLockKey(session);
+    const executionId = this.db.insertExecution({
+      sessionId: session.id,
+      discordMessageId: `trigger:${trigger.id}:${Date.now()}`,
+      discordChannelId: "trigger",
+      requestedBy: "trigger",
+      commandTextMasked: trigger.prompt,
+    });
+
+    await this.manager.enqueue({
+      executionId,
+      sessionId: session.id,
+      lockKey,
+      text: trigger.prompt,
+      maxRetries: 0,
+      onQueued: async () => {},
+      onProgress: async () => {},
+      run: async () => {
+        this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
+        const streamAgentMessages: string[] = [];
+        const shouldInjectAttachInstruction = !session.attach_instruction_sent_at;
+        if (shouldInjectAttachInstruction) {
+          this.db.markAttachInstructionSent(session.id);
+          session.attach_instruction_sent_at = new Date().toISOString();
+        }
+        const result = await this.codex.run({
+          prompt: trigger.prompt,
+          sessionId: session.id,
+          codexThreadId: session.codex_thread_id,
+          modelOverride: session.model_override,
+          sandboxMode: this.resolveSandboxMode(session),
+          preferredWorkingDirectory: session.preferred_working_directory,
+          includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
+          onAgentMessage: async ({ text }) => {
+            streamAgentMessages.push(text);
+            this.addLocalSyncSuppressionText(trigger.codex_thread_id, "agent_message", text);
+          },
+        });
+        if (!result.ok) {
+          return {
+            status: result.timedOut ? ("timeout" as const) : ("error" as const),
+            output: result.output,
+            errorCode: result.errorCode,
+          };
+        }
+        const effectiveOutput = streamAgentMessages.join("\n").trim() || result.output;
+        if (effectiveOutput.trim()) {
+          this.addLocalSyncSuppressionText(trigger.codex_thread_id, "agent_message", effectiveOutput);
+        }
+        return { status: "success" as const, output: effectiveOutput };
+      },
+      onFinish: async ({ status, output, retries, errorCode }) => {
+        this.db.updateExecutionStatus(executionId, status, { retryCount: retries, errorCode });
+        const header = `[Trigger ${trigger.id}] ${trigger.name}\ncodex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
+        const body = splitIntoChunks(output || "(no output)", appConfig.messageChunkSize);
+        for (const contextKey of contextKeys) {
+          const channel = await this.resolveSendableChannelByContextKey(contextKey);
+          if (!channel) continue;
+          await channel.send(header);
+          for (let i = 0; i < body.length; i += 1) {
+            await channel.send(`(${i + 1}/${body.length}) ${body[i]}`);
+          }
+        }
+      },
+    });
+  }
+
   private async handleAttachCommands(
     sendChannel: SendableChannels,
     paths: string[],
@@ -2115,5 +3639,43 @@ export class DiscordCodexBot {
     for (const block of blocks) {
       await msg.reply(block);
     }
+  }
+
+  private async sendMultilineReplyByChannel(
+    channel: SendableChannels,
+    header: string,
+    lines: string[],
+    footer?: string,
+  ): Promise<void> {
+    const maxBodyLength = Math.max(500, appConfig.messageChunkSize - 120);
+    let chunkLines: string[] = [];
+    let chunkLength = 0;
+    const flush = async () => {
+      if (chunkLines.length === 0) return;
+      const text = chunkLines.join("\n");
+      await channel.send(text);
+      chunkLines = [];
+      chunkLength = 0;
+    };
+    if (header) {
+      chunkLines.push(header);
+      chunkLength += header.length + 1;
+    }
+    for (const line of lines) {
+      const projected = chunkLength + line.length + 1;
+      if (projected > maxBodyLength && chunkLines.length > 0) {
+        await flush();
+      }
+      chunkLines.push(line);
+      chunkLength += line.length + 1;
+    }
+    if (footer) {
+      const projected = chunkLength + footer.length + 1;
+      if (projected > maxBodyLength && chunkLines.length > 0) {
+        await flush();
+      }
+      chunkLines.push(footer);
+    }
+    await flush();
   }
 }

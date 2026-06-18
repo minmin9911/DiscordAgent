@@ -145,6 +145,22 @@ npm start
 
 ## コマンド
 
+### `!help agent` の用途
+
+`!help agent` は、**Agent に DiscordAgent 専用コマンド（`!trigger` / `!attach`）を理解させるためのコマンド**です。  
+Agent は必要に応じてこのコマンドを自発的に利用できます。また、ユーザが明示的に実行して Agent に教え込むこともできます。
+
+- 主な対象:
+  - `!trigger ...`（ユーザ・Agent兼用コマンド）
+  - `!attach <absolute_path>`（Agent専用コマンド）
+- 主な用途:
+  - 新しい会話文脈で DiscordAgent コマンドを使わせる前
+  - Agent が Skill を優先してしまい、DiscordAgent コマンドを使わないとき
+  - Agent 自身がコマンドの使い方を確認したいときに参照する
+
+注意:
+- `!help agent` を連続で実行するとループ防止のため中断されます。
+
 ### 基本
 
 * `!help`
@@ -191,6 +207,55 @@ npm start
 
   * data\models.yamlが一覧のソースです。残念ながら、Codexのexec機能にはモデル名一覧を取得する機能がないため、機能が提供されない限り、一覧表の更新は手動で行う必要があります。
 
+### トリガー
+
+このコマンドは Agent が実行することを想定していますが、ユーザによる実行も可能です。  
+トリガーの発火には Windows タスクスケジューラを利用します。
+
+* `!trigger add daily HH:mm <prompt>`
+
+  * 毎日指定時刻に実行するトリガーを追加します。
+
+* `!trigger add weekly Mon,Wed HH:mm <prompt>`
+
+  * 毎週指定曜日・指定時刻に実行するトリガーを追加します。
+
+* `!trigger add monthly <day(1-31)> HH:mm <prompt>`
+
+  * 毎月指定日・指定時刻に実行するトリガーを追加します。
+
+* `!trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>`
+
+  * 毎月「第N曜日」または「最終曜日」の指定時刻に実行するトリガーを追加します。
+
+* `!trigger add at YYYY-MM-DD HH:mm <prompt>`
+
+  * 指定日時に1回だけ実行するトリガーを追加します。
+
+* `!trigger list`
+
+  * 登録済みトリガーの一覧を表示します。
+
+  * 無効なトリガーは `[OFF]`、有効なトリガーは `[ON]` セクションに分けて表示されます。
+
+* `!trigger show <id>`
+
+  * 指定したトリガーの詳細を表示します。
+
+  * 実行される `prompt` 全文も確認できます。
+
+* `!trigger edit <id> <prompt>`
+
+  * 指定したトリガーの `prompt` を更新します。
+
+* `!trigger stop <id>`
+
+  * 指定したトリガーを停止します。
+
+* `!trigger delete <id>`
+
+  * 指定したトリガーを削除します。
+
 ### メンテナンスコマンド
 
 * `!queue`
@@ -212,6 +277,24 @@ npm start
 * `!sandbox off`
 
   * このセッションを常時 `danger-full-access` で実行します。
+
+* `!sandbox dir add <absolute_path>`
+
+  * sandbox 外のフォルダを指定することで、承認なくそのフォルダにアクセスできるようにするコマンドです。
+
+  * このセッションの Codex スレッドに、追加許可ディレクトリを設定します。
+
+* `!sandbox dir remove <absolute_path>`
+
+  * 追加許可ディレクトリを削除します。
+
+* `!sandbox dir list`
+
+  * 現在設定されている追加許可ディレクトリを表示します。
+
+* `!sandbox dir clear`
+
+  * 追加許可ディレクトリをすべて削除します。
 
 * `!ok`
 

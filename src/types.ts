@@ -37,6 +37,8 @@ export interface TriggerRow {
   days_csv: string | null;
   prompt: string;
   task_name: string;
+  working_directory_override: string | null;
+  sandbox_mode_override: SandboxMode | null;
   status: TriggerStatus;
   created_by: string;
   created_at: string;

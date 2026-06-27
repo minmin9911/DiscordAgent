@@ -177,6 +177,26 @@ Trigger firing is implemented through Windows Task Scheduler.
 - `!trigger delete <id>`
   - Delete the specified trigger.
 
+- `!trigger env show <id>`
+  - Show the execution environment for the specified trigger.
+  - Without overrides, this shows `working_directory` / `sandbox_mode`; with overrides, it shows `working_directory(override)` / `sandbox_mode(override)`.
+
+- `!trigger env set workdir <id> <absolute_path>`
+  - Set the working directory used only when that trigger runs.
+
+- `!trigger env set sandbox <id> <on|off>`
+  - Set the sandbox mode used only when that trigger runs.
+  - `on` means `workspace-write`; `off` means `danger-full-access`.
+
+- `!trigger env clear <id>`
+  - Clear all execution-environment overrides for the specified trigger.
+
+- `!trigger env clear workdir <id>`
+  - Clear only the working-directory override for the specified trigger.
+
+- `!trigger env clear sandbox <id>`
+  - Clear only the sandbox override for the specified trigger.
+
 ### Maintenance
 
 - `!queue`

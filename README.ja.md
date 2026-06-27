@@ -256,6 +256,32 @@ Agent は必要に応じてこのコマンドを自発的に利用できます�
 
   * 指定したトリガーを削除します。
 
+* `!trigger env show <id>`
+
+  * 指定したトリガーの実行環境を表示します。
+  * override 未設定時は `working_directory` / `sandbox_mode`、override 設定時は `working_directory(override)` / `sandbox_mode(override)` が表示されます。
+
+* `!trigger env set workdir <id> <absolute_path>`
+
+  * 指定したトリガー実行時だけ使う working directory を設定します。
+
+* `!trigger env set sandbox <id> <on|off>`
+
+  * 指定したトリガー実行時だけ使う sandbox モードを設定します。
+  * `on` は `workspace-write`、`off` は `danger-full-access` を意味します。
+
+* `!trigger env clear <id>`
+
+  * 指定したトリガーの実行環境 override をまとめて解除します。
+
+* `!trigger env clear workdir <id>`
+
+  * 指定したトリガーの working directory override だけを解除します。
+
+* `!trigger env clear sandbox <id>`
+
+  * 指定したトリガーの sandbox override だけを解除します。
+
 ### メンテナンスコマンド
 
 * `!queue`

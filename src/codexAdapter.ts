@@ -45,6 +45,26 @@ function extractEventMsgAgentMessage(
 
 export type CodexSandboxMode = "workspace-write" | "danger-full-access";
 
+export function resolveCodexWorkingDirectory(input: {
+  forceWorkingDirectory?: string | null;
+  codexThreadId?: string | null;
+  preferredWorkingDirectory?: string | null;
+}): string | undefined {
+  if (input.forceWorkingDirectory && existsSync(input.forceWorkingDirectory)) {
+    return input.forceWorkingDirectory;
+  }
+  if (input.codexThreadId) {
+    const cwd = resolveWorkingDirectoryFromThreadId(input.codexThreadId);
+    if (cwd && existsSync(cwd)) {
+      return cwd;
+    }
+  }
+  if (input.preferredWorkingDirectory && existsSync(input.preferredWorkingDirectory)) {
+    return input.preferredWorkingDirectory;
+  }
+  return undefined;
+}
+
 export function detectLogicalCompletionFromJsonlLine(
   line: string,
 ): "turn.completed" | "task_complete" | null {
@@ -101,6 +121,7 @@ export class CodexAdapter {
     sandboxMode?: CodexSandboxMode;
     additionalReadDirs?: string[];
     preferredWorkingDirectory?: string | null;
+    forceWorkingDirectory?: string | null;
     includeDiscordAgentSystemPrompt?: boolean;
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
     onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
@@ -219,16 +240,7 @@ export class CodexAdapter {
       }
     }
     const args: string[] = [];
-    let resolvedCwd: string | undefined;
-    if (input.codexThreadId) {
-      const cwd = resolveWorkingDirectoryFromThreadId(input.codexThreadId);
-      if (cwd && existsSync(cwd)) {
-        resolvedCwd = cwd;
-      }
-    }
-    if (!resolvedCwd && input.preferredWorkingDirectory && existsSync(input.preferredWorkingDirectory)) {
-      resolvedCwd = input.preferredWorkingDirectory;
-    }
+    const resolvedCwd = resolveCodexWorkingDirectory(input);
     if (input.codexThreadId) {
       args.push(
         ...rootOptions,

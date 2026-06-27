@@ -51,6 +51,7 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
       "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
       "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
+      "- !trigger env show <id> | !trigger env set workdir <id> <absolute_path> | !trigger env set sandbox <id> <on|off> | !trigger env clear <id>",
       "- !sandbox on|off",
       "  - Use workspace-write sandbox or full access for this session.",
       "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
@@ -103,12 +104,13 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "  - 現時点でのCodexのメッセージを全て同期済みとして扱います。未来の更新のみ同期します。",
     "- !trigger add daily HH:mm <prompt>",
     "- !trigger add weekly Mon,Wed HH:mm <prompt>",
-    "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
-    "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
-    "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
-    "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
-    "- !sandbox on|off",
-    "  - このセッションを workspace-write または full access で実行します。",
+      "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
+      "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
+      "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
+      "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
+      "- !trigger env show <id> | !trigger env set workdir <id> <absolute_path> | !trigger env set sandbox <id> <on|off> | !trigger env clear <id>",
+      "- !sandbox on|off",
+      "  - このセッションを workspace-write または full access で実行します。",
     "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
     "  - このセッションのCodexスレッドに追加許可ディレクトリを設定します。",
     "- !ok / !ok <minutes> / !ng",
@@ -314,6 +316,12 @@ export function permissionRequestNotFound(locale: AppLocale): string {
   return locale === "en"
     ? "no pending permission request"
     : "承認待ちのリクエストはありません";
+}
+
+export function permissionRequestBusy(locale: AppLocale): string {
+  return locale === "en"
+    ? "another execution is still running or queued for this session. wait until it finishes, then run !ok again."
+    : "このセッションでは別の処理が実行中または待機中です。完了後に !ok を再実行してください。";
 }
 
 export function permissionGrantedReexecutePrompt(locale: AppLocale): string {
@@ -699,8 +707,14 @@ export function usageSync(locale: AppLocale): string {
 
 export function usageTrigger(locale: AppLocale): string {
   return locale === "en"
-    ? "usage: !trigger add daily HH:mm <prompt> | !trigger add weekly Mon,Wed HH:mm <prompt> | !trigger add monthly <day(1-31)> HH:mm <prompt> | !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt> | !trigger add at YYYY-MM-DD HH:mm <prompt> | !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>"
-    : "使い方: !trigger add daily HH:mm <prompt> | !trigger add weekly Mon,Wed HH:mm <prompt> | !trigger add monthly <day(1-31)> HH:mm <prompt> | !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt> | !trigger add at YYYY-MM-DD HH:mm <prompt> | !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>";
+    ? "usage: !trigger add daily HH:mm <prompt> | !trigger add weekly Mon,Wed HH:mm <prompt> | !trigger add monthly <day(1-31)> HH:mm <prompt> | !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt> | !trigger add at YYYY-MM-DD HH:mm <prompt> | !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id> | !trigger env ..."
+    : "使い方: !trigger add daily HH:mm <prompt> | !trigger add weekly Mon,Wed HH:mm <prompt> | !trigger add monthly <day(1-31)> HH:mm <prompt> | !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt> | !trigger add at YYYY-MM-DD HH:mm <prompt> | !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id> | !trigger env ...";
+}
+
+export function usageTriggerEnv(locale: AppLocale): string {
+  return locale === "en"
+    ? "usage: !trigger env show <id> | !trigger env set workdir <id> <absolute_path> | !trigger env set sandbox <id> <on|off> | !trigger env clear <id>"
+    : "使い方: !trigger env show <id> | !trigger env set workdir <id> <absolute_path> | !trigger env set sandbox <id> <on|off> | !trigger env clear <id>";
 }
 
 export function triggerAdded(locale: AppLocale, id: string, name: string): string {
@@ -733,8 +747,72 @@ export function triggerShowTitle(locale: AppLocale, id: string): string {
   return locale === "en" ? `trigger detail: ${id}` : `トリガー詳細: ${id}`;
 }
 
+export function triggerEnvShowTitle(locale: AppLocale, id: string): string {
+  return locale === "en" ? `trigger env: ${id}` : `トリガー実行環境: ${id}`;
+}
+
 export function triggerListEmpty(locale: AppLocale): string {
   return locale === "en" ? "no triggers" : "トリガーはありません";
+}
+
+export function triggerEnvSetWorkdir(locale: AppLocale, id: string, path: string): string {
+  return locale === "en"
+    ? `trigger env workdir set: ${id} -> ${path}`
+    : `trigger env の working_directory を設定しました: ${id} -> ${path}`;
+}
+
+export function triggerEnvSetSandbox(locale: AppLocale, id: string, mode: "on" | "off"): string {
+  return locale === "en"
+    ? `trigger env sandbox set: ${id} -> ${mode}`
+    : `trigger env の sandbox_mode を設定しました: ${id} -> ${mode}`;
+}
+
+export function triggerEnvCleared(locale: AppLocale, id: string): string {
+  return locale === "en"
+    ? `trigger env cleared: ${id}`
+    : `trigger env を解除しました: ${id}`;
+}
+
+export function triggerEnvWorkdirCleared(locale: AppLocale, id: string): string {
+  return locale === "en"
+    ? `trigger env workdir cleared: ${id}`
+    : `trigger env の working_directory を解除しました: ${id}`;
+}
+
+export function triggerEnvSandboxCleared(locale: AppLocale, id: string): string {
+  return locale === "en"
+    ? `trigger env sandbox cleared: ${id}`
+    : `trigger env の sandbox_mode を解除しました: ${id}`;
+}
+
+export function triggerEnvUserOnly(locale: AppLocale): string {
+  return locale === "en"
+    ? "trigger env is a user-only command"
+    : "trigger env はユーザ専用コマンドです";
+}
+
+export function triggerEnvPathMustBeAbsolute(locale: AppLocale): string {
+  return locale === "en"
+    ? "working_directory must be an absolute path"
+    : "working_directory には絶対パスを指定してください";
+}
+
+export function triggerEnvPathNotFound(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `working_directory not found: ${path}`
+    : `working_directory のパスが存在しません: ${path}`;
+}
+
+export function triggerEnvPathNotDirectory(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `working_directory is not a directory: ${path}`
+    : `working_directory はディレクトリではありません: ${path}`;
+}
+
+export function triggerEnvInvalidSandboxMode(locale: AppLocale): string {
+  return locale === "en"
+    ? "sandbox mode must be on or off"
+    : "sandbox_mode は on または off を指定してください";
 }
 
 export function helpAgentLoopDetected(locale: AppLocale): string {

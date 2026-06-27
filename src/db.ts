@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS triggers (
   days_csv TEXT,
   prompt TEXT NOT NULL,
   task_name TEXT NOT NULL,
+  working_directory_override TEXT,
+  sandbox_mode_override TEXT,
   status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
@@ -188,6 +190,21 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
     if (!hasDangerFullAccessUntil) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN danger_full_access_until TEXT");
     }
+    const triggerColumns = this.db.prepare("PRAGMA table_info(triggers)").all() as Array<{
+      name: string;
+    }>;
+    const hasTriggerWorkingDirectoryOverride = triggerColumns.some(
+      (c) => c.name === "working_directory_override",
+    );
+    if (!hasTriggerWorkingDirectoryOverride) {
+      this.db.exec("ALTER TABLE triggers ADD COLUMN working_directory_override TEXT");
+    }
+    const hasTriggerSandboxModeOverride = triggerColumns.some(
+      (c) => c.name === "sandbox_mode_override",
+    );
+    if (!hasTriggerSandboxModeOverride) {
+      this.db.exec("ALTER TABLE triggers ADD COLUMN sandbox_mode_override TEXT");
+    }
     this.ensureTriggerTypeSupportsMonthly();
   }
 
@@ -212,14 +229,16 @@ CREATE TABLE triggers (
   days_csv TEXT,
   prompt TEXT NOT NULL,
   task_name TEXT NOT NULL,
+  working_directory_override TEXT,
+  sandbox_mode_override TEXT,
   status TEXT NOT NULL CHECK (status IN ('enabled', 'disabled')),
   created_by TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 )`);
       this.db.exec(`
-INSERT INTO triggers (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, status, created_by, created_at, updated_at)
-SELECT id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, status, created_by, created_at, updated_at
+INSERT INTO triggers (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, working_directory_override, sandbox_mode_override, status, created_by, created_at, updated_at)
+SELECT id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, NULL, NULL, status, created_by, created_at, updated_at
 FROM triggers_old`);
 
       this.db.exec("ALTER TABLE trigger_fires RENAME TO trigger_fires_old");
@@ -786,8 +805,8 @@ FROM trigger_fires_old`);
     const now = nowIso();
     this.db.prepare(
       `INSERT INTO triggers
-      (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, status, created_by, created_at, updated_at)
-      VALUES (@id, @codex_thread_id, @name, @trigger_type, @time_hhmm, @days_csv, @prompt, @task_name, 'enabled', @created_by, @created_at, @updated_at)`,
+      (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, working_directory_override, sandbox_mode_override, status, created_by, created_at, updated_at)
+      VALUES (@id, @codex_thread_id, @name, @trigger_type, @time_hhmm, @days_csv, @prompt, @task_name, NULL, NULL, 'enabled', @created_by, @created_at, @updated_at)`,
     ).run({
       id,
       codex_thread_id: input.codexThreadId,
@@ -802,6 +821,48 @@ FROM trigger_fires_old`);
       updated_at: now,
     });
     return this.getTriggerById(id)!;
+  }
+
+  setTriggerWorkingDirectoryOverride(id: string, workingDirectoryOverride: string | null): void {
+    this.db
+      .prepare(
+        `UPDATE triggers
+         SET working_directory_override = ?,
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        workingDirectoryOverride,
+        nowIso(),
+        id,
+      );
+  }
+
+  setTriggerSandboxModeOverride(id: string, sandboxModeOverride: SandboxMode | null): void {
+    this.db
+      .prepare(
+        `UPDATE triggers
+         SET sandbox_mode_override = ?,
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        sandboxModeOverride,
+        nowIso(),
+        id,
+      );
+  }
+
+  clearTriggerExecutionOverrides(id: string): void {
+    this.db
+      .prepare(
+        `UPDATE triggers
+         SET working_directory_override = NULL,
+             sandbox_mode_override = NULL,
+             updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(nowIso(), id);
   }
 
   getTriggerById(id: string): TriggerRow | null {

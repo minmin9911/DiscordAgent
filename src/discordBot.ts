@@ -18,7 +18,7 @@ import { AppDb } from "./db.js";
 import { SessionService } from "./sessionService.js";
 import { ExecutionManager } from "./executionManager.js";
 import { maskSecrets } from "./mask.js";
-import { CodexAdapter } from "./codexAdapter.js";
+import { CodexAdapter, resolveCodexWorkingDirectory } from "./codexAdapter.js";
 import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
 import {
@@ -70,6 +70,7 @@ import {
   modelListSourceLine,
   modelWarningLine,
   permissionRequestDiscarded,
+  permissionRequestBusy,
   permissionGrantedReexecutePrompt,
   permissionRequestNotFound,
   permissionRetryPrompt,
@@ -90,9 +91,21 @@ import {
   usageOk,
   usageSandbox,
   usageTrigger,
+  usageTriggerEnv,
   triggerAdded,
   triggerDeleted,
   triggerEdited,
+  triggerEnvCleared,
+  triggerEnvInvalidSandboxMode,
+  triggerEnvPathMustBeAbsolute,
+  triggerEnvPathNotDirectory,
+  triggerEnvPathNotFound,
+  triggerEnvSandboxCleared,
+  triggerEnvSetSandbox,
+  triggerEnvSetWorkdir,
+  triggerEnvShowTitle,
+  triggerEnvUserOnly,
+  triggerEnvWorkdirCleared,
   triggerListEmpty,
   triggerListTitle,
   triggerNotFound,
@@ -158,6 +171,10 @@ type ExternalChannelResolveCache = {
 
 export function shouldProcessIncomingMessage(content: string, attachmentCount: number): boolean {
   return content.trim().length > 0 || attachmentCount > 0;
+}
+
+export function isExecutionRuntimeBusy(runtime: { queueLength: number; runningSince: string | null }): boolean {
+  return Boolean(runtime.runningSince) || runtime.queueLength > 0;
 }
 
 export function isPermissionDeniedCommandFailureText(text: string): boolean {
@@ -1668,16 +1685,172 @@ export class DiscordCodexBot {
   }
 
   private buildTriggerShowLines(trigger: TriggerRow): string[] {
-    return [
-      `id: ${trigger.id}`,
-      `name: ${trigger.name}`,
-      `schedule: ${formatTriggerSchedule(trigger)}`,
+      return [
+        `id: ${trigger.id}`,
+        `name: ${trigger.name}`,
+        `schedule: ${formatTriggerSchedule(trigger)}`,
       `status: ${trigger.status}`,
       `codex_thread_id: ${trigger.codex_thread_id}`,
       `task_name: ${trigger.task_name}`,
       "prompt:",
-      trigger.prompt,
+        trigger.prompt,
+      ];
+    }
+
+  private formatTriggerSandboxOverrideLabel(mode: SandboxMode): "on" | "off" {
+    return mode === "workspace-write" ? "on" : "off";
+  }
+
+  private buildTriggerEnvShowLines(trigger: TriggerRow): string[] {
+    const sessions = this.db.listSessionsByCodexThreadId(trigger.codex_thread_id);
+    const session = sessions[0] ?? null;
+    const effectiveWorkingDirectory = trigger.working_directory_override
+      ?? resolveCodexWorkingDirectory({
+        codexThreadId: trigger.codex_thread_id,
+        preferredWorkingDirectory: session?.preferred_working_directory ?? null,
+      })
+      ?? unknownValue(this.locale);
+    const effectiveSandboxMode = trigger.sandbox_mode_override
+      ?? (session ? this.resolveSandboxMode(session) : null);
+
+    return [
+      trigger.working_directory_override
+        ? `working_directory(override): ${effectiveWorkingDirectory}`
+        : `working_directory: ${effectiveWorkingDirectory}`,
+      trigger.sandbox_mode_override
+        ? `sandbox_mode(override): ${this.formatTriggerSandboxOverrideLabel(trigger.sandbox_mode_override)}`
+        : `sandbox_mode: ${effectiveSandboxMode ? this.formatTriggerSandboxOverrideLabel(effectiveSandboxMode) : unknownValue(this.locale)}`,
     ];
+  }
+
+  private async handleTriggerEnvCommand(msg: Message, body: string): Promise<void> {
+    const raw = body.trim();
+    if (!raw) {
+      await msg.reply(usageTriggerEnv(this.locale));
+      return;
+    }
+    const parts = raw.split(/\s+/);
+    const sub = (parts[0] ?? "").toLowerCase();
+    if (sub === "show") {
+      const id = parts[1] ?? "";
+      if (!id) {
+        await msg.reply(usageTriggerEnv(this.locale));
+        return;
+      }
+      const trigger = this.db.getTriggerById(id);
+      if (!trigger) {
+        await msg.reply(triggerNotFound(this.locale, id));
+        return;
+      }
+      await this.sendMultilineReply(msg, triggerEnvShowTitle(this.locale, id), this.buildTriggerEnvShowLines(trigger));
+      return;
+    }
+    if (sub === "set") {
+      const field = (parts[1] ?? "").toLowerCase();
+      const id = parts[2] ?? "";
+      if (field === "workdir") {
+        const pathArg = raw.split(/\s+/).slice(3).join(" ").trim();
+        if (!id || !pathArg) {
+          await msg.reply(usageTriggerEnv(this.locale));
+          return;
+        }
+        const trigger = this.db.getTriggerById(id);
+        if (!trigger) {
+          await msg.reply(triggerNotFound(this.locale, id));
+          return;
+        }
+        if (!isAbsolute(pathArg)) {
+          await msg.reply(triggerEnvPathMustBeAbsolute(this.locale));
+          return;
+        }
+        if (!existsSync(pathArg)) {
+          await msg.reply(triggerEnvPathNotFound(this.locale, pathArg));
+          return;
+        }
+        let stats;
+        try {
+          stats = statSync(pathArg);
+        } catch {
+          await msg.reply(triggerEnvPathNotFound(this.locale, pathArg));
+          return;
+        }
+        if (!stats.isDirectory()) {
+          await msg.reply(triggerEnvPathNotDirectory(this.locale, pathArg));
+          return;
+        }
+        this.db.setTriggerWorkingDirectoryOverride(id, pathArg);
+        await msg.reply(triggerEnvSetWorkdir(this.locale, id, pathArg));
+        return;
+      }
+      if (field === "sandbox") {
+        const mode = (parts[3] ?? "").toLowerCase();
+        if (!id || !mode) {
+          await msg.reply(usageTriggerEnv(this.locale));
+          return;
+        }
+        const trigger = this.db.getTriggerById(id);
+        if (!trigger) {
+          await msg.reply(triggerNotFound(this.locale, id));
+          return;
+        }
+        if (mode !== "on" && mode !== "off") {
+          await msg.reply(triggerEnvInvalidSandboxMode(this.locale));
+          return;
+        }
+        this.db.setTriggerSandboxModeOverride(id, mode === "on" ? "workspace-write" : "danger-full-access");
+        await msg.reply(triggerEnvSetSandbox(this.locale, id, mode));
+        return;
+      }
+      await msg.reply(usageTriggerEnv(this.locale));
+      return;
+    }
+    if (sub === "clear") {
+      const field = (parts[1] ?? "").toLowerCase();
+      if (field === "workdir") {
+        const id = parts[2] ?? "";
+        if (!id) {
+          await msg.reply(usageTriggerEnv(this.locale));
+          return;
+        }
+        const trigger = this.db.getTriggerById(id);
+        if (!trigger) {
+          await msg.reply(triggerNotFound(this.locale, id));
+          return;
+        }
+        this.db.setTriggerWorkingDirectoryOverride(id, null);
+        await msg.reply(triggerEnvWorkdirCleared(this.locale, id));
+        return;
+      }
+      if (field === "sandbox") {
+        const id = parts[2] ?? "";
+        if (!id) {
+          await msg.reply(usageTriggerEnv(this.locale));
+          return;
+        }
+        const trigger = this.db.getTriggerById(id);
+        if (!trigger) {
+          await msg.reply(triggerNotFound(this.locale, id));
+          return;
+        }
+        this.db.setTriggerSandboxModeOverride(id, null);
+        await msg.reply(triggerEnvSandboxCleared(this.locale, id));
+        return;
+      }
+      const id = parts[1] ?? "";
+      if (!id) {
+        await msg.reply(usageTriggerEnv(this.locale));
+        return;
+      }
+      const trigger = this.db.getTriggerById(id);
+      if (!trigger) {
+        await msg.reply(triggerNotFound(this.locale, id));
+        return;
+      }
+      this.db.clearTriggerExecutionOverrides(id);
+      await msg.reply(triggerEnvCleared(this.locale, id));
+      return;
+    }
+    await msg.reply(usageTriggerEnv(this.locale));
   }
 
   private async handleTriggerCommand(msg: Message, body: string): Promise<void> {
@@ -1688,6 +1861,10 @@ export class DiscordCodexBot {
     }
     const parts = raw.split(/\s+/);
     const sub = (parts[0] ?? "").toLowerCase();
+    if (sub === "env") {
+      await this.handleTriggerEnvCommand(msg, raw.slice(parts[0]!.length).trim());
+      return;
+    }
     const listFull = (parts[1] ?? "").toLowerCase() === "full";
     if (sub === "list") {
       const triggers = this.db.listTriggers(100);
@@ -1844,6 +2021,15 @@ export class DiscordCodexBot {
     }
     const parts = raw.split(/\s+/);
     const sub = (parts[0] ?? "").toLowerCase();
+    if (sub === "env") {
+      await sendChannel.send(triggerEnvUserOnly(this.locale));
+      await this.sendAgentTriggerCommandResult(sendChannel, {
+        ok: false,
+        command: commandText,
+        reason: "user_only",
+      });
+      return;
+    }
     const listFull = (parts[1] ?? "").toLowerCase() === "full";
     if (sub === "list") {
       const triggers = this.db.listTriggers(100);
@@ -2471,6 +2657,11 @@ export class DiscordCodexBot {
     this.pendingApprovals.delete(contextKey);
   }
 
+  private isSessionExecutionBusy(session: SessionRow): boolean {
+    const runtime = this.manager.getRuntimeState(this.getExecutionLockKey(session));
+    return isExecutionRuntimeBusy(runtime);
+  }
+
   private isValidHhmm(value: string): boolean {
     return /^([01]\d|2[0-3]):([0-5]\d)$/.test(value);
   }
@@ -2869,17 +3060,21 @@ export class DiscordCodexBot {
 
   private async handleOkCommand(msg: Message, contextKey: string, body: string): Promise<void> {
     const arg = body.trim();
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "ok",
+    });
+    if (this.isSessionExecutionBusy(session)) {
+      await msg.reply(permissionRequestBusy(this.locale));
+      return;
+    }
     if (arg) {
       const minutes = Number(arg);
       if (!Number.isInteger(minutes) || minutes <= 0 || minutes > TEMP_FULL_ACCESS_MAX_MINUTES) {
         await msg.reply(usageOk(this.locale, TEMP_FULL_ACCESS_MAX_MINUTES));
         return;
       }
-      const session = this.sessionService.resolveOrCreateActiveSession({
-        contextKey,
-        requesterId: msg.author.id,
-        initialMessage: "ok",
-      });
       const untilIso = new Date(Date.now() + minutes * 60 * 1000).toISOString();
       this.db.setSessionDangerFullAccessUntil(session.id, untilIso);
       session.danger_full_access_until = untilIso;
@@ -2907,11 +3102,6 @@ export class DiscordCodexBot {
       await msg.reply(permissionRequestNotFound(this.locale));
       return;
     }
-    const session = this.sessionService.resolveOrCreateActiveSession({
-      contextKey,
-      requesterId: msg.author.id,
-      initialMessage: "ok",
-    });
     if (session.id !== pending.sessionId) {
       this.pendingApprovals.delete(contextKey);
       await msg.reply(permissionRequestNotFound(this.locale));
@@ -3518,8 +3708,10 @@ export class DiscordCodexBot {
           sessionId: session.id,
           codexThreadId: session.codex_thread_id,
           modelOverride: session.model_override,
-          sandboxMode: this.resolveSandboxMode(session),
-          preferredWorkingDirectory: session.preferred_working_directory,
+          sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
+          preferredWorkingDirectory:
+            trigger.working_directory_override ?? session.preferred_working_directory,
+          forceWorkingDirectory: trigger.working_directory_override,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onAgentMessage: async ({ text }) => {
             streamAgentMessages.push(text);

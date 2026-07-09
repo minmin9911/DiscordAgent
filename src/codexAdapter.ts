@@ -38,7 +38,7 @@ function extractEventMsgAgentMessage(
   if (typeof message !== "string" || !message.trim()) return null;
   const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "unknown";
   return {
-    itemId: `event_msg:${timestamp}:${message.length}`,
+    itemId: `event_msg:agent_message:${timestamp}:${message.length}`,
     text: message,
   };
 }

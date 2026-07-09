@@ -4,6 +4,11 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.79 (2026-07-09)
+- `!queue stopall` の短縮コマンドとして `!stopall` / `!allstop` を追加。
+- `!ok` に prompt 付き書式を追加し、`!ok <minutes> <prompt>` / `!ok <prompt>` を受け付けるようにした。
+- External Sync について、External ではないメッセージが External 扱いで拾われてしまうことがあった問題の抑止を改善。なお、まだ完全には抑えきれていない。
+
 ## v0.1.0 build.76 (2026-06-19)
 - `!trigger` 機能を実装し、定期・単発実行の設定、一覧確認、詳細表示、停止、削除、編集に対応。（Agentからもユーザからも実行可能）
 - `!sandbox dir` を追加し、workspace-write 実行時にセッションごとの追加許可ディレクトリを設定できるようにした。

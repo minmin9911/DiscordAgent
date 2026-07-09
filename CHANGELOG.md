@@ -4,6 +4,11 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.79 (2026-07-09)
+- Add `!stopall` and `!allstop` as shorthand aliases for `!queue stopall`.
+- Extend `!ok` to accept prompt-attached forms: `!ok <minutes> <prompt>` and `!ok <prompt>`.
+- Improve suppression for cases where External Sync could incorrectly treat non-external messages as external. This is improved but not yet fully eliminated.
+
 ## v0.1.0 build.76 (2026-06-19)
 - Implement `!trigger` features for scheduled and one-shot execution, including list, show, stop, delete, and edit operations. (Available to both agents and users.)
 - Add `!sandbox dir` so each session can configure extra allowed directories for workspace-write runs.

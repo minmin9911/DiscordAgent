@@ -291,6 +291,7 @@ Agent は必要に応じてこのコマンドを自発的に利用できます�
 * `!queue stopall`
 
   * 全キューを緊急停止します（待機中は取消、実行中は強制停止）。
+  * 短縮コマンドとして `!stopall` / `!allstop` も使用できます。
 
 * `!queue fix`
 
@@ -325,10 +326,12 @@ Agent は必要に応じてこのコマンドを自発的に利用できます�
 * `!ok`
 
   * 直近の権限不足リクエストを1回だけ `danger-full-access` で再実行します。
+  * `!ok <prompt>` とすると、その prompt を 1回だけ full access で実行します。sudo のイメージです。
 
 * `!ok <minutes>`
 
   * 指定分数だけ、このセッションを一時的に `danger-full-access` で実行します。上限は60分です。
+  * `!ok <minutes> <prompt>` とすると、その prompt を full access で実行します。その後、指定した分数だけ full access 状態が持続します。sudo の時間限定版のイメージです。
 
 * `!ng`
 

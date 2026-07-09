@@ -7,15 +7,74 @@ export type ExternalSyncItemType = "user_message" | "agent_message";
 export interface ExternalSyncEvent {
   lineNo: number;
   eventId: string;
+  stableEventId?: string;
   itemType: ExternalSyncItemType;
   text: string;
   occurredAtMs: number | null;
+  eventSignature?: string;
 }
 
 export interface ExternalSyncReadResult {
   sourceFound: boolean;
   latestLineNo: number;
   events: ExternalSyncEvent[];
+}
+
+export function buildExternalSyncEventSignature(input: {
+  itemType: ExternalSyncItemType;
+  timestamp: string;
+  text: string;
+}): string {
+  return `${input.itemType}:${input.timestamp}:${input.text.length}`;
+}
+
+export function buildExternalSyncEventMsgId(input: {
+  itemType: ExternalSyncItemType;
+  timestamp: string;
+  text: string;
+}): string {
+  return `event_msg:${buildExternalSyncEventSignature(input)}`;
+}
+
+export function tryBuildStableIdentityFromAdjacentEventMsg(
+  lines: string[],
+  currentIndex: number,
+  itemType: ExternalSyncItemType,
+  text: string,
+): { stableEventId: string; eventSignature: string } | null {
+  const lookbackStart = Math.max(0, currentIndex - 3);
+  for (let i = currentIndex - 1; i >= lookbackStart; i -= 1) {
+    const trimmed = (lines[i] ?? "").trim();
+    if (!trimmed) continue;
+    try {
+      const obj = JSON.parse(trimmed) as {
+        type?: unknown;
+        timestamp?: unknown;
+        payload?: { type?: unknown; message?: unknown };
+      };
+      if (
+        obj.type === "event_msg"
+        && typeof obj.timestamp === "string"
+        && obj.payload
+        && typeof obj.payload === "object"
+        && obj.payload.type === itemType
+        && obj.payload.message === text
+      ) {
+        const eventSignature = buildExternalSyncEventSignature({
+          itemType,
+          timestamp: obj.timestamp,
+          text,
+        });
+        return {
+          stableEventId: `event_msg:${eventSignature}`,
+          eventSignature,
+        };
+      }
+    } catch {
+      // ignore
+    }
+  }
+  return null;
 }
 
 export function parseExternalSyncEventLine(
@@ -176,7 +235,63 @@ export function readCodexThreadEventsSinceLine(
       }
       recentBySignature.set(sig, parsed.lineNo);
     }
-    events.push({ ...parsed, occurredAtMs });
+    let eventSignature: string | undefined;
+    let stableEventId: string | undefined;
+    if (trimmed) {
+      try {
+        const obj = JSON.parse(trimmed) as {
+          type?: unknown;
+          timestamp?: unknown;
+          payload?: {
+            type?: unknown;
+            message?: unknown;
+            role?: unknown;
+            content?: unknown;
+          };
+        };
+        if (
+          obj.type === "event_msg"
+          && typeof obj.timestamp === "string"
+          && obj.payload
+          && typeof obj.payload === "object"
+          && (obj.payload.type === "user_message" || obj.payload.type === "agent_message")
+          && typeof obj.payload.message === "string"
+        ) {
+          stableEventId = buildExternalSyncEventMsgId({
+            itemType: obj.payload.type,
+            timestamp: obj.timestamp,
+            text: obj.payload.message,
+          });
+          eventSignature = buildExternalSyncEventSignature({
+            itemType: obj.payload.type,
+            timestamp: obj.timestamp,
+            text: obj.payload.message,
+          });
+        }
+        if (
+          !stableEventId
+          && obj.type === "response_item"
+          && obj.payload
+          && typeof obj.payload === "object"
+          && obj.payload.type === "message"
+          && obj.payload.role === "assistant"
+        ) {
+          const adjacent = tryBuildStableIdentityFromAdjacentEventMsg(
+            lines,
+            i,
+            "agent_message",
+            parsed.text,
+          );
+          if (adjacent) {
+            stableEventId = adjacent.stableEventId;
+            eventSignature = adjacent.eventSignature;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    events.push({ ...parsed, occurredAtMs, stableEventId, eventSignature });
   }
   const safeLatestLineNo = trailingInvalidJson
     ? Math.max(0, lines.length - 1)

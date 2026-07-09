@@ -18,6 +18,7 @@ import { AppDb } from "./db.js";
 import { SessionService } from "./sessionService.js";
 import { ExecutionManager } from "./executionManager.js";
 import { maskSecrets } from "./mask.js";
+import { parseOkCommandBody } from "./okCommand.js";
 import { CodexAdapter, resolveCodexWorkingDirectory } from "./codexAdapter.js";
 import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
@@ -121,7 +122,11 @@ import {
   searchCodexSessions,
   type CodexSessionMeta,
 } from "./codexSessionMeta.js";
-import { readCodexThreadEventsSinceLine } from "./codexExternalSync.js";
+import {
+  buildExternalSyncEventMsgId,
+  buildExternalSyncEventSignature,
+  readCodexThreadEventsSinceLine,
+} from "./codexExternalSync.js";
 import { ATTACH_MAX_BYTES, extractAttachPaths } from "./attachPolicy.js";
 import {
   buildPromptWithIncomingAttachments,
@@ -328,7 +333,13 @@ export class DiscordCodexBot {
   private readonly helpAgentStreakByContext = new Map<string, number>();
   private readonly localSyncSuppress = new Map<
     string,
-    { userTexts: Set<string>; agentTexts: Set<string>; expiresAtMs: number }
+    {
+      userTexts: Set<string>;
+      agentTexts: Set<string>;
+      userSignatures: Set<string>;
+      agentSignatures: Set<string>;
+      expiresAtMs: number;
+    }
   >();
   private readonly externalChannelResolveCache = new Map<string, ExternalChannelResolveCache>();
   private externalSyncEnabled = appConfig.externalSyncEnabled;
@@ -507,6 +518,10 @@ export class DiscordCodexBot {
       }
       if (content === "!queue") {
         await this.handleQueueCommand(msg, "");
+        return;
+      }
+      if (content === "!stopall" || content === "!allstop") {
+        await this.handleQueueCommand(msg, "stopall");
         return;
       }
       if (content.startsWith("!queue ")) {
@@ -1226,6 +1241,7 @@ export class DiscordCodexBot {
             if (event.threadId) {
               await applyObservedThreadId(event.threadId, "event");
             }
+            const suppressThreadId = observedThreadId ?? session.codex_thread_id ?? null;
             if (
               event.type === "turn.started"
               || event.type === "turn.completed"
@@ -1238,7 +1254,7 @@ export class DiscordCodexBot {
                   eventType: event.type,
                   itemType: event.itemType ?? null,
                   itemId: event.itemId ?? null,
-                  codexThreadId: observedThreadId ?? session.codex_thread_id ?? null,
+                  codexThreadId: suppressThreadId,
                 },
                 "codex json milestone",
               );
@@ -1271,9 +1287,64 @@ export class DiscordCodexBot {
               event.type === "item.completed"
               && (event.itemType === "user_message" || event.itemType === "agent_message")
               && event.itemId
-              && observedThreadId
+              && suppressThreadId
             ) {
-              this.db.markExternalSyncEventSeen(observedThreadId, event.itemId);
+              this.db.markExternalSyncEventSeen(suppressThreadId, event.itemId);
+              const rawTimestamp = typeof event.raw.timestamp === "string"
+                ? event.raw.timestamp
+                : null;
+              if (rawTimestamp && event.itemText) {
+                const stableEventId = buildExternalSyncEventMsgId({
+                  itemType: event.itemType,
+                  timestamp: rawTimestamp,
+                  text: event.itemText,
+                });
+                this.db.markExternalSyncEventSeen(suppressThreadId, stableEventId);
+                this.addLocalSyncSuppressionSignature(
+                  suppressThreadId,
+                  event.itemType,
+                  buildExternalSyncEventSignature({
+                    itemType: event.itemType,
+                    timestamp: rawTimestamp,
+                    text: event.itemText,
+                  }),
+                );
+              }
+            }
+            if (
+              suppressThreadId
+              && event.raw.type === "event_msg"
+              && event.raw.payload
+              && typeof event.raw.payload === "object"
+            ) {
+              const payload = event.raw.payload as { type?: unknown; message?: unknown };
+              const msgType = payload.type;
+              const message = payload.message;
+              const timestamp = typeof event.raw.timestamp === "string" ? event.raw.timestamp : null;
+              if (
+                (msgType === "user_message" || msgType === "agent_message")
+                && typeof message === "string"
+                && message.trim()
+                && timestamp
+              ) {
+                this.db.markExternalSyncEventSeen(
+                  suppressThreadId,
+                  buildExternalSyncEventMsgId({
+                    itemType: msgType,
+                    timestamp,
+                    text: message,
+                  }),
+                );
+                this.addLocalSyncSuppressionSignature(
+                  suppressThreadId,
+                  msgType,
+                  buildExternalSyncEventSignature({
+                    itemType: msgType,
+                    timestamp,
+                    text: message,
+                  }),
+                );
+              }
             }
             if (event.type === "turn.started") {
               await editProgressMessage(
@@ -1291,8 +1362,12 @@ export class DiscordCodexBot {
             if (finalized) return;
             if (seenAgentItemIds.has(itemId)) return;
             seenAgentItemIds.add(itemId);
-            if (observedThreadId) {
-              this.addLocalSyncSuppressionText(observedThreadId, "agent_message", text);
+            const suppressThreadId = observedThreadId ?? session.codex_thread_id ?? null;
+            if (suppressThreadId) {
+              this.addLocalSyncSuppressionText(suppressThreadId, "agent_message", text);
+              if (itemId.startsWith("event_msg:")) {
+                this.db.markExternalSyncEventSeen(suppressThreadId, itemId);
+              }
             }
             streamAgentMessages.push(text);
             const preview = normalizeStreamPreview(text);
@@ -2495,6 +2570,7 @@ export class DiscordCodexBot {
       commandTextMasked: "[agent-cmd-internal]",
     });
     const lockKey = `codex:${threadId}`;
+    this.addLocalSyncSuppressionText(threadId, "user_message", promptText);
     const result = await this.manager.enqueue({
       executionId,
       sessionId: session.id,
@@ -3059,7 +3135,7 @@ export class DiscordCodexBot {
   }
 
   private async handleOkCommand(msg: Message, contextKey: string, body: string): Promise<void> {
-    const arg = body.trim();
+    const parsed = parseOkCommandBody(body);
     const session = this.sessionService.resolveOrCreateActiveSession({
       contextKey,
       requesterId: msg.author.id,
@@ -3069,8 +3145,8 @@ export class DiscordCodexBot {
       await msg.reply(permissionRequestBusy(this.locale));
       return;
     }
-    if (arg) {
-      const minutes = Number(arg);
+    if (parsed.minutes !== null) {
+      const minutes = parsed.minutes;
       if (!Number.isInteger(minutes) || minutes <= 0 || minutes > TEMP_FULL_ACCESS_MAX_MINUTES) {
         await msg.reply(usageOk(this.locale, TEMP_FULL_ACCESS_MAX_MINUTES));
         return;
@@ -3078,6 +3154,14 @@ export class DiscordCodexBot {
       const untilIso = new Date(Date.now() + minutes * 60 * 1000).toISOString();
       this.db.setSessionDangerFullAccessUntil(session.id, untilIso);
       session.danger_full_access_until = untilIso;
+      if (parsed.prompt) {
+        this.pendingApprovals.delete(contextKey);
+        await msg.reply(temporaryFullAccessEnabled(this.locale, minutes));
+        await this.handleExecutionMessage(msg, parsed.prompt, {
+          sandboxOverride: "danger-full-access",
+        });
+        return;
+      }
       const pending = this.pendingApprovals.get(contextKey);
       if (pending && pending.sessionId !== session.id) {
         this.pendingApprovals.delete(contextKey);
@@ -3094,6 +3178,15 @@ export class DiscordCodexBot {
         return;
       }
       await msg.reply(temporaryFullAccessEnabled(this.locale, minutes));
+      return;
+    }
+
+    if (parsed.prompt) {
+      this.pendingApprovals.delete(contextKey);
+      await this.handleExecutionMessage(msg, parsed.prompt, {
+        sandboxOverride: "danger-full-access",
+        approvalStatusOverride: "one_shot",
+      });
       return;
     }
 
@@ -3258,6 +3351,8 @@ export class DiscordCodexBot {
     const current = this.localSyncSuppress.get(codexThreadId) ?? {
       userTexts: new Set<string>(),
       agentTexts: new Set<string>(),
+      userSignatures: new Set<string>(),
+      agentSignatures: new Set<string>(),
       expiresAtMs,
     };
     current.expiresAtMs = Math.max(current.expiresAtMs, expiresAtMs);
@@ -3269,10 +3364,35 @@ export class DiscordCodexBot {
     this.localSyncSuppress.set(codexThreadId, current);
   }
 
+  private addLocalSyncSuppressionSignature(
+    codexThreadId: string,
+    itemType: "user_message" | "agent_message",
+    signature: string,
+  ): void {
+    if (!signature) return;
+    const now = Date.now();
+    const expiresAtMs = now + (5 * 60 * 1000);
+    const current = this.localSyncSuppress.get(codexThreadId) ?? {
+      userTexts: new Set<string>(),
+      agentTexts: new Set<string>(),
+      userSignatures: new Set<string>(),
+      agentSignatures: new Set<string>(),
+      expiresAtMs,
+    };
+    current.expiresAtMs = Math.max(current.expiresAtMs, expiresAtMs);
+    if (itemType === "user_message") {
+      current.userSignatures.add(signature);
+    } else {
+      current.agentSignatures.add(signature);
+    }
+    this.localSyncSuppress.set(codexThreadId, current);
+  }
+
   private shouldSuppressLocalSyncEvent(
     codexThreadId: string,
     itemType: "user_message" | "agent_message",
     text: string,
+    eventSignature?: string,
   ): boolean {
     const entry = this.localSyncSuppress.get(codexThreadId);
     if (!entry) return false;
@@ -3280,6 +3400,10 @@ export class DiscordCodexBot {
     if (entry.expiresAtMs <= now) {
       this.localSyncSuppress.delete(codexThreadId);
       return false;
+    }
+    if (eventSignature) {
+      if (itemType === "user_message" && entry.userSignatures.has(eventSignature)) return true;
+      if (itemType === "agent_message" && entry.agentSignatures.has(eventSignature)) return true;
     }
     const normalized = this.normalizeSuppressionText(text);
     if (!normalized) return false;
@@ -3297,7 +3421,14 @@ export class DiscordCodexBot {
         codexThreadId: string;
         contextKeys: string[];
         latestLineNo: number;
-        event: { eventId: string; itemType: "user_message" | "agent_message"; text: string; lineNo: number; occurredAtMs: number | null };
+        event: {
+          eventId: string;
+          stableEventId?: string;
+          itemType: "user_message" | "agent_message";
+          text: string;
+          lineNo: number;
+          occurredAtMs: number | null;
+        };
       }> = [];
 
       for (const threadId of threadIds) {
@@ -3327,14 +3458,17 @@ export class DiscordCodexBot {
 
       const cap = appConfig.externalSyncMaxBurst;
       const dropCount = Math.max(0, collected.length - cap);
-      if (dropCount > 0) {
-        for (let i = 0; i < dropCount; i += 1) {
-          const dropped = collected[i]!;
-          this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.eventId);
-        }
-        this.logger.info(
-          { reason, dropped: dropCount, sent: cap },
-          "external sync global cap applied",
+        if (dropCount > 0) {
+          for (let i = 0; i < dropCount; i += 1) {
+            const dropped = collected[i]!;
+            this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.eventId);
+            if (dropped.event.stableEventId) {
+              this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.stableEventId);
+            }
+          }
+          this.logger.info(
+            { reason, dropped: dropCount, sent: cap },
+            "external sync global cap applied",
         );
       }
       const target = dropCount > 0 ? collected.slice(dropCount) : collected;
@@ -3346,6 +3480,9 @@ export class DiscordCodexBot {
           row.event.text,
         );
         this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.eventId);
+        if (row.event.stableEventId) {
+          this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.stableEventId);
+        }
       }
 
       const latestByThread = new Map<string, number>();
@@ -3370,6 +3507,7 @@ export class DiscordCodexBot {
     latestLineNo: number;
     events: Array<{
       eventId: string;
+      stableEventId?: string;
       itemType: "user_message" | "agent_message";
       text: string;
       lineNo: number;
@@ -3411,18 +3549,34 @@ export class DiscordCodexBot {
       return null;
     }
 
-    const pendingEvents = read.events.filter((event) => {
-      if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
-      if (event.text.includes(INTERNAL_SYNC_MARKER)) {
-        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
-        return false;
-      }
-      if (this.shouldSuppressLocalSyncEvent(codexThreadId, event.itemType, event.text)) {
-        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
-        return false;
-      }
-      return true;
-    });
+      const pendingEvents = read.events.filter((event) => {
+        if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
+        if (event.stableEventId && this.db.hasExternalSyncEventSeen(codexThreadId, event.stableEventId)) {
+          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+          this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
+          return false;
+        }
+        if (event.text.includes(INTERNAL_SYNC_MARKER)) {
+          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+          if (event.stableEventId) {
+            this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
+          }
+          return false;
+        }
+        if (this.shouldSuppressLocalSyncEvent(
+          codexThreadId,
+          event.itemType,
+          event.text,
+          event.eventSignature,
+        )) {
+          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+          if (event.stableEventId) {
+            this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
+          }
+          return false;
+        }
+        return true;
+      });
     if (pendingEvents.length === 0) {
       this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
       return null;

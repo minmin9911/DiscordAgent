@@ -201,6 +201,7 @@ Trigger firing is implemented through Windows Task Scheduler.
 
 - `!queue`
 - `!queue stopall`
+  - `!stopall` and `!allstop` are also available as shorthand aliases.
 - `!queue fix`
 - `!sandbox on`
   - Run this session with `workspace-write`. This is the default setting for work inside the current workspace.
@@ -217,8 +218,10 @@ Trigger firing is implemented through Windows Task Scheduler.
   - Remove all extra allowed directories.
 - `!ok`
   - Retry the latest permission-limited request once with `danger-full-access`.
+  - `!ok <prompt>` runs that prompt once with full access, similar to a one-shot sudo.
 - `!ok <minutes>`
   - Temporarily run this session with `danger-full-access` for the specified number of minutes. The maximum is 60 minutes.
+  - `!ok <minutes> <prompt>` runs that prompt with full access, then keeps full access enabled for the specified duration, similar to a time-limited sudo.
 - `!ng`
   - Discard the latest permission-limited request.
 - `!sync`

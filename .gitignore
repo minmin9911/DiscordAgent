@@ -55,6 +55,7 @@ Desktop.ini
 docs/
 poc/
 workspaces/
+.local/
 tmp_*.md
 /*.md
 !/README.md

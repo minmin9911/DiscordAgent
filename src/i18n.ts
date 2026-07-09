@@ -56,7 +56,7 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "  - Use workspace-write sandbox or full access for this session.",
       "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
       "  - Manage extra directories allowed for this session's Codex thread.",
-      "- !ok / !ok <minutes> / !ng",
+      "- !ok / !ok <minutes> / !ok <prompt> / !ok <minutes> <prompt> / !ng",
       "  - Retry the latest permission-limited request or temporarily allow full access.",
       "",
       "## Session Management",
@@ -113,7 +113,7 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "  - このセッションを workspace-write または full access で実行します。",
     "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
     "  - このセッションのCodexスレッドに追加許可ディレクトリを設定します。",
-    "- !ok / !ok <minutes> / !ng",
+    "- !ok / !ok <minutes> / !ok <prompt> / !ok <minutes> <prompt> / !ng",
     "  - 直近の権限不足リクエストを再実行、または一時的に full access を許可します。",
     "",
     "## セッション管理",
@@ -470,6 +470,10 @@ export function buildAgentCommandReference(locale: AppLocale): string {
       "",
       "Safety warning:",
       "- Trigger commands execute when output as a standalone `!trigger ...` line.",
+      "- `!trigger list` and `!trigger show` are read-only. `add` / `edit` / `stop` / `delete` mutate state.",
+      "- Output at most one mutating `!trigger` command per reply.",
+      "- Do not output the next mutating `!trigger` command until you receive the result of the previous one.",
+      "- Even when multiple changes are needed, execute them one by one and wait for each result.",
       "- Do not print executable `!trigger ...` lines when only asking a question.",
       "",
       "For general commands, use `!help`.",
@@ -511,6 +515,10 @@ export function buildAgentCommandReference(locale: AppLocale): string {
     "",
     "注意:",
     "- `!trigger ...` を単独行で出力すると、そのまま実行されます。",
+    "- `!trigger list` / `!trigger show` は参照系です。`add` / `edit` / `stop` / `delete` は状態変更です。",
+    "- 状態変更系の `!trigger` は、1返答につき1件だけ出力してください。",
+    "- 状態変更系の結果を受け取る前に、次の状態変更系 `!trigger` を出力しないでください。",
+    "- 複数の状態変更が必要でも、必ず result を待ってから1件ずつ実行してください。",
     "- 質問や確認だけをしたい場面では、実行形式の `!trigger ...` 行を出力しないでください。",
     "",
     "通常のコマンド一覧は `!help` を参照してください。",
@@ -569,8 +577,8 @@ export function approvalStatusLine(locale: AppLocale, view: ApprovalStatusView):
 
 export function usageOk(locale: AppLocale, maxMinutes: number): string {
   return locale === "en"
-    ? `usage: !ok [1-${maxMinutes}]`
-    : `使い方: !ok [1-${maxMinutes}]`;
+    ? `usage: !ok [1-${maxMinutes}] [prompt] | !ok [prompt]`
+    : `使い方: !ok [1-${maxMinutes}] [prompt] | !ok [prompt]`;
 }
 
 export function usageCodexSession(locale: AppLocale): string {

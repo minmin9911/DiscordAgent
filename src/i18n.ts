@@ -62,6 +62,8 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "## Session Management",
       "- !session new [name]",
       "  - Disconnect from the current session and start a new one (with a new Codex thread).",
+      "- !session workdir set <absolute_path> | !session workdir clear",
+      "  - Override the working_directory used by DiscordAgent for this session.",
       "- !session current",
       "  - Show the current session's codex_thread_id / working_directory / status / queue.",
       "- !model",
@@ -119,6 +121,8 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "## セッション管理",
     "- !session new [name]",
     "  - 現在のセッションとの接続を切り、新しいセッションを始めます（Codexのスレッドも新しくなります）。",
+    "- !session workdir set <absolute_path> | !session workdir clear",
+    "  - このセッションで DiscordAgent が使う working_directory を上書きします。",
     "- !session current",
     "  - 現在のセッションの codex_thread_id / working_directory / status / queue などを表示します。",
     "- !model",
@@ -640,8 +644,44 @@ export function usageSessionSwitch(locale: AppLocale): string {
 
 export function usageSessionRoot(locale: AppLocale): string {
   return locale === "en"
-    ? "usage: !session <new|current> ..."
-    : "使い方: !session <new|current> ...";
+    ? "usage: !session <new|current|workdir> ..."
+    : "使い方: !session <new|current|workdir> ...";
+}
+
+export function usageSessionWorkdir(locale: AppLocale): string {
+  return locale === "en"
+    ? "usage: !session workdir set <absolute_path> | !session workdir clear"
+    : "使い方: !session workdir set <absolute_path> | !session workdir clear";
+}
+
+export function sessionWorkdirSet(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `working_directory override set: ${path}`
+    : `working_directory override を設定しました: ${path}`;
+}
+
+export function sessionWorkdirCleared(locale: AppLocale): string {
+  return locale === "en"
+    ? "working_directory override cleared"
+    : "working_directory override を解除しました";
+}
+
+export function sessionWorkdirPathMustBeAbsolute(locale: AppLocale): string {
+  return locale === "en"
+    ? "working_directory path must be absolute"
+    : "working_directory には絶対パスを指定してください";
+}
+
+export function sessionWorkdirPathNotFound(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `working_directory path not found: ${path}`
+    : `working_directory のパスが存在しません: ${path}`;
+}
+
+export function sessionWorkdirPathNotDirectory(locale: AppLocale, path: string): string {
+  return locale === "en"
+    ? `working_directory path is not a directory: ${path}`
+    : `working_directory のパスはディレクトリではありません: ${path}`;
 }
 
 export function queueStopallExecuted(

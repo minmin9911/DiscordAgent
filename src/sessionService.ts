@@ -247,6 +247,7 @@ export class SessionService {
     return {
       ...session,
       preferred_working_directory: workingDirectory,
+      working_directory_override: session.working_directory_override,
     };
   }
 }

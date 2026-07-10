@@ -19,6 +19,7 @@ export interface SessionRow {
   sandbox_mode: SandboxMode | null;
   danger_full_access_until: string | null;
   preferred_working_directory: string | null;
+  working_directory_override: string | null;
   attach_instruction_sent_at: string | null;
   status: SessionStatus;
   created_by: string;

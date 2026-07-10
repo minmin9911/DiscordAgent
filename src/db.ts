@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   sandbox_mode TEXT,
   danger_full_access_until TEXT,
   preferred_working_directory TEXT,
+  working_directory_override TEXT,
   attach_instruction_sent_at TEXT,
   status TEXT NOT NULL CHECK (status IN ('active', 'archived', 'busy', 'error')),
   created_by TEXT NOT NULL,
@@ -169,6 +170,12 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
     );
     if (!hasPreferredWorkingDirectory) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN preferred_working_directory TEXT");
+    }
+    const hasWorkingDirectoryOverride = columns.some(
+      (c) => c.name === "working_directory_override",
+    );
+    if (!hasWorkingDirectoryOverride) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN working_directory_override TEXT");
     }
     const hasAttachInstructionSentAt = columns.some(
       (c) => c.name === "attach_instruction_sent_at",
@@ -352,6 +359,7 @@ FROM trigger_fires_old`);
              OR IFNULL(summary, '') LIKE @like
              OR IFNULL(codex_thread_id, '') LIKE @like
              OR IFNULL(preferred_working_directory, '') LIKE @like
+             OR IFNULL(working_directory_override, '') LIKE @like
            )
          ORDER BY last_used_at DESC
          LIMIT @limit`,
@@ -450,6 +458,12 @@ FROM trigger_fires_old`);
   setSessionPreferredWorkingDirectory(sessionId: string, workingDirectory: string): void {
     this.db
       .prepare("UPDATE sessions SET preferred_working_directory = ? WHERE id = ?")
+      .run(workingDirectory, sessionId);
+  }
+
+  setSessionWorkingDirectoryOverride(sessionId: string, workingDirectory: string | null): void {
+    this.db
+      .prepare("UPDATE sessions SET working_directory_override = ? WHERE id = ?")
       .run(workingDirectory, sessionId);
   }
 

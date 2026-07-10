@@ -59,6 +59,7 @@ import {
   usageQueue,
   usageSessionConnect,
   usageSessionRoot,
+  usageSessionWorkdir,
   usageSessionSwitch,
   usageSync,
   workingDirectoryInherited,
@@ -107,6 +108,11 @@ import {
   triggerEnvShowTitle,
   triggerEnvUserOnly,
   triggerEnvWorkdirCleared,
+  sessionWorkdirCleared,
+  sessionWorkdirPathMustBeAbsolute,
+  sessionWorkdirPathNotDirectory,
+  sessionWorkdirPathNotFound,
+  sessionWorkdirSet,
   triggerListEmpty,
   triggerListTitle,
   triggerNotFound,
@@ -141,6 +147,7 @@ import {
 import type { SandboxMode, SessionRow, TriggerRow, TriggerStatus } from "./types.js";
 import { truncateExternalUserMessage } from "./externalSyncText.js";
 import { loadModelCatalog, type ModelCatalogItem } from "./modelCatalog.js";
+import { resolveSessionWorkingDirectoryState } from "./sessionWorkingDirectory.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
@@ -856,10 +863,12 @@ export class DiscordCodexBot {
 
     if (sub === "new") {
       const previous = this.sessionService.getCurrentSession(contextKey);
-      const inheritedWorkingDirectory = previous?.preferred_working_directory
-        ?? (previous?.codex_thread_id
-          ? resolveWorkingDirectoryFromThreadId(previous.codex_thread_id)
-          : null);
+      const previousResolvedCwd = previous?.codex_thread_id
+        ? resolveWorkingDirectoryFromThreadId(previous.codex_thread_id)
+        : null;
+      const inheritedWorkingDirectory = previous
+        ? resolveSessionWorkingDirectoryState(previous, previousResolvedCwd).effectiveWorkingDirectory
+        : null;
       const created = this.sessionService.createAndBindSession({
         contextKey,
         requesterId: msg.author.id,
@@ -871,6 +880,52 @@ export class DiscordCodexBot {
         await msg.reply(workingDirectoryInherited(this.locale, inheritedWorkingDirectory));
       }
       await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(created)));
+      return;
+    }
+
+    if (sub === "workdir") {
+      const [actionRaw, ...pathParts] = rest;
+      const action = (actionRaw ?? "").toLowerCase();
+      const current = this.sessionService.getCurrentSession(contextKey);
+      if (!current) {
+        await msg.reply("ERR_ACTIVE_SESSION_NOT_FOUND");
+        return;
+      }
+      if (action === "clear") {
+        this.db.setSessionWorkingDirectoryOverride(current.id, null);
+        await msg.reply(sessionWorkdirCleared(this.locale));
+        return;
+      }
+      if (action === "set") {
+        const pathArg = pathParts.join(" ").trim();
+        if (!pathArg) {
+          await msg.reply(usageSessionWorkdir(this.locale));
+          return;
+        }
+        if (!isAbsolute(pathArg)) {
+          await msg.reply(sessionWorkdirPathMustBeAbsolute(this.locale));
+          return;
+        }
+        if (!existsSync(pathArg)) {
+          await msg.reply(sessionWorkdirPathNotFound(this.locale, pathArg));
+          return;
+        }
+        let stats;
+        try {
+          stats = statSync(pathArg);
+        } catch {
+          await msg.reply(sessionWorkdirPathNotFound(this.locale, pathArg));
+          return;
+        }
+        if (!stats.isDirectory()) {
+          await msg.reply(sessionWorkdirPathNotDirectory(this.locale, pathArg));
+          return;
+        }
+        this.db.setSessionWorkingDirectoryOverride(current.id, pathArg);
+        await msg.reply(sessionWorkdirSet(this.locale, pathArg));
+        return;
+      }
+      await msg.reply(usageSessionWorkdir(this.locale));
       return;
     }
 
@@ -987,13 +1042,12 @@ export class DiscordCodexBot {
       }
       const lockKey = this.getExecutionLockKey(current);
       const runtime = this.manager.getRuntimeState(lockKey);
-      const workingDirectory = current.codex_thread_id
-        ? (
-            resolveWorkingDirectoryFromThreadId(current.codex_thread_id)
-            ?? current.preferred_working_directory
-            ?? unknownValue(this.locale)
-          )
-        : (current.preferred_working_directory ?? notLinkedYet(this.locale));
+      const resolvedCodexCwd = current.codex_thread_id
+        ? resolveWorkingDirectoryFromThreadId(current.codex_thread_id)
+        : null;
+      const workingDirectoryState = resolveSessionWorkingDirectoryState(current, resolvedCodexCwd);
+      const workingDirectory = workingDirectoryState.baseWorkingDirectory
+        ?? (current.codex_thread_id ? unknownValue(this.locale) : notLinkedYet(this.locale));
       const lines = [
         `codex_thread_id: ${current.codex_thread_id ?? notLinkedYet(this.locale)}`,
         `model: ${current.model_override ?? "default"}`,
@@ -1005,6 +1059,9 @@ export class DiscordCodexBot {
         `queue_length: ${runtime.queueLength}`,
         `last_used_at: ${current.last_used_at}`,
       ];
+      if (workingDirectoryState.overrideWorkingDirectory) {
+        lines.splice(5, 0, `working_directory_override: ${workingDirectoryState.overrideWorkingDirectory}`);
+      }
       if (runtime.runningSince) lines.push(`running_since: ${runtime.runningSince}`);
       await msg.reply(lines.join("\n"));
       return;
@@ -1235,6 +1292,7 @@ export class DiscordCodexBot {
           sandboxMode,
           additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
           preferredWorkingDirectory: session.preferred_working_directory,
+          forceWorkingDirectory: session.working_directory_override,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onEvent: async (event) => {
             if (finalized) return;
@@ -1486,6 +1544,15 @@ export class DiscordCodexBot {
           retryCount: retries,
         });
         this.sessionService.touchSession(session.id);
+        if (status === "success" && !storedThreadIdAtStart && session.working_directory_override) {
+          this.db.setSessionPreferredWorkingDirectory(
+            session.id,
+            session.working_directory_override,
+          );
+          this.db.setSessionWorkingDirectoryOverride(session.id, null);
+          session.preferred_working_directory = session.working_directory_override;
+          session.working_directory_override = null;
+        }
         this.logger.info(
           { executionId, sessionId: session.id, status, retries, errorCode },
           "execution finished",
@@ -1780,6 +1847,7 @@ export class DiscordCodexBot {
     const sessions = this.db.listSessionsByCodexThreadId(trigger.codex_thread_id);
     const session = sessions[0] ?? null;
     const effectiveWorkingDirectory = trigger.working_directory_override
+      ?? session?.working_directory_override
       ?? resolveCodexWorkingDirectory({
         codexThreadId: trigger.codex_thread_id,
         preferredWorkingDirectory: session?.preferred_working_directory ?? null,
@@ -2589,6 +2657,7 @@ export class DiscordCodexBot {
           sandboxMode,
           additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
           preferredWorkingDirectory: session.preferred_working_directory,
+          forceWorkingDirectory: session.working_directory_override,
           includeDiscordAgentSystemPrompt: false,
         });
         if (!runResult.ok) {
@@ -3863,9 +3932,9 @@ export class DiscordCodexBot {
           codexThreadId: session.codex_thread_id,
           modelOverride: session.model_override,
           sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
-          preferredWorkingDirectory:
-            trigger.working_directory_override ?? session.preferred_working_directory,
-          forceWorkingDirectory: trigger.working_directory_override,
+          preferredWorkingDirectory: session.preferred_working_directory,
+          forceWorkingDirectory:
+            trigger.working_directory_override ?? session.working_directory_override,
           includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
           onAgentMessage: async ({ text }) => {
             streamAgentMessages.push(text);

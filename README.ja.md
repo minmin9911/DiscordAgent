@@ -191,9 +191,27 @@ Agent は必要に応じてこのコマンドを自発的に利用できます�
 
   * 現在のCodexセッションとの接続を切り、新規のCodexセッションを割り当てます。`[name]` はDiscord Agent内での管理用のセッション名称です（未使用）。
 
+* `!session workdir set <absolute_path>`
+
+  * 現在のセッションで使う `working_directory` を、任意のディレクトリに変更します。
+
+  * 既に Codex セッションが割り当てられている場合は、以後 DiscordAgent からの実行に対してこの設定が優先されます。
+
+  * まだ Codex セッションが割り当てられていない場合は、次回最初の Codex 起動時にこのディレクトリが採用され、その後は通常の `working_directory` として引き継がれます。
+
+* `!session workdir clear`
+
+  * `!session workdir set` で設定した上書きを解除します。
+
 * `!session current`
 
   * 現在のDiscordスレッドに設定されているCodexの各種情報、`codex_thread_id` / `working_directory` / `status` / `queue` などを表示
+
+  * `working_directory_override` が設定されている場合は、元の `working_directory` とあわせて表示されます。
+
+* `!session connect <codex_thread_id>`
+
+  * 既存の Codex セッションに接続し直す場合、`working_directory` の上書きは自動適用されません。必要なら接続後に `!session workdir set ...` を実行してください。
 
 * `!model`
 

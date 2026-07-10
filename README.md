@@ -128,7 +128,17 @@ Notes:
 ### Session Management
 
 - `!session new [name]`
+- `!session workdir set <absolute_path>`
+  - Changes the `working_directory` used by the current session to any directory.
+  - If a Codex session is already linked, this override takes priority for future executions sent through DiscordAgent.
+  - If no Codex session is linked yet, this directory is used for the next initial Codex launch and is then carried forward as the normal `working_directory`.
+- `!session workdir clear`
+  - Clears the override set by `!session workdir set`.
 - `!session current`
+  - Show the current session state.
+  - If `working_directory_override` is set, both the base `working_directory` and the override are shown.
+- `!session connect <codex_thread_id>`
+  - When reconnecting to an existing Codex session, the working-directory override is not applied automatically. If needed, run `!session workdir set ...` after connecting.
 - `!model`
   - Show available models for the current session.
 - `!model <no>`

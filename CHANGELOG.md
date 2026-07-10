@@ -4,7 +4,8 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
-## v0.1.0 build.79 (2026-07-09)
+## v0.1.0 build.80 (2026-07-10)
+- Added support for changing a session's working directory to any directory. Supports `!session workdir set <absolute_path>` / `!session workdir clear`, and `!session current` now shows the current setting.
 - Add `!stopall` and `!allstop` as shorthand aliases for `!queue stopall`.
 - Extend `!ok` to accept prompt-attached forms: `!ok <minutes> <prompt>` and `!ok <prompt>`.
 - Improve suppression for cases where External Sync could incorrectly treat non-external messages as external. This is improved but not yet fully eliminated.

@@ -209,12 +209,48 @@ function parseCwdFromSessionMeta(sessionFile: string): string | null {
   return null;
 }
 
+function parseWorkspaceRootFromEnvironmentContext(sessionFile: string): string | null {
+  const text = readFileSync(sessionFile, "utf8");
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  const rootRe = /<workspace_roots>\s*<root>(.*?)<\/root>[\s\S]*?<\/workspace_roots>/i;
+
+  for (const line of lines.slice(0, 80)) {
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>;
+      if (obj.type !== "response_item") continue;
+      if (!obj.payload || typeof obj.payload !== "object") continue;
+      const payload = obj.payload as Record<string, unknown>;
+      if (payload.type !== "message" || payload.role !== "user") continue;
+      if (!Array.isArray(payload.content)) continue;
+      for (const item of payload.content) {
+        if (!item || typeof item !== "object") continue;
+        const part = item as Record<string, unknown>;
+        if (typeof part.text !== "string") continue;
+        const match = part.text.match(rootRe);
+        if (match?.[1]?.trim()) {
+          return match[1].trim();
+        }
+      }
+    } catch {
+      // ignore non-json lines
+    }
+  }
+  return null;
+}
+
+export function resolveWorkingDirectoryFromSessionFile(sessionFile: string): string | null {
+  return (
+    parseWorkspaceRootFromEnvironmentContext(sessionFile)
+    ?? parseCwdFromSessionMeta(sessionFile)
+  );
+}
+
 function parseSessionMeta(sessionFile: string): CodexSessionMeta | null {
   const text = readFileSync(sessionFile, "utf8");
   const lines = text.split(/\r?\n/).filter(Boolean);
 
   let threadId: string | null = null;
-  let cwd: string | null = null;
+  let cwd = resolveWorkingDirectoryFromSessionFile(sessionFile);
   let summary: string | null = null;
   const searchPieces: string[] = [];
 
@@ -383,7 +419,7 @@ export function resolveWorkingDirectoryFromThreadId(
     cwdCache.set(threadId, null);
     return null;
   }
-  const cwd = parseCwdFromSessionMeta(sessionFile);
+  const cwd = resolveWorkingDirectoryFromSessionFile(sessionFile);
   cwdCache.set(threadId, cwd);
   return cwd;
 }

@@ -4,6 +4,9 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.82 (2026-07-11)
+- Change Codex session working-directory resolution to prefer `workspace_roots`. Some existing sessions may therefore use a different working directory than before; check with `!session current` if needed.
+
 ## v0.1.0 build.80 (2026-07-10)
 - Added support for changing a session's working directory to any directory. Supports `!session workdir set <absolute_path>` / `!session workdir clear`, and `!session current` now shows the current setting.
 - Add `!stopall` and `!allstop` as shorthand aliases for `!queue stopall`.

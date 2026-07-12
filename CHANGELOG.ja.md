@@ -4,6 +4,9 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.82 (2026-07-11)
+- Codex セッションの working_directory 解決を `workspace_roots` 優先に変更。これまでと異なる working_directory が採用される既存セッションが一部にあるため、必要に応じて `!session current` で確認してください。
+
 ## v0.1.0 build.80 (2026-07-10)
 - セッションごとに、ワーキングディレクトリを任意のディレクトリへ変更できるようにしました。`!session workdir set <absolute_path>` / `!session workdir clear` に対応し、`!session current` で現在の設定を確認できます。
 - `!queue stopall` の短縮コマンドとして `!stopall` / `!allstop` を追加。

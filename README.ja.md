@@ -33,6 +33,13 @@ Discordのチャンネルやスレッドごとに別のCodexのセッション�
 
 * Edgeブラウザのサイドバーでdiscord.comを開くことで、ブラウズしながら、いつでもCodexを秘書として活用できます。
 
+## Subagent
+
+- Codex の subagent 機能も利用できます。
+  - DiscordAgent からは `/subagent` などのスラッシュコマンドは使えません。
+  - subagent の一覧取得や専用管理機能はないため、必要な情報は親 Agent に確認してください。
+  - 複数セッションをまたいで使う永続的な subagent を作成した場合は、親 Agent から返された子 Agent の識別子を `!codex session <id>` で Discord スレッドに割り当てることで、その subagent の動作を見たり、直接会話したりできます。
+
 ## 前提
 
 * Node.js 20+（Windowsネイティブ）

@@ -587,8 +587,16 @@ export class DiscordCodexBot {
       this.discardPendingApprovalForNewPrompt(contextKey);
       await this.handleExecutionMessage(msg, content);
     } finally {
+      this.cacheContextNameForMessage(contextKey, msg);
       this.db.setContextCursor(contextKey, msg.id);
     }
+  }
+
+  private cacheContextNameForMessage(contextKey: string, msg: Message): void {
+    const channel = msg.channel as Message["channel"] & { name?: unknown };
+    const rawName = typeof channel.name === "string" ? channel.name.trim() : "";
+    if (!rawName) return;
+    this.db.setContextNameCached(contextKey, rawName);
   }
 
   private async recoverUnreadForAllContexts(reason: string): Promise<void> {

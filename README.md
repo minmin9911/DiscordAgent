@@ -23,6 +23,13 @@ Codex can also return files to Discord by emitting `!attach <absolute_path>`.
 - Coordinate travel plans and write back to Google Docs through separate Skills
 - Keep Discord open in the Edge sidebar and use Codex as an always-available assistant while browsing
 
+## Subagents
+
+- You can also use Codex subagents.
+  - Slash commands such as `/subagent` are not available through DiscordAgent.
+  - There is no subagent list view or dedicated management UI, so ask the parent agent when you need subagent information.
+  - If you create a persistent subagent that you use across multiple sessions, you can assign the child agent identifier returned by the parent agent to a Discord thread with `!codex session <id>` and then watch that subagent's activity or talk to it directly.
+
 ## Requirements
 
 - Node.js 20+ on Windows

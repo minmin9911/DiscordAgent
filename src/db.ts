@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS context_bindings (
   context_key TEXT PRIMARY KEY,
   active_session_id TEXT NOT NULL,
+  context_name_cached TEXT,
   updated_at TEXT NOT NULL,
   FOREIGN KEY(active_session_id) REFERENCES sessions(id)
 );
@@ -196,6 +197,15 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
     );
     if (!hasDangerFullAccessUntil) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN danger_full_access_until TEXT");
+    }
+    const contextBindingColumns = this.db
+      .prepare("PRAGMA table_info(context_bindings)")
+      .all() as Array<{ name: string }>;
+    const hasContextNameCached = contextBindingColumns.some(
+      (c) => c.name === "context_name_cached",
+    );
+    if (!hasContextNameCached) {
+      this.db.exec("ALTER TABLE context_bindings ADD COLUMN context_name_cached TEXT");
     }
     const triggerColumns = this.db.prepare("PRAGMA table_info(triggers)").all() as Array<{
       name: string;
@@ -381,6 +391,21 @@ FROM trigger_fires_old`);
         active_session_id: sessionId,
         updated_at: nowIso(),
       });
+  }
+
+  setContextNameCached(contextKey: string, contextName: string | null): void {
+    this.db
+      .prepare(
+        "UPDATE context_bindings SET context_name_cached = ? WHERE context_key = ?",
+      )
+      .run(contextName, contextKey);
+  }
+
+  getContextNameCached(contextKey: string): string | null {
+    const row = this.db
+      .prepare("SELECT context_name_cached FROM context_bindings WHERE context_key = ?")
+      .get(contextKey) as { context_name_cached: string | null } | undefined;
+    return row?.context_name_cached ?? null;
   }
 
   getBoundSession(contextKey: string): SessionRow | null {

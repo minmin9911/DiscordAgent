@@ -19,7 +19,11 @@ import { SessionService } from "./sessionService.js";
 import { ExecutionManager } from "./executionManager.js";
 import { maskSecrets } from "./mask.js";
 import { parseOkCommandBody } from "./okCommand.js";
-import { CodexAdapter, resolveCodexWorkingDirectory } from "./codexAdapter.js";
+import {
+  CodexAdapter,
+  resolveCodexWorkingDirectory,
+  type CodexResult,
+} from "./codexAdapter.js";
 import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
 import {
@@ -131,7 +135,9 @@ import {
 import {
   buildExternalSyncEventMsgId,
   buildExternalSyncEventSignature,
+  readCodexThreadCompletedTurnsSinceLine,
   readCodexThreadEventsSinceLine,
+  readCodexThreadStartedTurnsSinceLine,
 } from "./codexExternalSync.js";
 import { ATTACH_MAX_BYTES, extractAttachPaths } from "./attachPolicy.js";
 import {
@@ -320,6 +326,14 @@ function extractHelpAgentCommands(output: string): { commands: string[]; cleaned
   };
 }
 
+interface LocalExternalSyncAttempt {
+  executionId: string;
+  codexThreadId: string;
+  startLineNo: number;
+  startedAtMs: number;
+  expectedPromptNormalized: string;
+}
+
 export class DiscordCodexBot {
   private readonly logger: pino.Logger;
   private readonly client = new Client({
@@ -348,6 +362,7 @@ export class DiscordCodexBot {
       expiresAtMs: number;
     }
   >();
+  private readonly activeLocalSyncRuns = new Map<string, number>();
   private readonly externalChannelResolveCache = new Map<string, ExternalChannelResolveCache>();
   private externalSyncEnabled = appConfig.externalSyncEnabled;
   private externalSyncRunning = false;
@@ -1189,6 +1204,7 @@ export class DiscordCodexBot {
     const executionLockKey = this.getExecutionLockKey(session);
     const storedThreadIdAtStart = session.codex_thread_id ?? null;
     let observedThreadId: string | null = storedThreadIdAtStart;
+    let lateLocalSyncAttempt: LocalExternalSyncAttempt | null = null;
     let threadSwitchNotice: string | null = null;
     let threadSwitchAnnounced = false;
     const applyObservedThreadId = async (
@@ -1201,6 +1217,12 @@ export class DiscordCodexBot {
       if (change.kind === "none") return;
       this.db.setSessionCodexThreadId(session.id, change.nextThreadId);
       session.codex_thread_id = change.nextThreadId;
+      lateLocalSyncAttempt ??= this.beginLocalExternalSyncAttempt(
+        change.nextThreadId,
+        executionId,
+        prompt,
+        0,
+      );
       this.addLocalSyncSuppressionText(change.nextThreadId, "user_message", content);
       if (change.kind === "bound") {
         this.logger.info(
@@ -1292,17 +1314,23 @@ export class DiscordCodexBot {
           },
           "execution started",
         );
-        const runResult = await this.codex.run({
-          prompt,
-          sessionId: session.id,
-          codexThreadId: session.codex_thread_id,
-          modelOverride: session.model_override,
-          sandboxMode,
-          additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
-          preferredWorkingDirectory: session.preferred_working_directory,
-          forceWorkingDirectory: session.working_directory_override,
-          includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
-          onEvent: async (event) => {
+        const runResult = await (async () => {
+          try {
+            return await this.runCodexWithLocalExternalSyncTracking(
+              session.codex_thread_id,
+              executionId,
+              prompt,
+              () => this.codex.run({
+                prompt,
+                sessionId: session.id,
+                codexThreadId: session.codex_thread_id,
+                modelOverride: session.model_override,
+                sandboxMode,
+                additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
+                preferredWorkingDirectory: session.preferred_working_directory,
+                forceWorkingDirectory: session.working_directory_override,
+                includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
+                onEvent: async (event) => {
             if (finalized) return;
             if (event.threadId) {
               await applyObservedThreadId(event.threadId, "event");
@@ -1423,8 +1451,8 @@ export class DiscordCodexBot {
                 ),
               );
             }
-          },
-          onAgentMessage: async ({ itemId, text }) => {
+                },
+                onAgentMessage: async ({ itemId, text }) => {
             if (finalized) return;
             if (seenAgentItemIds.has(itemId)) return;
             seenAgentItemIds.add(itemId);
@@ -1450,14 +1478,14 @@ export class DiscordCodexBot {
                 ),
               ),
             );
-          },
-          onStdErrLine: async (line) => {
+                },
+                onStdErrLine: async (line) => {
             this.logger.debug(
               { executionId, sessionId: session.id, line },
               "codex stderr stream line",
             );
-          },
-          onClose: async ({ code, signal }) => {
+                },
+                onClose: async ({ code, signal }) => {
             this.logger.info(
               {
                 executionId,
@@ -1468,8 +1496,8 @@ export class DiscordCodexBot {
               },
               "codex process closed",
             );
-          },
-          onLifecycle: async ({ type, source, graceMs }) => {
+                },
+                onLifecycle: async ({ type, source, graceMs }) => {
             this.logger.info(
               {
                 executionId,
@@ -1481,8 +1509,14 @@ export class DiscordCodexBot {
               },
               "codex lifecycle event",
             );
-          },
-        });
+                },
+              }),
+            );
+          } finally {
+            this.finishLocalExternalSyncAttempt(lateLocalSyncAttempt);
+            lateLocalSyncAttempt = null;
+          }
+        })();
         this.logger.info(
           {
             executionId,
@@ -1819,6 +1853,7 @@ export class DiscordCodexBot {
     let index = 1;
     for (const section of sections) {
       if (section.items.length === 0) continue;
+      if (lines.length > 0) lines.push("");
       lines.push(`${section.mark} ${section.label} (${section.items.length})`);
       for (const trigger of section.items) {
         const codex = listFull
@@ -2657,17 +2692,22 @@ export class DiscordCodexBot {
       onProgress: async () => {},
       run: async () => {
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
-        const runResult = await this.codex.run({
-          prompt: promptText,
-          sessionId: session.id,
-          codexThreadId: threadId,
-          modelOverride: session.model_override,
-          sandboxMode,
-          additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
-          preferredWorkingDirectory: session.preferred_working_directory,
-          forceWorkingDirectory: session.working_directory_override,
-          includeDiscordAgentSystemPrompt: false,
-        });
+        const runResult = await this.runCodexWithLocalExternalSyncTracking(
+          threadId,
+          executionId,
+          promptText,
+          () => this.codex.run({
+            prompt: promptText,
+            sessionId: session.id,
+            codexThreadId: threadId,
+            modelOverride: session.model_override,
+            sandboxMode,
+            additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
+            preferredWorkingDirectory: session.preferred_working_directory,
+            forceWorkingDirectory: session.working_directory_override,
+            includeDiscordAgentSystemPrompt: false,
+          }),
+        );
         if (!runResult.ok) {
           return {
             status: runResult.timedOut ? ("timeout" as const) : ("error" as const),
@@ -3412,6 +3452,136 @@ export class DiscordCodexBot {
     return anchored;
   }
 
+  private beginLocalExternalSyncAttempt(
+    codexThreadId: string | null | undefined,
+    executionId: string,
+    expectedPrompt: string,
+    startLineNoOverride?: number,
+  ): LocalExternalSyncAttempt | null {
+    const threadId = codexThreadId?.trim();
+    if (!threadId) return null;
+    const read = readCodexThreadEventsSinceLine(threadId, Number.MAX_SAFE_INTEGER);
+    const activeCount = this.activeLocalSyncRuns.get(threadId) ?? 0;
+    this.activeLocalSyncRuns.set(threadId, activeCount + 1);
+    const attempt = {
+      executionId,
+      codexThreadId: threadId,
+      startLineNo: startLineNoOverride ?? (read.sourceFound ? read.latestLineNo : 0),
+      startedAtMs: Date.now(),
+      expectedPromptNormalized: this.normalizeSuppressionText(expectedPrompt),
+    };
+    this.logger.debug(
+      {
+        executionId,
+        codexThreadId: threadId,
+        startLineNo: attempt.startLineNo,
+      },
+      "local external sync turn tracking started",
+    );
+    return attempt;
+  }
+
+  private finishLocalExternalSyncAttempt(attempt: LocalExternalSyncAttempt | null): void {
+    if (!attempt) return;
+    try {
+      const read = readCodexThreadStartedTurnsSinceLine(
+        attempt.codexThreadId,
+        attempt.startLineNo,
+      );
+      const candidates = read.turns.filter((turn) => turn.startLineNo > attempt.startLineNo);
+      const promptMatches = candidates.filter((turn) => {
+        if (!turn.userMessage || !attempt.expectedPromptNormalized) return false;
+        const actual = this.normalizeSuppressionText(turn.userMessage);
+        return actual === attempt.expectedPromptNormalized
+          || actual.endsWith(attempt.expectedPromptNormalized);
+      });
+      if (attempt.expectedPromptNormalized && promptMatches.length === 0) {
+        this.logger.warn(
+          {
+            executionId: attempt.executionId,
+            codexThreadId: attempt.codexThreadId,
+            startLineNo: attempt.startLineNo,
+            candidateCount: candidates.length,
+          },
+          "local external sync turn prompt did not match",
+        );
+        return;
+      }
+      const rankedCandidates = promptMatches.length > 0 ? promptMatches : candidates;
+      rankedCandidates.sort((a, b) => {
+        const aDistance = a.occurredAtMs === null
+          ? Number.MAX_SAFE_INTEGER
+          : Math.abs(a.occurredAtMs - attempt.startedAtMs);
+        const bDistance = b.occurredAtMs === null
+          ? Number.MAX_SAFE_INTEGER
+          : Math.abs(b.occurredAtMs - attempt.startedAtMs);
+        if (aDistance !== bDistance) return aDistance - bDistance;
+        return a.startLineNo - b.startLineNo;
+      });
+      const turn = rankedCandidates[0];
+      if (!turn) {
+        this.logger.warn(
+          {
+            executionId: attempt.executionId,
+            codexThreadId: attempt.codexThreadId,
+            startLineNo: attempt.startLineNo,
+            latestLineNo: read.latestLineNo,
+          },
+          "local external sync turn was not completed",
+        );
+        return;
+      }
+      this.db.markExternalSyncEventSeen(
+        attempt.codexThreadId,
+        `turn:${turn.turnId}:user`,
+      );
+      this.db.markExternalSyncEventSeen(
+        attempt.codexThreadId,
+        `turn:${turn.turnId}:agent`,
+      );
+      for (const eventId of turn.eventIds) {
+        this.db.markExternalSyncEventSeen(attempt.codexThreadId, eventId);
+      }
+      this.logger.info(
+        {
+          executionId: attempt.executionId,
+          codexThreadId: attempt.codexThreadId,
+          turnId: turn.turnId,
+          startLineNo: turn.startLineNo,
+          completeLineNo: turn.completeLineNo,
+          origin: "local",
+          action: "suppress",
+        },
+        "external sync turn classified",
+      );
+    } finally {
+      const activeCount = this.activeLocalSyncRuns.get(attempt.codexThreadId) ?? 0;
+      if (activeCount <= 1) {
+        this.activeLocalSyncRuns.delete(attempt.codexThreadId);
+      } else {
+        this.activeLocalSyncRuns.set(attempt.codexThreadId, activeCount - 1);
+      }
+    }
+  }
+
+  private async runCodexWithLocalExternalSyncTracking(
+    codexThreadId: string | null | undefined,
+    executionId: string,
+    expectedPrompt: string,
+    run: () => Promise<CodexResult>,
+  ): Promise<CodexResult> {
+    const attempt = this.beginLocalExternalSyncAttempt(
+      codexThreadId,
+      executionId,
+      expectedPrompt,
+    );
+    try {
+      return await run();
+    } finally {
+      this.finishLocalExternalSyncAttempt(attempt);
+    }
+  }
+
   private normalizeSuppressionText(text: string): string {
     return text.replace(/\s+/g, " ").trim();
   }
@@ -3591,27 +3761,123 @@ export class DiscordCodexBot {
       occurredAtMs: number | null;
     }>;
   } | null {
+    if ((this.activeLocalSyncRuns.get(codexThreadId) ?? 0) > 0) {
+      this.logger.debug(
+        { reason, codexThreadId, action: "defer" },
+        "external sync deferred for active local run",
+      );
+      return null;
+    }
     const cursor = this.db.getExternalSyncCursor(codexThreadId);
-    const read = readCodexThreadEventsSinceLine(codexThreadId, cursor ?? 0);
-    if (!read.sourceFound) return null;
+    const turnRead = readCodexThreadCompletedTurnsSinceLine(codexThreadId, cursor ?? 0);
+    if (!turnRead.sourceFound) return null;
 
     if (cursor === null) {
-      this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+      this.db.setExternalSyncCursor(codexThreadId, turnRead.latestLineNo);
       this.logger.info(
-        { reason, codexThreadId, latestLineNo: read.latestLineNo },
+        { reason, codexThreadId, latestLineNo: turnRead.latestLineNo },
         "external sync anchored thread (future-only)",
       );
       return null;
     }
 
-    if (read.latestLineNo < cursor) {
-      this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
+    if (turnRead.latestLineNo < cursor) {
+      this.db.setExternalSyncCursor(codexThreadId, turnRead.latestLineNo);
       this.logger.warn(
-        { reason, codexThreadId, prevLineNo: cursor, latestLineNo: read.latestLineNo },
+        {
+          reason,
+          codexThreadId,
+          prevLineNo: cursor,
+          latestLineNo: turnRead.latestLineNo,
+        },
         "external sync cursor moved backward; re-anchored to latest",
       );
       return null;
     }
+
+    if (turnRead.hasTaskBoundary || turnRead.turns.length > 0) {
+      if (turnRead.turns.length === 0) return null;
+      const contextKeys = this.db.listContextKeysByCodexThreadId(codexThreadId);
+      if (contextKeys.length === 0) {
+        this.db.setExternalSyncCursor(codexThreadId, turnRead.latestCompleteLineNo);
+        return null;
+      }
+      const turnEvents = turnRead.turns.flatMap((turn) => {
+        const events: Array<{
+          eventId: string;
+          itemType: "user_message" | "agent_message";
+          text: string;
+          lineNo: number;
+          occurredAtMs: number | null;
+        }> = [];
+        if (turn.userMessage?.trim()) {
+          events.push({
+            eventId: `turn:${turn.turnId}:user`,
+            itemType: "user_message",
+            text: turn.userMessage,
+            lineNo: turn.startLineNo,
+            occurredAtMs: turn.occurredAtMs,
+          });
+        }
+        if (turn.finalAgentMessage?.trim()) {
+          events.push({
+            eventId: `turn:${turn.turnId}:agent`,
+            itemType: "agent_message",
+            text: turn.finalAgentMessage,
+            lineNo: turn.completeLineNo,
+            occurredAtMs: turn.occurredAtMs,
+          });
+        }
+        return events;
+      });
+      const pendingEvents = turnEvents.filter((event) => {
+        if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
+        if (event.text.includes(INTERNAL_SYNC_MARKER)) {
+          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+          return false;
+        }
+        if (this.shouldSuppressLocalSyncEvent(
+          codexThreadId,
+          event.itemType,
+          event.text,
+        )) {
+          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+          return false;
+        }
+        return true;
+      });
+      if (pendingEvents.length === 0) {
+        this.db.setExternalSyncCursor(codexThreadId, turnRead.latestCompleteLineNo);
+        return null;
+      }
+      const broadcastTurnIds = new Set(
+        pendingEvents.map((event) => event.eventId.split(":").slice(1, -1).join(":")),
+      );
+      for (const turn of turnRead.turns) {
+        if (!broadcastTurnIds.has(turn.turnId)) continue;
+        this.logger.info(
+          {
+            codexThreadId,
+            turnId: turn.turnId,
+            startLineNo: turn.startLineNo,
+            completeLineNo: turn.completeLineNo,
+            origin: "external",
+            action: "broadcast",
+          },
+          "external sync turn classified",
+        );
+      }
+      return {
+        codexThreadId,
+        contextKeys,
+        latestLineNo: turnRead.latestCompleteLineNo,
+        events: pendingEvents,
+      };
+    }
+
+    // Older JSONL variants without task boundaries retain the original line-based fallback.
+    const read = readCodexThreadEventsSinceLine(codexThreadId, cursor ?? 0);
+    if (!read.sourceFound) return null;
 
     if (read.events.length === 0) {
       if (read.latestLineNo !== cursor) {
@@ -3626,34 +3892,34 @@ export class DiscordCodexBot {
       return null;
     }
 
-      const pendingEvents = read.events.filter((event) => {
-        if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
-        if (event.stableEventId && this.db.hasExternalSyncEventSeen(codexThreadId, event.stableEventId)) {
-          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+    const pendingEvents = read.events.filter((event) => {
+      if (this.db.hasExternalSyncEventSeen(codexThreadId, event.eventId)) return false;
+      if (event.stableEventId && this.db.hasExternalSyncEventSeen(codexThreadId, event.stableEventId)) {
+        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+        this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
+        return false;
+      }
+      if (event.text.includes(INTERNAL_SYNC_MARKER)) {
+        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+        if (event.stableEventId) {
           this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
-          return false;
         }
-        if (event.text.includes(INTERNAL_SYNC_MARKER)) {
-          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
-          if (event.stableEventId) {
-            this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
-          }
-          return false;
+        return false;
+      }
+      if (this.shouldSuppressLocalSyncEvent(
+        codexThreadId,
+        event.itemType,
+        event.text,
+        event.eventSignature,
+      )) {
+        this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
+        if (event.stableEventId) {
+          this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
         }
-        if (this.shouldSuppressLocalSyncEvent(
-          codexThreadId,
-          event.itemType,
-          event.text,
-          event.eventSignature,
-        )) {
-          this.db.markExternalSyncEventSeen(codexThreadId, event.eventId);
-          if (event.stableEventId) {
-            this.db.markExternalSyncEventSeen(codexThreadId, event.stableEventId);
-          }
-          return false;
-        }
-        return true;
-      });
+        return false;
+      }
+      return true;
+    });
     if (pendingEvents.length === 0) {
       this.db.setExternalSyncCursor(codexThreadId, read.latestLineNo);
       return null;
@@ -3934,21 +4200,26 @@ export class DiscordCodexBot {
           this.db.markAttachInstructionSent(session.id);
           session.attach_instruction_sent_at = new Date().toISOString();
         }
-        const result = await this.codex.run({
-          prompt: trigger.prompt,
-          sessionId: session.id,
-          codexThreadId: session.codex_thread_id,
-          modelOverride: session.model_override,
-          sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
-          preferredWorkingDirectory: session.preferred_working_directory,
-          forceWorkingDirectory:
-            trigger.working_directory_override ?? session.working_directory_override,
-          includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
-          onAgentMessage: async ({ text }) => {
-            streamAgentMessages.push(text);
-            this.addLocalSyncSuppressionText(trigger.codex_thread_id, "agent_message", text);
-          },
-        });
+        const result = await this.runCodexWithLocalExternalSyncTracking(
+          trigger.codex_thread_id,
+          executionId,
+          trigger.prompt,
+          () => this.codex.run({
+            prompt: trigger.prompt,
+            sessionId: session.id,
+            codexThreadId: session.codex_thread_id,
+            modelOverride: session.model_override,
+            sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
+            preferredWorkingDirectory: session.preferred_working_directory,
+            forceWorkingDirectory:
+              trigger.working_directory_override ?? session.working_directory_override,
+            includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
+            onAgentMessage: async ({ text }) => {
+              streamAgentMessages.push(text);
+              this.addLocalSyncSuppressionText(trigger.codex_thread_id, "agent_message", text);
+            },
+          }),
+        );
         if (!result.ok) {
           return {
             status: result.timedOut ? ("timeout" as const) : ("error" as const),

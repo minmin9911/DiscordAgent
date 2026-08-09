@@ -4,6 +4,11 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.85 (2026-08-09)
+- External Sync の判定をCodexターン単位へ見直し、DiscordAgent経由で実行したメッセージが `[External ...]` として二重表示される問題を大幅に抑制しました。外部クライアントの更新は、Codexターンの完了を確認してから、ユーザー入力と最終回答のみを同期します。
+- Codexが空の `agent_message` を返した場合に、内部JSONを本文として表示しないよう修正しました。
+- `!model` の一覧を更新し、GPT-5.6 Terra / Luna の最新料金目安を反映しました。利用対象外となった `gpt-5.4-mini` は一覧から削除しました。
+
 ## v0.1.0 build.82 (2026-07-11)
 - Codex セッションの working_directory 解決を `workspace_roots` 優先に変更。これまでと異なる working_directory が採用される既存セッションが一部にあるため、必要に応じて `!session current` で確認してください。
 

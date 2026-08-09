@@ -30,10 +30,8 @@ export interface CodexStreamEvent {
 function extractEventMsgAgentMessage(
   obj: Record<string, unknown>,
 ): { itemId: string; text: string } | null {
-  if (obj.type !== "event_msg") return null;
-  if (!obj.payload || typeof obj.payload !== "object") return null;
+  if (!isEventMsgAgentMessage(obj)) return null;
   const payload = obj.payload as Record<string, unknown>;
-  if (payload.type !== "agent_message") return null;
   const message = payload.message;
   if (typeof message !== "string" || !message.trim()) return null;
   const timestamp = typeof obj.timestamp === "string" ? obj.timestamp : "unknown";
@@ -41,6 +39,13 @@ function extractEventMsgAgentMessage(
     itemId: `event_msg:agent_message:${timestamp}:${message.length}`,
     text: message,
   };
+}
+
+function isEventMsgAgentMessage(obj: Record<string, unknown>): boolean {
+  if (obj.type !== "event_msg") return false;
+  if (!obj.payload || typeof obj.payload !== "object") return false;
+  const payload = obj.payload as Record<string, unknown>;
+  return payload.type === "agent_message" && typeof payload.message === "string";
 }
 
 export type CodexSandboxMode = "workspace-write" | "danger-full-access";
@@ -100,6 +105,18 @@ export function isCodexRuntimeCommandLine(commandLine: string | null | undefined
     || normalized.includes("@openai/codex/bin/codex.js")
     || normalized.includes("codex.cmd exec")
     || normalized.includes(" codex exec ");
+}
+
+export function selectCodexUserOutput(input: {
+  agentMessages: string[];
+  hasAgentMessage: boolean;
+  fallback: string;
+}): string {
+  if (input.hasAgentMessage) {
+    // 空文字も Codex が正常に agent_message を返した結果として扱う。
+    return input.agentMessages.join("\n").trim();
+  }
+  return input.fallback || "(no output)";
 }
 
 export class CodexAdapter {
@@ -338,7 +355,7 @@ export class CodexAdapter {
         const fallback = this.sanitizeOutput(
           [stdout, stderr].filter(Boolean).join("\n").trim(),
         );
-        if (parsed.agentMessages.length === 0 && fallback.length === 0) {
+        if (!parsed.hasAgentMessage && fallback.length === 0) {
           resolve({
             ok: false,
             output: "No output from codex.",
@@ -346,7 +363,7 @@ export class CodexAdapter {
           });
           return;
         }
-        if (parsed.errors.length > 0 && parsed.agentMessages.length === 0) {
+        if (parsed.errors.length > 0 && !parsed.hasAgentMessage) {
           resolve({
             ok: false,
             output: parsed.errors.join("\n"),
@@ -360,7 +377,11 @@ export class CodexAdapter {
         const mergedWarnings = parsed.errors.length > 0
           ? [...parsed.warnings, ...parsed.errors]
           : parsed.warnings;
-        const output = this.selectUserOutput(parsed.agentMessages, fallback);
+        const output = this.selectUserOutput(
+          parsed.agentMessages,
+          fallback,
+          parsed.hasAgentMessage,
+        );
         const outputWithCode = code && code !== 0 && !forcedCloseAfterLogicalComplete
           ? `${output}\n\n[warning] codex exited with code ${code}, but a response was received.`
           : output;
@@ -565,6 +586,7 @@ export class CodexAdapter {
   private parseJsonl(raw: string): {
     threadId?: string;
     agentMessages: string[];
+    hasAgentMessage: boolean;
     warnings: string[];
     errors: string[];
   } {
@@ -575,6 +597,7 @@ export class CodexAdapter {
     const agentMessages: string[] = [];
     const warnings: string[] = [];
     const errors: string[] = [];
+    let hasAgentMessage = false;
     let threadId: string | undefined;
 
     for (const line of lines) {
@@ -584,14 +607,18 @@ export class CodexAdapter {
           threadId = obj.thread_id;
           continue;
         }
-        const eventMsgAgent = extractEventMsgAgentMessage(obj);
-        if (eventMsgAgent) {
-          agentMessages.push(eventMsgAgent.text);
+        if (isEventMsgAgentMessage(obj)) {
+          hasAgentMessage = true;
+          const eventMsgAgent = extractEventMsgAgentMessage(obj);
+          if (eventMsgAgent) {
+            agentMessages.push(eventMsgAgent.text);
+          }
           continue;
         }
         if (obj.type === "item.completed" && obj.item && typeof obj.item === "object") {
           const item = obj.item as Record<string, unknown>;
           if (item.type === "agent_message" && typeof item.text === "string") {
+            hasAgentMessage = true;
             agentMessages.push(item.text);
             continue;
           }
@@ -608,7 +635,7 @@ export class CodexAdapter {
         // 非JSON行は無視する（stderr混入を許容）。
       }
     }
-    return { threadId, agentMessages, warnings, errors };
+    return { threadId, agentMessages, hasAgentMessage, warnings, errors };
   }
 
   private isKnownWarning(message: string): boolean {
@@ -676,9 +703,12 @@ export class CodexAdapter {
     return cleaned.join("\n").trim();
   }
 
-  private selectUserOutput(agentMessages: string[], fallback: string): string {
-    const agentText = agentMessages.join("\n").trim();
-    return agentText || fallback || "(no output)";
+  private selectUserOutput(
+    agentMessages: string[],
+    fallback: string,
+    hasAgentMessage = agentMessages.length > 0,
+  ): string {
+    return selectCodexUserOutput({ agentMessages, hasAgentMessage, fallback });
   }
 
   private escapeForShell(text: string): string {

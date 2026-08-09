@@ -4,6 +4,11 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.85 (2026-08-09)
+- Reworked External Sync around Codex turns, substantially reducing cases where messages executed through DiscordAgent were mirrored again as `[External ...]`. Updates from external clients are synchronized only after the Codex turn completes, using the user input and final response.
+- Prevented internal JSON from being shown as the body when Codex returns an empty `agent_message`.
+- Updated the `!model` catalog with current GPT-5.6 Terra / Luna pricing guidance and removed `gpt-5.4-mini`, which is no longer a supported choice.
+
 ## v0.1.0 build.82 (2026-07-11)
 - Change Codex session working-directory resolution to prefer `workspace_roots`. Some existing sessions may therefore use a different working directory than before; check with `!session current` if needed.
 

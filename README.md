@@ -152,6 +152,7 @@ Notes:
   - Switch the model for the current session.
   - `0` uses the model specified in Codex `config.toml` (default model).
   - The list source is `data/models.yaml`.
+  - Each description includes pricing guidance per 1M tokens for input / cached input / output.
   - Codex `exec` does not currently provide a model-list API, so this list must be maintained manually unless that feature is added.
 - `!codex [query]`
 - `!codex pick <no>`
@@ -270,6 +271,7 @@ Prioritize the following:
 
 If the same `codex_thread_id` is updated from another client such as Codex CLI or a VSCode extension, DiscordAgent can mirror those updates back into Discord.
 This works in future-only mode and does not replay older history.
+Updates from external clients are synchronized only after the Codex turn completes, using the user input and final response.
 
 ## Restart Behavior
 

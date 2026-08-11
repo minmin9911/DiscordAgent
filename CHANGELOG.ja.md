@@ -4,6 +4,10 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.87 (2026-08-11)
+- `!sandbox dir` で、日本語Windowsの円記号（`¥`）をパス区切りとして入力できるようにしました。パス表示のMarkdown崩れも防止しています。
+- `!sandbox dir` の追加・削除では、Windowsのパス規則に合わせて大文字小文字を区別しないようにしました。
+
 ## v0.1.0 build.85 (2026-08-09)
 - External Sync の判定をCodexターン単位へ見直し、DiscordAgent経由で実行したメッセージが `[External ...]` として二重表示される問題を大幅に抑制しました。外部クライアントの更新は、Codexターンの完了を確認してから、ユーザー入力と最終回答のみを同期します。
 - Codexが空の `agent_message` を返した場合に、内部JSONを本文として表示しないよう修正しました。

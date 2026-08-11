@@ -16,6 +16,10 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function sandboxExtraDirPathKey(dirPath: string): string {
+  return dirPath.toLowerCase();
+}
+
 export class AppDb {
   private db: Database.Database;
 
@@ -135,9 +139,10 @@ CREATE TABLE IF NOT EXISTS trigger_fires (
 CREATE TABLE IF NOT EXISTS sandbox_extra_dirs (
   codex_thread_id TEXT NOT NULL,
   dir_path TEXT NOT NULL,
+  dir_path_key TEXT NOT NULL,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (codex_thread_id, dir_path)
+  PRIMARY KEY (codex_thread_id, dir_path_key)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_last_used_at ON sessions(last_used_at DESC);
@@ -223,6 +228,58 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
       this.db.exec("ALTER TABLE triggers ADD COLUMN sandbox_mode_override TEXT");
     }
     this.ensureTriggerTypeSupportsMonthly();
+    this.ensureSandboxExtraDirsCaseInsensitive();
+  }
+
+  private ensureSandboxExtraDirsCaseInsensitive(): void {
+    const columns = this.db.prepare("PRAGMA table_info(sandbox_extra_dirs)").all() as Array<{
+      name: string;
+    }>;
+    if (columns.some((column) => column.name === "dir_path_key")) return;
+
+    const existingRows = this.db
+      .prepare(
+        `SELECT codex_thread_id, dir_path, created_at, updated_at
+         FROM sandbox_extra_dirs
+         ORDER BY updated_at ASC, created_at ASC`,
+      )
+      .all() as Array<{
+      codex_thread_id: string;
+      dir_path: string;
+      created_at: string;
+      updated_at: string;
+    }>;
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("ALTER TABLE sandbox_extra_dirs RENAME TO sandbox_extra_dirs_old");
+      this.db.exec(`
+CREATE TABLE sandbox_extra_dirs (
+  codex_thread_id TEXT NOT NULL,
+  dir_path TEXT NOT NULL,
+  dir_path_key TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (codex_thread_id, dir_path_key)
+);`);
+      const insert = this.db.prepare(
+        `INSERT INTO sandbox_extra_dirs
+         (codex_thread_id, dir_path, dir_path_key, created_at, updated_at)
+         VALUES (@codex_thread_id, @dir_path, @dir_path_key, @created_at, @updated_at)
+         ON CONFLICT(codex_thread_id, dir_path_key) DO UPDATE SET
+           dir_path = excluded.dir_path,
+           updated_at = excluded.updated_at`,
+      );
+      for (const row of existingRows) {
+        insert.run({ ...row, dir_path_key: sandboxExtraDirPathKey(row.dir_path) });
+      }
+      this.db.exec("DROP TABLE sandbox_extra_dirs_old");
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dirs(codex_thread_id)");
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   private ensureTriggerTypeSupportsMonthly(): void {
@@ -773,14 +830,17 @@ FROM trigger_fires_old`);
   addSandboxExtraDir(codexThreadId: string, dirPath: string): void {
     this.db
       .prepare(
-        `INSERT INTO sandbox_extra_dirs (codex_thread_id, dir_path, created_at, updated_at)
-         VALUES (@codex_thread_id, @dir_path, @created_at, @updated_at)
-         ON CONFLICT(codex_thread_id, dir_path) DO UPDATE SET
+        `INSERT INTO sandbox_extra_dirs
+         (codex_thread_id, dir_path, dir_path_key, created_at, updated_at)
+         VALUES (@codex_thread_id, @dir_path, @dir_path_key, @created_at, @updated_at)
+         ON CONFLICT(codex_thread_id, dir_path_key) DO UPDATE SET
+           dir_path = excluded.dir_path,
            updated_at = excluded.updated_at`,
       )
       .run({
         codex_thread_id: codexThreadId,
         dir_path: dirPath,
+        dir_path_key: sandboxExtraDirPathKey(dirPath),
         created_at: nowIso(),
         updated_at: nowIso(),
       });
@@ -789,9 +849,9 @@ FROM trigger_fires_old`);
   removeSandboxExtraDir(codexThreadId: string, dirPath: string): number {
     const result = this.db
       .prepare(
-        "DELETE FROM sandbox_extra_dirs WHERE codex_thread_id = ? AND dir_path = ?",
+        "DELETE FROM sandbox_extra_dirs WHERE codex_thread_id = ? AND dir_path_key = ?",
       )
-      .run(codexThreadId, dirPath);
+      .run(codexThreadId, sandboxExtraDirPathKey(dirPath));
     return result.changes;
   }
 

@@ -4,6 +4,10 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.87 (2026-08-11)
+- `!sandbox dir` now accepts the yen sign (`¥`) used as a path separator on Japanese Windows systems. It also prevents Markdown from corrupting displayed paths.
+- `!sandbox dir` add and remove now follow Windows path rules by treating path casing as identical.
+
 ## v0.1.0 build.85 (2026-08-09)
 - Reworked External Sync around Codex turns, substantially reducing cases where messages executed through DiscordAgent were mirrored again as `[External ...]`. Updates from external clients are synchronized only after the Codex turn completes, using the user input and final response.
 - Prevented internal JSON from being shown as the body when Codex returns an empty `agent_message`.

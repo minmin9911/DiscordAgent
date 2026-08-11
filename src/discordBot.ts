@@ -191,6 +191,21 @@ export function shouldProcessIncomingMessage(content: string, attachmentCount: n
   return content.trim().length > 0 || attachmentCount > 0;
 }
 
+// Japanese Windows users may enter U+00A5/U+FFE5 yen signs for path separators.
+// Normalize them before Node's Windows-path validation and filesystem access.
+export function normalizeWindowsPathInput(rawPath: string): string {
+  return rawPath.trim().replace(/[\u00A5\uFFE5]/g, "\\");
+}
+
+export function formatDiscordInlineCode(value: string): string {
+  const longestBacktickRun = Math.max(
+    0,
+    ...(value.match(/`+/g) ?? []).map((run) => run.length),
+  );
+  const delimiter = "`".repeat(longestBacktickRun + 1);
+  return `${delimiter}${value}${delimiter}`;
+}
+
 export function isExecutionRuntimeBusy(runtime: { queueLength: number; runningSince: string | null }): boolean {
   return Boolean(runtime.runningSince) || runtime.queueLength > 0;
 }
@@ -920,7 +935,7 @@ export class DiscordCodexBot {
         return;
       }
       if (action === "set") {
-        const pathArg = pathParts.join(" ").trim();
+        const pathArg = normalizeWindowsPathInput(pathParts.join(" "));
         if (!pathArg) {
           await msg.reply(usageSessionWorkdir(this.locale));
           return;
@@ -1935,7 +1950,7 @@ export class DiscordCodexBot {
       const field = (parts[1] ?? "").toLowerCase();
       const id = parts[2] ?? "";
       if (field === "workdir") {
-        const pathArg = raw.split(/\s+/).slice(3).join(" ").trim();
+        const pathArg = normalizeWindowsPathInput(raw.split(/\s+/).slice(3).join(" "));
         if (!id || !pathArg) {
           await msg.reply(usageTriggerEnv(this.locale));
           return;
@@ -3118,7 +3133,7 @@ export class DiscordCodexBot {
   }
 
   private normalizeAbsoluteDirPath(rawPath: string): string {
-    const resolved = resolve(rawPath.trim());
+    const resolved = resolve(normalizeWindowsPathInput(rawPath));
     const isDriveRoot = /^[A-Za-z]:\\$/.test(resolved);
     if (isDriveRoot) return resolved;
     return resolved.replace(/[\\\/]+$/, "");
@@ -3182,10 +3197,10 @@ export class DiscordCodexBot {
         await msg.reply(`${sandboxDirListTitle(this.locale, resolvedSession.threadId)}\n${sandboxDirListEmpty(this.locale)}`);
         return;
       }
-      await this.sendMultilineReply(
-        msg,
-        sandboxDirListTitle(this.locale, resolvedSession.threadId),
-        dirs.map((v, i) => `${i + 1}. ${v}`),
+        await this.sendMultilineReply(
+          msg,
+          sandboxDirListTitle(this.locale, resolvedSession.threadId),
+          dirs.map((v, i) => `${i + 1}. ${formatDiscordInlineCode(v)}`),
       );
       return;
     }
@@ -3206,7 +3221,7 @@ export class DiscordCodexBot {
       return;
     }
 
-    const rawPath = raw.split(/\s+/).slice(2).join(" ").trim();
+    const rawPath = normalizeWindowsPathInput(raw.split(/\s+/).slice(2).join(" "));
     if (!rawPath) {
       await msg.reply(usageSandbox(this.locale));
       return;
@@ -3225,30 +3240,30 @@ export class DiscordCodexBot {
     const normalizedPath = this.normalizeAbsoluteDirPath(rawPath);
     if (op === "add") {
       if (!existsSync(normalizedPath)) {
-        await msg.reply(sandboxDirPathNotFound(this.locale, normalizedPath));
+        await msg.reply(sandboxDirPathNotFound(this.locale, formatDiscordInlineCode(normalizedPath)));
         return;
       }
       try {
         const st = statSync(normalizedPath);
         if (!st.isDirectory()) {
-          await msg.reply(sandboxDirPathNotDirectory(this.locale, normalizedPath));
+          await msg.reply(sandboxDirPathNotDirectory(this.locale, formatDiscordInlineCode(normalizedPath)));
           return;
         }
       } catch {
-        await msg.reply(sandboxDirPathNotFound(this.locale, normalizedPath));
+        await msg.reply(sandboxDirPathNotFound(this.locale, formatDiscordInlineCode(normalizedPath)));
         return;
       }
       this.db.addSandboxExtraDir(resolvedSession.threadId, normalizedPath);
-      await msg.reply(sandboxDirAdded(this.locale, normalizedPath));
+      await msg.reply(sandboxDirAdded(this.locale, formatDiscordInlineCode(normalizedPath)));
       return;
     }
 
     const removed = this.db.removeSandboxExtraDir(resolvedSession.threadId, normalizedPath);
     if (removed === 0) {
-      await msg.reply(sandboxDirNotFound(this.locale, normalizedPath));
+      await msg.reply(sandboxDirNotFound(this.locale, formatDiscordInlineCode(normalizedPath)));
       return;
     }
-    await msg.reply(sandboxDirRemoved(this.locale, normalizedPath));
+    await msg.reply(sandboxDirRemoved(this.locale, formatDiscordInlineCode(normalizedPath)));
   }
 
   private async handleOkCommand(msg: Message, contextKey: string, body: string): Promise<void> {
@@ -4254,7 +4269,7 @@ export class DiscordCodexBot {
     paths: string[],
   ): Promise<void> {
     for (const rawPath of paths) {
-      const filePath = rawPath.trim();
+      const filePath = normalizeWindowsPathInput(rawPath);
       if (!filePath) {
         await sendChannel.send(attachInvalidPath(this.locale));
         continue;

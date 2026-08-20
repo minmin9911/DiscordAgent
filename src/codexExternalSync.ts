@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -18,6 +18,45 @@ export interface ExternalSyncReadResult {
   sourceFound: boolean;
   latestLineNo: number;
   events: ExternalSyncEvent[];
+}
+
+export interface CodexThreadFileFingerprint {
+  path: string;
+  size: number;
+  mtimeMs: number;
+}
+
+const sessionFilePathCache = new Map<string, string>();
+
+export function hasCodexThreadFileChanged(
+  previous: CodexThreadFileFingerprint | undefined,
+  current: CodexThreadFileFingerprint | null,
+): boolean {
+  if (!current) return previous !== undefined;
+  if (!previous) return true;
+  return previous.path !== current.path
+    || previous.size !== current.size
+    || previous.mtimeMs !== current.mtimeMs;
+}
+
+export function getCodexThreadFileFingerprint(
+  codexThreadId: string,
+): CodexThreadFileFingerprint | null {
+  const sessionsRoot = join(homedir(), ".codex", "sessions");
+  if (!existsSync(sessionsRoot)) return null;
+  const sessionFile = findSessionFileByThreadId(sessionsRoot, codexThreadId);
+  if (!sessionFile) return null;
+  try {
+    const stats = statSync(sessionFile);
+    return {
+      path: sessionFile,
+      size: stats.size,
+      mtimeMs: stats.mtimeMs,
+    };
+  } catch {
+    sessionFilePathCache.delete(codexThreadId);
+    return null;
+  }
 }
 
 export interface ExternalSyncTurn {
@@ -468,6 +507,10 @@ export function readCodexThreadStartedTurnsSinceLine(
 }
 
 function findSessionFileByThreadId(rootDir: string, threadId: string): string | null {
+  const cached = sessionFilePathCache.get(threadId);
+  if (cached && existsSync(cached)) return cached;
+  sessionFilePathCache.delete(threadId);
+
   const stack: string[] = [rootDir];
   const suffix = `${threadId}.jsonl`;
   while (stack.length > 0) {
@@ -480,6 +523,7 @@ function findSessionFileByThreadId(rootDir: string, threadId: string): string | 
         continue;
       }
       if (entry.isFile() && entry.name.endsWith(suffix)) {
+        sessionFilePathCache.set(threadId, full);
         return full;
       }
     }

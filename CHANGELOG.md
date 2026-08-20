@@ -4,6 +4,10 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.89 (2026-08-21)
+- Fix an issue where the same running message could appear multiple times when Discord communication was unstable.
+- Optimize External Sync history reads so unchanged Codex session history is not repeatedly parsed, reducing background CPU and memory usage and improving response latency.
+
 ## v0.1.0 build.87 (2026-08-11)
 - `!sandbox dir` now accepts the yen sign (`¥`) used as a path separator on Japanese Windows systems. It also prevents Markdown from corrupting displayed paths.
 - `!sandbox dir` add and remove now follow Windows path rules by treating path casing as identical.

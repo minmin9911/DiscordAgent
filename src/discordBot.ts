@@ -19,6 +19,7 @@ import { SessionService } from "./sessionService.js";
 import { ExecutionManager } from "./executionManager.js";
 import { maskSecrets } from "./mask.js";
 import { parseOkCommandBody } from "./okCommand.js";
+import { ProgressMessageController, getDiscordErrorCode } from "./progressMessageController.js";
 import {
   CodexAdapter,
   resolveCodexWorkingDirectory,
@@ -135,6 +136,8 @@ import {
 import {
   buildExternalSyncEventMsgId,
   buildExternalSyncEventSignature,
+  getCodexThreadFileFingerprint,
+  hasCodexThreadFileChanged,
   readCodexThreadCompletedTurnsSinceLine,
   readCodexThreadEventsSinceLine,
   readCodexThreadStartedTurnsSinceLine,
@@ -378,6 +381,10 @@ export class DiscordCodexBot {
     }
   >();
   private readonly activeLocalSyncRuns = new Map<string, number>();
+  private readonly externalSyncFileFingerprints = new Map<
+    string,
+    { path: string; size: number; mtimeMs: number }
+  >();
   private readonly externalChannelResolveCache = new Map<string, ExternalChannelResolveCache>();
   private externalSyncEnabled = appConfig.externalSyncEnabled;
   private externalSyncRunning = false;
@@ -1142,8 +1149,7 @@ export class DiscordCodexBot {
       return;
     }
     const sendChannel = msg.channel;
-    let progressMessageId: string | null = null;
-    let finalized = false;
+    let finishHandled = false;
     let lastProgressEditAtMs = 0;
     const seenAgentItemIds = new Set<string>();
     const streamAgentMessages: string[] = [];
@@ -1176,38 +1182,32 @@ export class DiscordCodexBot {
       if (merged.length <= MAX_PROGRESS_LEN) return merged;
       return `${merged.slice(0, MAX_PROGRESS_LEN - 30)}\n...(truncated)`;
     };
-    const editProgressMessage = async (text: string): Promise<void> => {
-      if (finalized) return;
+    const progressMessage = new ProgressMessageController({
+      executionId,
+      send: async (text, options) => sendChannel.send({ content: text, ...options }),
+      edit: async (messageId, text) => {
+        await sendChannel.messages.edit(messageId, { content: text });
+      },
+      onError: ({ operation, messageId, error }) => {
+        this.logger.warn(
+          {
+            err: error,
+            executionId,
+            messageId,
+            operation,
+            discordErrorCode: getDiscordErrorCode(error),
+          },
+          "progress message operation failed",
+        );
+      },
+    });
+    const editProgressMessage = (text: string): Promise<void> => {
       const now = Date.now();
-      if (now - lastProgressEditAtMs < 1000) return;
+      if (now - lastProgressEditAtMs < 1000) return Promise.resolve();
       lastProgressEditAtMs = now;
-      if (!progressMessageId) {
-        const sent = await sendChannel.send(text);
-        progressMessageId = sent.id;
-        return;
-      }
-      try {
-        const prev = await sendChannel.messages.fetch(progressMessageId);
-        await prev.edit(text);
-      } catch {
-        const sent = await sendChannel.send(text);
-        progressMessageId = sent.id;
-      }
+      return progressMessage.update(text);
     };
-    const sendOrEditFinal = async (text: string): Promise<void> => {
-      finalized = true;
-      if (!progressMessageId) {
-        const sent = await sendChannel.send(text);
-        progressMessageId = sent.id;
-        return;
-      }
-      try {
-        const prev = await sendChannel.messages.fetch(progressMessageId);
-        await prev.edit(text);
-      } catch {
-        await sendChannel.send(text);
-      }
-    };
+    const sendOrEditFinal = (text: string): Promise<void> => progressMessage.final(text);
     const incomingPaths = options?.promptOverride
       ? []
       : await this.saveIncomingAttachments(msg, session.id);
@@ -1302,7 +1302,6 @@ export class DiscordCodexBot {
         }
       },
       onProgress: async (elapsedSec, queueLength) => {
-        if (finalized) return;
         const progressText = composeStatusText(
           runningElapsedMessage(
             this.locale,
@@ -1346,7 +1345,6 @@ export class DiscordCodexBot {
                 forceWorkingDirectory: session.working_directory_override,
                 includeDiscordAgentSystemPrompt: shouldInjectAttachInstruction,
                 onEvent: async (event) => {
-            if (finalized) return;
             if (event.threadId) {
               await applyObservedThreadId(event.threadId, "event");
             }
@@ -1468,7 +1466,6 @@ export class DiscordCodexBot {
             }
                 },
                 onAgentMessage: async ({ itemId, text }) => {
-            if (finalized) return;
             if (seenAgentItemIds.has(itemId)) return;
             seenAgentItemIds.add(itemId);
             const suppressThreadId = observedThreadId ?? session.codex_thread_id ?? null;
@@ -1595,7 +1592,8 @@ export class DiscordCodexBot {
         return { status: "success" as const, output: runResult.output };
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
-        if (finalized) return;
+        if (finishHandled) return;
+        finishHandled = true;
         this.db.updateExecutionStatus(executionId, status, {
           errorCode,
           retryCount: retries,
@@ -3692,9 +3690,27 @@ export class DiscordCodexBot {
           occurredAtMs: number | null;
         };
       }> = [];
+      const activeThreadIds = new Set(threadIds);
+      for (const cachedThreadId of this.externalSyncFileFingerprints.keys()) {
+        if (!activeThreadIds.has(cachedThreadId)) {
+          this.externalSyncFileFingerprints.delete(cachedThreadId);
+        }
+      }
 
       for (const threadId of threadIds) {
+        // A local execution may still be writing this JSONL. Leave its fingerprint untouched
+        // so the completed turn is inspected after the local-run suppression window closes.
+        if ((this.activeLocalSyncRuns.get(threadId) ?? 0) > 0) continue;
+        const fingerprint = getCodexThreadFileFingerprint(threadId);
+        const previousFingerprint = this.externalSyncFileFingerprints.get(threadId);
+        if (!fingerprint) {
+          this.externalSyncFileFingerprints.delete(threadId);
+          continue;
+        }
+        if (!hasCodexThreadFileChanged(previousFingerprint, fingerprint)) continue;
         const chunk = this.collectExternalEventsForThread(reason, threadId);
+        // Do not advance the observed fingerprint on a parser failure; retry next cycle.
+        this.externalSyncFileFingerprints.set(threadId, fingerprint);
         if (!chunk) continue;
         collected.push(...chunk.events.map((event) => ({
           codexThreadId: chunk.codexThreadId,

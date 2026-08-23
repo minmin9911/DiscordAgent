@@ -4,7 +4,7 @@ models:
     description: Uses Codex default model(config.toml)
     disabled: false
   - id: gpt-5.6-sol
-    description: Latest frontier agentic coding model. 125 / 12.5 / 750
+    description: Latest frontier agentic coding model. 100 / 10 / 500
     disabled: false
   - id: gpt-5.6-terra
     description: Balanced agentic coding model for everyday work. 50 / 5 / 300

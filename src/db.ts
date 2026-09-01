@@ -228,6 +228,7 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
       this.db.exec("ALTER TABLE triggers ADD COLUMN sandbox_mode_override TEXT");
     }
     this.ensureTriggerTypeSupportsMonthly();
+    this.ensureTriggerFireCascade();
     this.ensureSandboxExtraDirsCaseInsensitive();
   }
 
@@ -312,7 +313,7 @@ CREATE TABLE triggers (
 )`);
       this.db.exec(`
 INSERT INTO triggers (id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, working_directory_override, sandbox_mode_override, status, created_by, created_at, updated_at)
-SELECT id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, NULL, NULL, status, created_by, created_at, updated_at
+SELECT id, codex_thread_id, name, trigger_type, time_hhmm, days_csv, prompt, task_name, working_directory_override, sandbox_mode_override, status, created_by, created_at, updated_at
 FROM triggers_old`);
 
       this.db.exec("ALTER TABLE trigger_fires RENAME TO trigger_fires_old");
@@ -341,6 +342,49 @@ FROM trigger_fires_old`);
       this.db.exec("ROLLBACK");
       this.db.exec("PRAGMA foreign_keys = ON");
       throw err;
+    }
+    this.db.exec("PRAGMA foreign_keys = ON");
+  }
+
+  private ensureTriggerFireCascade(): void {
+    const foreignKeys = this.db
+      .prepare("PRAGMA foreign_key_list(trigger_fires)")
+      .all() as Array<{ table?: string; from?: string; on_delete?: string }>;
+    const hasCascade = foreignKeys.some(
+      (row) => row.table === "triggers"
+        && row.from === "trigger_id"
+        && String(row.on_delete ?? "").toUpperCase() === "CASCADE",
+    );
+    if (hasCascade) return;
+
+    this.db.exec("PRAGMA foreign_keys = OFF");
+    this.db.exec("BEGIN");
+    try {
+      this.db.exec("ALTER TABLE trigger_fires RENAME TO trigger_fires_old");
+      this.db.exec(`
+CREATE TABLE trigger_fires (
+  id TEXT PRIMARY KEY,
+  trigger_id TEXT NOT NULL,
+  fired_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('pending', 'done', 'error')),
+  processed_at TEXT,
+  error_message TEXT,
+  FOREIGN KEY(trigger_id) REFERENCES triggers(id) ON DELETE CASCADE
+)`);
+      this.db.exec(`
+INSERT INTO trigger_fires (id, trigger_id, fired_at, status, processed_at, error_message)
+SELECT old.id, old.trigger_id, old.fired_at, old.status, old.processed_at, old.error_message
+FROM trigger_fires_old AS old
+INNER JOIN triggers ON triggers.id = old.trigger_id`);
+      this.db.exec("DROP TABLE trigger_fires_old");
+      this.db.exec(
+        "CREATE INDEX IF NOT EXISTS idx_trigger_fires_status_fired_at ON trigger_fires(status, fired_at)",
+      );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      this.db.exec("PRAGMA foreign_keys = ON");
+      throw error;
     }
     this.db.exec("PRAGMA foreign_keys = ON");
   }
@@ -1047,6 +1091,31 @@ FROM trigger_fires_old`);
       return claimed;
     });
     return tx(limit);
+  }
+
+  failClaimedPendingTriggerFires(errorMessage: string): TriggerFireRow[] {
+    const tx = this.db.transaction((message: string) => {
+      const claimed = this.db
+        .prepare(
+          "SELECT * FROM trigger_fires WHERE status = 'pending' AND processed_at IS NOT NULL ORDER BY fired_at ASC",
+        )
+        .all() as TriggerFireRow[];
+      if (claimed.length === 0) return claimed;
+      const failedAt = nowIso();
+      const update = this.db.prepare(
+        "UPDATE trigger_fires SET status = 'error', processed_at = ?, error_message = ? WHERE id = ? AND status = 'pending'",
+      );
+      for (const fire of claimed) {
+        update.run(failedAt, message, fire.id);
+      }
+      return claimed.map((fire) => ({
+        ...fire,
+        status: "error" as const,
+        processed_at: failedAt,
+        error_message: message,
+      }));
+    });
+    return tx(errorMessage);
   }
 
   markTriggerFireDone(id: string): void {

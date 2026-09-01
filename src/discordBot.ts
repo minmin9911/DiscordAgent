@@ -160,6 +160,9 @@ import { resolveSessionWorkingDirectoryState } from "./sessionWorkingDirectory.j
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
+const GATEWAY_RECONNECT_IDLE_CHECK_MS = 5 * 1000;
+const GATEWAY_RECONNECT_RETRY_MS = 60 * 1000;
+const GATEWAY_RECONNECT_COOLDOWN_MS = 5 * 60 * 1000;
 const EXTERNAL_SYNC_PREVIEW_MAX = 1500;
 const APP_STATE_LAST_RESOLVED_DEFAULT_MODEL = "last_resolved_default_model";
 const APP_STATE_SANDBOX_NOTICE_STARTUP = "sandbox_notice_startup_once";
@@ -192,6 +195,10 @@ type ExternalChannelResolveCache = {
 
 export function shouldProcessIncomingMessage(content: string, attachmentCount: number): boolean {
   return content.trim().length > 0 || attachmentCount > 0;
+}
+
+export function shouldRequestGatewayReconnect(reason: string, recoveredCount: number): boolean {
+  return reason === "polling" && recoveredCount > 0;
 }
 
 // Japanese Windows users may enter U+00A5/U+FFE5 yen signs for path separators.
@@ -389,6 +396,11 @@ export class DiscordCodexBot {
   private externalSyncEnabled = appConfig.externalSyncEnabled;
   private externalSyncRunning = false;
   private recoveringUnread = false;
+  private triggerClaimsRecovered = false;
+  private gatewayReconnectPending = false;
+  private gatewayReconnectInProgress = false;
+  private gatewayReconnectTimer: NodeJS.Timeout | null = null;
+  private lastGatewayReconnectAt = 0;
 
   constructor(params: { db: AppDb; logger: pino.Logger }) {
     this.db = params.db;
@@ -443,7 +455,23 @@ export class DiscordCodexBot {
         });
       }, TRIGGER_POLL_MS);
     });
-    this.client.on("shardResume", () => {
+    this.client.on("shardDisconnect", (event, shardId) => {
+      this.logger.warn(
+        { shardId, code: event.code, reason: event.reason },
+        "Discord gateway shard disconnected",
+      );
+    });
+    this.client.on("shardError", (error, shardId) => {
+      this.logger.warn({ err: error, shardId }, "Discord gateway shard error");
+    });
+    this.client.on("shardReady", (shardId, unavailableGuilds) => {
+      this.logger.info(
+        { shardId, unavailableGuilds: unavailableGuilds?.size ?? 0 },
+        "Discord gateway shard ready",
+      );
+    });
+    this.client.on("shardResume", (shardId, replayedEvents) => {
+      this.logger.info({ shardId, replayedEvents }, "Discord gateway shard resumed");
       this.recoverUnreadForAllContexts("shard_resume").catch((err) => {
         this.logger.warn({ err }, "unread recovery on resume failed");
       });
@@ -495,6 +523,7 @@ export class DiscordCodexBot {
     }
 
     const contextKey = this.sessionService.buildContextKey(msg.guildId, msg.channelId);
+    let processingFailed = false;
     try {
       if (!this.isAllowedUser(msg)) {
         this.logger.warn(
@@ -623,9 +652,15 @@ export class DiscordCodexBot {
       }
       this.discardPendingApprovalForNewPrompt(contextKey);
       await this.handleExecutionMessage(msg, content);
+    } catch (error) {
+      processingFailed = true;
+      this.processedMessageIds.delete(msg.id);
+      throw error;
     } finally {
-      this.cacheContextNameForMessage(contextKey, msg);
-      this.db.setContextCursor(contextKey, msg.id);
+      if (!processingFailed) {
+        this.cacheContextNameForMessage(contextKey, msg);
+        this.db.setContextCursor(contextKey, msg.id);
+      }
     }
   }
 
@@ -644,11 +679,77 @@ export class DiscordCodexBot {
     this.recoveringUnread = true;
     try {
       const contexts = await this.resolveRecoveryContexts();
+      let recoveredCount = 0;
       for (const context of contexts) {
-        await this.recoverUnreadForContext(context.contextKey, context.channel, reason);
+        recoveredCount += await this.recoverUnreadForContext(
+          context.contextKey,
+          context.channel,
+          reason,
+        );
+      }
+      if (shouldRequestGatewayReconnect(reason, recoveredCount)) {
+        this.requestGatewayReconnect(recoveredCount);
       }
     } finally {
       this.recoveringUnread = false;
+    }
+  }
+
+  private requestGatewayReconnect(recoveredCount: number): void {
+    if (!this.gatewayReconnectPending) {
+      this.logger.warn(
+        { recoveredCount },
+        "Discord gateway appears stale; reconnect scheduled",
+      );
+    }
+    this.gatewayReconnectPending = true;
+    this.scheduleGatewayReconnect(0);
+  }
+
+  private scheduleGatewayReconnect(delayMs: number): void {
+    if (this.gatewayReconnectTimer || this.gatewayReconnectInProgress) return;
+    this.gatewayReconnectTimer = setTimeout(() => {
+      this.gatewayReconnectTimer = null;
+      this.attemptGatewayReconnect().catch((err) => {
+        this.logger.error({ err }, "Discord gateway reconnect attempt failed unexpectedly");
+      });
+    }, delayMs);
+  }
+
+  private async attemptGatewayReconnect(): Promise<void> {
+    if (!this.gatewayReconnectPending || this.gatewayReconnectInProgress) return;
+
+    const activeQueues = this.manager.getQueueSnapshots();
+    if (activeQueues.length > 0) {
+      this.scheduleGatewayReconnect(GATEWAY_RECONNECT_IDLE_CHECK_MS);
+      return;
+    }
+
+    const cooldownRemaining = Math.max(
+      0,
+      GATEWAY_RECONNECT_COOLDOWN_MS - (Date.now() - this.lastGatewayReconnectAt),
+    );
+    if (cooldownRemaining > 0) {
+      this.scheduleGatewayReconnect(cooldownRemaining);
+      return;
+    }
+
+    this.gatewayReconnectPending = false;
+    this.gatewayReconnectInProgress = true;
+    try {
+      this.logger.warn("reconnecting Discord gateway");
+      await this.client.destroy();
+      await this.client.login(appConfig.discordToken);
+      this.lastGatewayReconnectAt = Date.now();
+      this.logger.info({ user: this.client.user?.tag }, "Discord gateway reconnected");
+    } catch (error) {
+      this.gatewayReconnectPending = true;
+      this.logger.error({ err: error }, "Discord gateway reconnect failed; retry scheduled");
+    } finally {
+      this.gatewayReconnectInProgress = false;
+      if (this.gatewayReconnectPending) {
+        this.scheduleGatewayReconnect(GATEWAY_RECONNECT_RETRY_MS);
+      }
     }
   }
 
@@ -696,7 +797,7 @@ export class DiscordCodexBot {
     contextKey: string,
     channel: RecoveryChannel,
     reason: string,
-  ): Promise<void> {
+  ): Promise<number> {
     const cursor = this.db.getContextCursor(contextKey);
     if (!cursor) {
       const latest = await channel.messages.fetch({ limit: 1 });
@@ -708,15 +809,17 @@ export class DiscordCodexBot {
         { reason, contextKey, channelId: channel.id },
         "unread recovery anchored with latest message",
       );
-      return;
+      return 0;
     }
 
     const fetched = await channel.messages.fetch({ limit: 100, after: cursor });
-    if (fetched.size === 0) return;
+    if (fetched.size === 0) return 0;
     const sorted = [...fetched.values()].sort(
       (a, b) => a.createdTimestamp - b.createdTimestamp,
     );
-    const candidates = sorted.filter((m) => !m.author.bot && !m.system);
+    const candidates = sorted.filter(
+      (m) => !m.author.bot && !m.system && !this.processedMessageIds.has(m.id),
+    );
     const toProcess = candidates.slice(0, UNREAD_RECOVERY_LIMIT);
     const dropped = Math.max(0, candidates.length - toProcess.length);
 
@@ -729,7 +832,7 @@ export class DiscordCodexBot {
       this.db.setContextCursor(contextKey, latestMessage.id);
     }
 
-    if (toProcess.length === 0 && dropped === 0) return;
+    if (toProcess.length === 0 && dropped === 0) return 0;
     const lines = unreadRecoveryLines(this.locale, toProcess.length, dropped, UNREAD_RECOVERY_LIMIT);
     await channel.send(lines.join("\n"));
     this.logger.info(
@@ -742,6 +845,7 @@ export class DiscordCodexBot {
       },
       "unread recovery completed",
     );
+    return toProcess.length;
   }
 
   private buildCodexSearchCacheKey(userId: string, contextKey: string): string {
@@ -850,9 +954,6 @@ export class DiscordCodexBot {
         member,
       });
       if (localRes.ok) {
-        await msg.reply(
-          codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(localRes.session)),
-        );
         await msg.reply(
           codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(localRes.session)),
         );
@@ -1014,7 +1115,6 @@ export class DiscordCodexBot {
         await msg.reply(
           codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)),
         );
-        await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
         return;
       }
       const looksLikeId = isUuidLike(arg);
@@ -1029,7 +1129,6 @@ export class DiscordCodexBot {
           await msg.reply(
             codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)),
           );
-          await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
           return;
         }
         const connectRes = this.sessionService.connectCodexThread({
@@ -1047,7 +1146,6 @@ export class DiscordCodexBot {
         await msg.reply(
           codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(connectRes.session)),
         );
-        await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(connectRes.session)));
         return;
       }
       const res = this.sessionService.switchByName({
@@ -1075,7 +1173,6 @@ export class DiscordCodexBot {
       await msg.reply(
         codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)),
       );
-      await msg.reply(codexSessionLine(this.locale, this.getUserFacingCodexSessionLabel(res.session)));
       return;
     }
 
@@ -1288,7 +1385,8 @@ export class DiscordCodexBot {
       sessionId: session.id,
       lockKey: executionLockKey,
       text: content,
-      maxRetries: 1,
+      // Replaying a whole prompt can duplicate side effects after a partial failure.
+      maxRetries: 0,
       onQueued: async (position) => {
         const text = queuedMessage(
           this.locale,
@@ -3690,6 +3788,10 @@ export class DiscordCodexBot {
           occurredAtMs: number | null;
         };
       }> = [];
+      const fingerprintsAfterDelivery = new Map<
+        string,
+        { path: string; size: number; mtimeMs: number }
+      >();
       const activeThreadIds = new Set(threadIds);
       for (const cachedThreadId of this.externalSyncFileFingerprints.keys()) {
         if (!activeThreadIds.has(cachedThreadId)) {
@@ -3709,9 +3811,12 @@ export class DiscordCodexBot {
         }
         if (!hasCodexThreadFileChanged(previousFingerprint, fingerprint)) continue;
         const chunk = this.collectExternalEventsForThread(reason, threadId);
-        // Do not advance the observed fingerprint on a parser failure; retry next cycle.
-        this.externalSyncFileFingerprints.set(threadId, fingerprint);
-        if (!chunk) continue;
+        if (!chunk) {
+          this.externalSyncFileFingerprints.set(threadId, fingerprint);
+          continue;
+        }
+        // Commit this fingerprint only after Discord delivery and cursor updates succeed.
+        fingerprintsAfterDelivery.set(threadId, fingerprint);
         collected.push(...chunk.events.map((event) => ({
           codexThreadId: chunk.codexThreadId,
           contextKeys: chunk.contextKeys,
@@ -3736,17 +3841,17 @@ export class DiscordCodexBot {
 
       const cap = appConfig.externalSyncMaxBurst;
       const dropCount = Math.max(0, collected.length - cap);
-        if (dropCount > 0) {
-          for (let i = 0; i < dropCount; i += 1) {
-            const dropped = collected[i]!;
-            this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.eventId);
-            if (dropped.event.stableEventId) {
-              this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.stableEventId);
-            }
+      if (dropCount > 0) {
+        for (let i = 0; i < dropCount; i += 1) {
+          const dropped = collected[i]!;
+          this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.eventId);
+          if (dropped.event.stableEventId) {
+            this.db.markExternalSyncEventSeen(dropped.codexThreadId, dropped.event.stableEventId);
           }
-          this.logger.info(
-            { reason, dropped: dropCount, sent: cap },
-            "external sync global cap applied",
+        }
+        this.logger.info(
+          { reason, dropped: dropCount, sent: cap },
+          "external sync global cap applied",
         );
       }
       const target = dropCount > 0 ? collected.slice(dropCount) : collected;
@@ -3770,6 +3875,9 @@ export class DiscordCodexBot {
       }
       for (const [threadId, latestLineNo] of latestByThread.entries()) {
         this.db.setExternalSyncCursor(threadId, latestLineNo);
+      }
+      for (const [threadId, fingerprint] of fingerprintsAfterDelivery.entries()) {
+        this.externalSyncFileFingerprints.set(threadId, fingerprint);
       }
     } finally {
       this.externalSyncRunning = false;
@@ -4127,8 +4235,35 @@ export class DiscordCodexBot {
   }
 
   private async runTriggerMaintenanceCycle(): Promise<void> {
+    if (!this.triggerClaimsRecovered) {
+      await this.recoverInterruptedTriggerFires();
+      this.triggerClaimsRecovered = true;
+    }
     await this.runPendingTriggerFires();
     this.cleanupObsoleteAtTriggers();
+  }
+
+  private async recoverInterruptedTriggerFires(): Promise<void> {
+    const message = "Trigger execution was interrupted by a DiscordAgent restart.";
+    const interrupted = this.db.failClaimedPendingTriggerFires(message);
+    for (const fire of interrupted) {
+      const trigger = this.db.getTriggerById(fire.trigger_id);
+      if (!trigger) continue;
+      const sessions = this.db.listSessionsByCodexThreadId(trigger.codex_thread_id);
+      if (sessions.length === 0) continue;
+      const contextKeys = this.db.listContextKeysBySessionIds(sessions.map((session) => session.id));
+      try {
+        await this.broadcastTriggerResult(trigger, sessions[0]!, contextKeys, message);
+      } catch (error) {
+        this.logger.warn(
+          { err: error, triggerId: trigger.id, fireId: fire.id },
+          "failed to notify interrupted trigger fire",
+        );
+      }
+    }
+    if (interrupted.length > 0) {
+      this.logger.warn({ recovered: interrupted.length }, "interrupted trigger fires marked as error");
+    }
   }
 
   private cleanupObsoleteAtTriggers(): void {
@@ -4186,8 +4321,7 @@ export class DiscordCodexBot {
         continue;
       }
       try {
-        await this.executeTrigger(trigger);
-        this.db.markTriggerFireDone(fire.id);
+        await this.executeTrigger(trigger, fire.id);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.db.markTriggerFireError(fire.id, message);
@@ -4195,7 +4329,7 @@ export class DiscordCodexBot {
     }
   }
 
-  private async executeTrigger(trigger: TriggerRow): Promise<void> {
+  private async executeTrigger(trigger: TriggerRow, fireId: string): Promise<void> {
     const sessions = this.db.listSessionsByCodexThreadId(trigger.codex_thread_id);
     if (sessions.length === 0) {
       throw new Error("no active session for codex_thread_id");
@@ -4215,7 +4349,7 @@ export class DiscordCodexBot {
       commandTextMasked: trigger.prompt,
     });
 
-    await this.manager.enqueue({
+    const enqueueResult = await this.manager.enqueue({
       executionId,
       sessionId: session.id,
       lockKey,
@@ -4241,6 +4375,7 @@ export class DiscordCodexBot {
             codexThreadId: session.codex_thread_id,
             modelOverride: session.model_override,
             sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
+            additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
             preferredWorkingDirectory: session.preferred_working_directory,
             forceWorkingDirectory:
               trigger.working_directory_override ?? session.working_directory_override,
@@ -4266,18 +4401,49 @@ export class DiscordCodexBot {
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
         this.db.updateExecutionStatus(executionId, status, { retryCount: retries, errorCode });
-        const header = `[Trigger ${trigger.id}] ${trigger.name}\ncodex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
-        const body = splitIntoChunks(output || "(no output)", appConfig.messageChunkSize);
-        for (const contextKey of contextKeys) {
-          const channel = await this.resolveSendableChannelByContextKey(contextKey);
-          if (!channel) continue;
-          await channel.send(header);
-          for (let i = 0; i < body.length; i += 1) {
-            await channel.send(`(${i + 1}/${body.length}) ${body[i]}`);
-          }
+        try {
+          await this.broadcastTriggerResult(trigger, session, contextKeys, output || "(no output)");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.db.markTriggerFireError(fireId, `Discord delivery failed: ${message}`);
+          throw error;
+        }
+        if (status === "success") {
+          this.db.markTriggerFireDone(fireId);
+        } else {
+          this.db.markTriggerFireError(fireId, errorCode ?? output ?? "trigger execution failed");
         }
       },
     });
+    if (!enqueueResult.ok) {
+      const message = `Trigger was not queued: ${enqueueResult.code}`;
+      this.db.updateExecutionStatus(executionId, "error", { errorCode: enqueueResult.code });
+      this.db.markTriggerFireError(fireId, message);
+      await this.broadcastTriggerResult(trigger, session, contextKeys, message);
+    }
+  }
+
+  private async broadcastTriggerResult(
+    trigger: TriggerRow,
+    session: SessionRow,
+    contextKeys: string[],
+    output: string,
+  ): Promise<void> {
+    const header = `[Trigger ${trigger.id}] ${trigger.name}\ncodex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
+    const body = splitIntoChunks(output || "(no output)", appConfig.messageChunkSize);
+    let delivered = 0;
+    for (const contextKey of contextKeys) {
+      const channel = await this.resolveSendableChannelByContextKey(contextKey);
+      if (!channel) continue;
+      await channel.send(header);
+      for (let i = 0; i < body.length; i += 1) {
+        await channel.send(`(${i + 1}/${body.length}) ${body[i]}`);
+      }
+      delivered += 1;
+    }
+    if (delivered === 0) {
+      throw new Error("no sendable Discord context for trigger result");
+    }
   }
 
   private async handleAttachCommands(

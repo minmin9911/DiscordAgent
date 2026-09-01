@@ -1,6 +1,6 @@
 import { exec, spawn, spawnSync, type ExecException } from "node:child_process";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 const DISCORD_AGENT_SYSTEM_PROMPT = [
   "You are running through DiscordAgent.",
   "DiscordAgent hint commands: !attach (upload local file), !trigger (schedule prompt execution), !help agent (show DiscordAgent command help).",
@@ -55,8 +55,15 @@ export function resolveCodexWorkingDirectory(input: {
   codexThreadId?: string | null;
   preferredWorkingDirectory?: string | null;
 }): string | undefined {
-  if (input.forceWorkingDirectory && existsSync(input.forceWorkingDirectory)) {
-    return input.forceWorkingDirectory;
+  if (input.forceWorkingDirectory) {
+    try {
+      if (statSync(input.forceWorkingDirectory).isDirectory()) {
+        return input.forceWorkingDirectory;
+      }
+    } catch {
+      // Explicit overrides must never silently fall back to another project.
+    }
+    throw new Error(`Configured working directory is unavailable: ${input.forceWorkingDirectory}`);
   }
   if (input.codexThreadId) {
     const cwd = resolveWorkingDirectoryFromThreadId(input.codexThreadId);
@@ -68,6 +75,96 @@ export function resolveCodexWorkingDirectory(input: {
     return input.preferredWorkingDirectory;
   }
   return undefined;
+}
+
+export interface ParsedCodexJsonl {
+  threadId?: string;
+  agentMessages: string[];
+  hasAgentMessage: boolean;
+  warnings: string[];
+  errors: string[];
+}
+
+function isKnownCodexWarning(message: string): boolean {
+  return (
+    message.includes("Under-development features enabled:")
+    || message.includes("suppress_unstable_features_warning")
+    || message.includes("state db missing rollout path")
+    || message.includes("Falling back from WebSockets to HTTPS transport")
+    || message.includes("stream disconnected before completion")
+  );
+}
+
+function extractTopLevelCodexError(obj: Record<string, unknown>): string | null {
+  if (obj.type === "error" && typeof obj.message === "string") {
+    return obj.message;
+  }
+  if (obj.type !== "turn.failed") return null;
+  if (typeof obj.error === "string") return obj.error;
+  if (obj.error && typeof obj.error === "object") {
+    const error = obj.error as Record<string, unknown>;
+    if (typeof error.message === "string") return error.message;
+  }
+  return "Codex turn failed.";
+}
+
+export function parseCodexJsonl(raw: string): ParsedCodexJsonl {
+  const lines = raw
+    .split(/\r?\n/)
+    .map((value) => value.trim())
+    .filter(Boolean);
+  const agentMessages: string[] = [];
+  const warnings: string[] = [];
+  const errors: string[] = [];
+  const errorSet = new Set<string>();
+  let hasAgentMessage = false;
+  let threadId: string | undefined;
+
+  const pushIssue = (message: string): void => {
+    if (isKnownCodexWarning(message)) {
+      if (!warnings.includes(message)) warnings.push(message);
+      return;
+    }
+    if (!errorSet.has(message)) {
+      errorSet.add(message);
+      errors.push(message);
+    }
+  };
+
+  for (const line of lines) {
+    try {
+      const obj = JSON.parse(line) as Record<string, unknown>;
+      if (obj.type === "thread.started" && typeof obj.thread_id === "string") {
+        threadId = obj.thread_id;
+        continue;
+      }
+      const topLevelError = extractTopLevelCodexError(obj);
+      if (topLevelError) {
+        pushIssue(topLevelError);
+        continue;
+      }
+      if (isEventMsgAgentMessage(obj)) {
+        hasAgentMessage = true;
+        const eventMsgAgent = extractEventMsgAgentMessage(obj);
+        if (eventMsgAgent) agentMessages.push(eventMsgAgent.text);
+        continue;
+      }
+      if (obj.type === "item.completed" && obj.item && typeof obj.item === "object") {
+        const item = obj.item as Record<string, unknown>;
+        if (item.type === "agent_message" && typeof item.text === "string") {
+          hasAgentMessage = true;
+          agentMessages.push(item.text);
+          continue;
+        }
+        if (item.type === "error" && typeof item.message === "string") {
+          pushIssue(item.message);
+        }
+      }
+    } catch {
+      // Allow non-JSON lines mixed into the stream.
+    }
+  }
+  return { threadId, agentMessages, hasAgentMessage, warnings, errors };
 }
 
 export function detectLogicalCompletionFromJsonlLine(
@@ -243,12 +340,6 @@ export class CodexAdapter {
       "--json",
       "--skip-git-repo-check",
     ];
-    const addDirOptions: string[] = [];
-    if ((input.sandboxMode ?? "workspace-write") === "workspace-write") {
-      for (const dir of input.additionalReadDirs ?? []) {
-        addDirOptions.push("--add-dir", dir);
-      }
-    }
     const modelOptions = input.modelOverride ? ["--model", input.modelOverride] : [];
     const rootOptions: string[] = [];
     if ((input.sandboxMode ?? "workspace-write") === "workspace-write") {
@@ -257,7 +348,16 @@ export class CodexAdapter {
       }
     }
     const args: string[] = [];
-    const resolvedCwd = resolveCodexWorkingDirectory(input);
+    let resolvedCwd: string | undefined;
+    try {
+      resolvedCwd = resolveCodexWorkingDirectory(input);
+    } catch (error) {
+      return {
+        ok: false,
+        output: error instanceof Error ? error.message : String(error),
+        errorCode: "ERR_WORKING_DIRECTORY_INVALID",
+      };
+    }
     if (input.codexThreadId) {
       args.push(
         ...rootOptions,
@@ -351,7 +451,7 @@ export class CodexAdapter {
           void Promise.resolve(input.onStdErrLine(lastStderrLine)).catch(() => {});
           stderrLineBuffer = "";
         }
-        const parsed = this.parseJsonl(stdout);
+        const parsed = parseCodexJsonl(stdout);
         const fallback = this.sanitizeOutput(
           [stdout, stderr].filter(Boolean).join("\n").trim(),
         );
@@ -368,6 +468,17 @@ export class CodexAdapter {
             ok: false,
             output: parsed.errors.join("\n"),
             errorCode: "ERR_CODEX_AGENT_ERROR",
+            threadId: parsed.threadId,
+            workingDirectoryUsed: resolvedCwd,
+            warnings: parsed.warnings,
+          });
+          return;
+        }
+        if (code !== null && code !== 0 && !parsed.hasAgentMessage) {
+          resolve({
+            ok: false,
+            output: fallback,
+            errorCode: "ERR_CODEX_EXEC_FAILED",
             threadId: parsed.threadId,
             workingDirectoryUsed: resolvedCwd,
             warnings: parsed.warnings,
@@ -583,71 +694,6 @@ export class CodexAdapter {
     }
   }
 
-  private parseJsonl(raw: string): {
-    threadId?: string;
-    agentMessages: string[];
-    hasAgentMessage: boolean;
-    warnings: string[];
-    errors: string[];
-  } {
-    const lines = raw
-      .split(/\r?\n/)
-      .map((v) => v.trim())
-      .filter(Boolean);
-    const agentMessages: string[] = [];
-    const warnings: string[] = [];
-    const errors: string[] = [];
-    let hasAgentMessage = false;
-    let threadId: string | undefined;
-
-    for (const line of lines) {
-      try {
-        const obj = JSON.parse(line) as Record<string, unknown>;
-        if (obj.type === "thread.started" && typeof obj.thread_id === "string") {
-          threadId = obj.thread_id;
-          continue;
-        }
-        if (isEventMsgAgentMessage(obj)) {
-          hasAgentMessage = true;
-          const eventMsgAgent = extractEventMsgAgentMessage(obj);
-          if (eventMsgAgent) {
-            agentMessages.push(eventMsgAgent.text);
-          }
-          continue;
-        }
-        if (obj.type === "item.completed" && obj.item && typeof obj.item === "object") {
-          const item = obj.item as Record<string, unknown>;
-          if (item.type === "agent_message" && typeof item.text === "string") {
-            hasAgentMessage = true;
-            agentMessages.push(item.text);
-            continue;
-          }
-          if (item.type === "error" && typeof item.message === "string") {
-            if (this.isKnownWarning(item.message)) {
-              warnings.push(item.message);
-            } else {
-              errors.push(item.message);
-            }
-            continue;
-          }
-        }
-      } catch {
-        // 非JSON行は無視する（stderr混入を許容）。
-      }
-    }
-    return { threadId, agentMessages, hasAgentMessage, warnings, errors };
-  }
-
-  private isKnownWarning(message: string): boolean {
-    return (
-      message.includes("Under-development features enabled:") ||
-      message.includes("suppress_unstable_features_warning") ||
-      message.includes("state db missing rollout path") ||
-      message.includes("Falling back from WebSockets to HTTPS transport") ||
-      message.includes("stream disconnected before completion")
-    );
-  }
-
   private handleStdoutJsonlLine(
     line: string,
     onEvent?: (event: CodexStreamEvent) => void | Promise<void>,
@@ -699,7 +745,7 @@ export class CodexAdapter {
 
   private sanitizeOutput(text: string): string {
     const lines = text.split(/\r?\n/);
-    const cleaned = lines.filter((line) => !this.isKnownWarning(line.trim()));
+    const cleaned = lines.filter((line) => !isKnownCodexWarning(line.trim()));
     return cleaned.join("\n").trim();
   }
 

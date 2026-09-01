@@ -4,6 +4,13 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.91 (2026-09-01)
+- Automatically reconnect to Discord when real-time event delivery has stopped and unread recovery detects delayed messages.
+
+## v0.1.0 build.90 (2026-08-28)
+- Improve Codex failure handling to prevent errors from being treated as successful, overlapping work in the same session, and lost trigger results.
+- Fail safely instead of falling back to another directory when the configured working_directory is unavailable.
+
 ## v0.1.0 build.89 (2026-08-21)
 - Fix an issue where the same running message could appear multiple times when Discord communication was unstable.
 - Optimize External Sync history reads so unchanged Codex session history is not repeatedly parsed, reducing background CPU and memory usage and improving response latency.

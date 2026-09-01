@@ -2,6 +2,7 @@ import type pino from "pino";
 import type { RuntimeSessionState } from "./types.js";
 
 type TaskStatus = "success" | "error" | "timeout";
+type TaskRunResult = { status: TaskStatus; output: string; errorCode?: string };
 
 export interface ExecutionTask {
   executionId: string;
@@ -11,7 +12,7 @@ export interface ExecutionTask {
   maxRetries: number;
   onQueued: (position: number) => Promise<void>;
   onProgress: (elapsedSec: number, queueLength: number) => Promise<void>;
-  run: () => Promise<{ status: TaskStatus; output: string; errorCode?: string }>;
+  run: () => Promise<TaskRunResult>;
   onFinish: (result: {
     status: TaskStatus;
     output: string;
@@ -122,7 +123,15 @@ export class ExecutionManager {
 
     queue.tasks.push(task);
     const position = queue.tasks.length;
-    await task.onQueued(position);
+    try {
+      await task.onQueued(position);
+    } catch (err) {
+      // A transient Discord failure must not strand an accepted task in memory.
+      this.logger.warn(
+        { err, lockKey: task.lockKey, executionId: task.executionId, position },
+        "queued notification failed; continuing execution",
+      );
+    }
 
     if (!queue.running) {
       this.startNext(task.lockKey).catch((err) => {
@@ -145,6 +154,8 @@ export class ExecutionManager {
     const generationAtStart = queue.generation;
 
     let retries = 0;
+    let finishStarted = false;
+    let waitForUnderlyingCompletion: Promise<void> | null = null;
     let progressTimer: NodeJS.Timeout | null = setInterval(() => {
       const q = this.queues.get(lockKey);
       const elapsedSec = q?.runningSince ? Math.floor((Date.now() - q.runningSince) / 1000) : 0;
@@ -154,9 +165,27 @@ export class ExecutionManager {
       });
     }, this.progressIntervalSec * 1000);
 
+    const clearProgressTimer = (): void => {
+      if (!progressTimer) return;
+      clearInterval(progressTimer);
+      progressTimer = null;
+    };
+    const finishOnce = async (result: {
+      status: TaskStatus;
+      output: string;
+      retries: number;
+      errorCode?: string;
+    }): Promise<void> => {
+      if (finishStarted) return;
+      finishStarted = true;
+      await task.onFinish(result);
+    };
+
     try {
       while (true) {
-        const result = await this.runWithHardTimeout(task.run);
+        const timedRun = await this.runWithHardTimeout(task.run);
+        const result = timedRun.result;
+        waitForUnderlyingCompletion = timedRun.waitForCompletion;
         if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
           this.logger.warn(
             { lockKey, executionId: task.executionId },
@@ -169,16 +198,30 @@ export class ExecutionManager {
           await new Promise((r) => setTimeout(r, 2000));
           continue;
         }
-        await task.onFinish({
+        await finishOnce({
           status: result.status,
           output: result.output,
           retries,
           errorCode: result.errorCode,
         });
+        if (waitForUnderlyingCompletion) {
+          clearProgressTimer();
+          this.logger.warn(
+            { lockKey, executionId: task.executionId },
+            "watchdog expired; retaining queue lock until the task actually settles",
+          );
+        }
         break;
       }
     } catch (err) {
-      this.logger.error({ err }, "task run failed unexpectedly");
+      if (finishStarted) {
+        this.logger.error(
+          { err, lockKey, executionId: task.executionId },
+          "task finish callback failed",
+        );
+        return;
+      }
+      this.logger.error({ err, lockKey, executionId: task.executionId }, "task run failed unexpectedly");
       if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
         this.logger.warn(
           { lockKey, executionId: task.executionId },
@@ -186,16 +229,23 @@ export class ExecutionManager {
         );
         return;
       }
-      await task.onFinish({
-        status: "error",
-        output: "unexpected error",
-        retries,
-        errorCode: "ERR_UNEXPECTED",
-      });
+      try {
+        await finishOnce({
+          status: "error",
+          output: "unexpected error",
+          retries,
+          errorCode: "ERR_UNEXPECTED",
+        });
+      } catch (finishError) {
+        this.logger.error(
+          { err: finishError, lockKey, executionId: task.executionId },
+          "task finish callback failed",
+        );
+      }
     } finally {
-      if (progressTimer) {
-        clearInterval(progressTimer);
-        progressTimer = null;
+      clearProgressTimer();
+      if (waitForUnderlyingCompletion) {
+        await waitForUnderlyingCompletion;
       }
       const current = this.queues.get(lockKey);
       if (!current) return;
@@ -227,15 +277,18 @@ export class ExecutionManager {
   }
 
   private async runWithHardTimeout(
-    run: () => Promise<{ status: TaskStatus; output: string; errorCode?: string }>,
-  ): Promise<{ status: TaskStatus; output: string; errorCode?: string }> {
+    run: () => Promise<TaskRunResult>,
+  ): Promise<{ result: TaskRunResult; waitForCompletion: Promise<void> | null }> {
     let timer: NodeJS.Timeout | null = null;
+    let watchdogExpired = false;
+    const runPromise = Promise.resolve().then(run);
     try {
-      return await Promise.race([
-        run(),
-        new Promise<{ status: TaskStatus; output: string; errorCode?: string }>(
+      const result = await Promise.race([
+        runPromise,
+        new Promise<TaskRunResult>(
           (resolve) => {
             timer = setTimeout(() => {
+              watchdogExpired = true;
               resolve({
                 status: "timeout",
                 output: "Codex execution timed out by watchdog.",
@@ -245,6 +298,12 @@ export class ExecutionManager {
           },
         ),
       ]);
+      return {
+        result,
+        waitForCompletion: watchdogExpired
+          ? runPromise.then(() => undefined, () => undefined)
+          : null,
+      };
     } finally {
       if (timer) clearTimeout(timer);
     }

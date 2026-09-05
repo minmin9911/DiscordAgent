@@ -131,6 +131,7 @@ import {
   resolveCodexSessionMetaByThreadId,
   resolveWorkingDirectoryFromThreadId,
   searchCodexSessions,
+  type CodexUsageStatus,
   type CodexSessionMeta,
 } from "./codexSessionMeta.js";
 import {
@@ -163,6 +164,7 @@ const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
 const GATEWAY_RECONNECT_IDLE_CHECK_MS = 5 * 1000;
 const GATEWAY_RECONNECT_RETRY_MS = 60 * 1000;
 const GATEWAY_RECONNECT_COOLDOWN_MS = 5 * 60 * 1000;
+const USAGE_BEFORE_MAX_AGE_MS = 5 * 60 * 1000;
 const EXTERNAL_SYNC_PREVIEW_MAX = 1500;
 const APP_STATE_LAST_RESOLVED_DEFAULT_MODEL = "last_resolved_default_model";
 const APP_STATE_SANDBOX_NOTICE_STARTUP = "sandbox_notice_startup_once";
@@ -401,6 +403,7 @@ export class DiscordCodexBot {
   private gatewayReconnectInProgress = false;
   private gatewayReconnectTimer: NodeJS.Timeout | null = null;
   private lastGatewayReconnectAt = 0;
+  private latestUsageSnapshot: { status: CodexUsageStatus; observedAtMs: number } | null = null;
 
   constructor(params: { db: AppDb; logger: pino.Logger }) {
     this.db = params.db;
@@ -1316,6 +1319,7 @@ export class DiscordCodexBot {
     const executionLockKey = this.getExecutionLockKey(session);
     const storedThreadIdAtStart = session.codex_thread_id ?? null;
     let observedThreadId: string | null = storedThreadIdAtStart;
+    let usageStatusBefore: CodexUsageStatus | null = null;
     let lateLocalSyncAttempt: LocalExternalSyncAttempt | null = null;
     let threadSwitchNotice: string | null = null;
     let threadSwitchAnnounced = false;
@@ -1412,6 +1416,7 @@ export class DiscordCodexBot {
       },
       run: async () => {
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
+        usageStatusBefore = this.getRecentUsageSnapshot();
         const shouldInjectAttachInstruction = !session.attach_instruction_sent_at;
         if (shouldInjectAttachInstruction) {
           this.db.markAttachInstructionSent(session.id);
@@ -1723,7 +1728,7 @@ export class DiscordCodexBot {
         const chunks = splitIntoChunks(body, appConfig.messageChunkSize);
         const sessionLabel = this.getUserFacingCodexSessionLabel(session);
         const usageStatus = observedThreadId
-          ? readLatestCodexUsageStatusByThreadId(observedThreadId)
+          ? this.readAndRememberUsageStatus(observedThreadId)
           : null;
         if (observedThreadId && !session.model_override) {
           const resolvedDefaultModel = readLatestCodexResolvedModelByThreadId(observedThreadId);
@@ -1734,7 +1739,9 @@ export class DiscordCodexBot {
         const modelBlock = session.model_override
           ? `${modelWarningLine(this.locale, session.model_override)}\n`
           : "";
-        const usageBlock = usageStatus ? `${codexUsageStatusLine(this.locale, usageStatus)}\n` : "";
+        const usageBlock = usageStatus
+          ? `${codexUsageStatusLine(this.locale, usageStatus, usageStatusBefore)}\n`
+          : "";
         if (usageStatus) {
           this.logger.info(
             {
@@ -1748,6 +1755,8 @@ export class DiscordCodexBot {
               secondaryUsedPercent: usageStatus.secondaryUsedPercent,
               secondaryWindowMinutes: usageStatus.secondaryWindowMinutes,
               secondaryResetsAt: usageStatus.secondaryResetsAt,
+              beforePrimaryUsedPercent: usageStatusBefore?.primaryUsedPercent ?? null,
+              beforeSecondaryUsedPercent: usageStatusBefore?.secondaryUsedPercent ?? null,
             },
             "codex usage status read from session jsonl",
           );
@@ -4243,6 +4252,30 @@ export class DiscordCodexBot {
     this.cleanupObsoleteAtTriggers();
   }
 
+  private getRecentUsageSnapshot(nowMs = Date.now()): CodexUsageStatus | null {
+    const snapshot = this.latestUsageSnapshot;
+    if (!snapshot) return null;
+    const ageMs = nowMs - snapshot.observedAtMs;
+    if (ageMs < 0 || ageMs > USAGE_BEFORE_MAX_AGE_MS) return null;
+    return snapshot.status;
+  }
+
+  private readAndRememberUsageStatus(codexThreadId: string): CodexUsageStatus | null {
+    try {
+      const status = readLatestCodexUsageStatusByThreadId(codexThreadId);
+      if (status) {
+        this.latestUsageSnapshot = { status, observedAtMs: Date.now() };
+      }
+      return status;
+    } catch (error) {
+      this.logger.warn(
+        { err: error, codexThreadId },
+        "failed to read Codex usage status",
+      );
+      return null;
+    }
+  }
+
   private async recoverInterruptedTriggerFires(): Promise<void> {
     const message = "Trigger execution was interrupted by a DiscordAgent restart.";
     const interrupted = this.db.failClaimedPendingTriggerFires(message);
@@ -4401,6 +4434,7 @@ export class DiscordCodexBot {
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
         this.db.updateExecutionStatus(executionId, status, { retryCount: retries, errorCode });
+        this.readAndRememberUsageStatus(trigger.codex_thread_id);
         try {
           await this.broadcastTriggerResult(trigger, session, contextKeys, output || "(no output)");
         } catch (error) {

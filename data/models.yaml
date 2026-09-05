@@ -3,6 +3,9 @@ models:
   - id: default
     description: Uses Codex default model(config.toml)
     disabled: false
+  - id: gpt-6-astra
+    description: Our most capable model, built for the hardest end-to-end work. 250 / 25 / 1250
+    disabled: false
   - id: gpt-5.6-sol
     description: Latest frontier agentic coding model. 100 / 10 / 500
     disabled: false

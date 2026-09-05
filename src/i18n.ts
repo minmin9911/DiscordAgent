@@ -1,6 +1,6 @@
 export type AppLocale = "ja" | "en";
 
-type UsageLimitStatus = {
+export type UsageLimitStatus = {
   planType: string | null;
   primaryUsedPercent: number | null;
   primaryWindowMinutes: number | null;
@@ -12,7 +12,9 @@ type UsageLimitStatus = {
 
 type LimitLeftInfo = {
   leftPercent: number;
-  text: string;
+  label: string;
+  windowMinutes: number | null;
+  resetsAt: number | null;
 };
 
 export function resolveAppLocale(explicitLocale: string | null | undefined): AppLocale {
@@ -181,35 +183,67 @@ function formatLimitLeft(
   locale: AppLocale,
   usedPercent: number | null,
   windowMinutes: number | null,
+  resetsAt: number | null,
 ): LimitLeftInfo | null {
   if (usedPercent == null) return null;
   const leftPercent = Math.max(0, Math.min(100, Math.round(100 - usedPercent)));
   if (windowMinutes === 300) {
     return {
       leftPercent,
-      text: locale === "en" ? `\`5h=${leftPercent}%\`` : `\`5時間=${leftPercent}%\``,
+      label: locale === "en" ? "5h" : "5時間",
+      windowMinutes,
+      resetsAt,
     };
   }
   if (windowMinutes === 10080) {
     return {
       leftPercent,
-      text: locale === "en" ? `\`weekly=${leftPercent}%\`` : `\`週間=${leftPercent}%\``,
+      label: locale === "en" ? "weekly" : "週間",
+      windowMinutes,
+      resetsAt,
     };
   }
   return {
     leftPercent,
-    text: `\`window${windowMinutes ?? "?"}m=${leftPercent}%\``,
+    label: `window${windowMinutes ?? "?"}m`,
+    windowMinutes,
+    resetsAt,
   };
+}
+
+function buildLimitInfos(locale: AppLocale, status: UsageLimitStatus): LimitLeftInfo[] {
+  const primary = formatLimitLeft(
+    locale,
+    status.primaryUsedPercent,
+    status.primaryWindowMinutes,
+    status.primaryResetsAt,
+  );
+  const secondary = formatLimitLeft(
+    locale,
+    status.secondaryUsedPercent,
+    status.secondaryWindowMinutes,
+    status.secondaryResetsAt,
+  );
+  return [primary, secondary].filter((value): value is LimitLeftInfo => Boolean(value));
 }
 
 export function codexUsageStatusLine(
   locale: AppLocale,
   status: UsageLimitStatus,
+  previousStatus?: UsageLimitStatus | null,
 ): string {
-  const primary = formatLimitLeft(locale, status.primaryUsedPercent, status.primaryWindowMinutes);
-  const secondary = formatLimitLeft(locale, status.secondaryUsedPercent, status.secondaryWindowMinutes);
-  const limitInfos = [primary, secondary].filter((v): v is LimitLeftInfo => Boolean(v));
-  const parts = limitInfos.map((v) => v.text);
+  const limitInfos = buildLimitInfos(locale, status);
+  const previousLimitInfos = previousStatus ? buildLimitInfos(locale, previousStatus) : [];
+  const parts = limitInfos.map((current) => {
+    const previous = previousLimitInfos.find(
+      (candidate) => candidate.windowMinutes === current.windowMinutes
+        && candidate.resetsAt === current.resetsAt,
+    );
+    const value = previous
+      ? `${previous.leftPercent}%→${current.leftPercent}%`
+      : `${current.leftPercent}%`;
+    return `\`${current.label}=${value}\``;
+  });
   const resetsAtEpochSec = status.secondaryResetsAt ?? status.primaryResetsAt;
   if (resetsAtEpochSec != null) {
     const resetAt = new Date(resetsAtEpochSec * 1000);

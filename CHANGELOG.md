@@ -4,6 +4,10 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.92 (2026-09-04)
+- Show the Codex usage change through the current completion in a `20%→16%` format when a previous observation from the last five minutes is available.
+- Added GPT-6 Astra to the `!model` catalog.
+
 ## v0.1.0 build.91 (2026-09-01)
 - Automatically reconnect to Discord when real-time event delivery has stopped and unread recovery detects delayed messages.
 

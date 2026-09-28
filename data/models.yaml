@@ -6,6 +6,12 @@ models:
   - id: gpt-6-astra
     description: Our most capable model, built for the hardest end-to-end work. 250 / 25 / 1250
     disabled: false
+  - id: gpt-6-sol
+    description: Workhorse model for coding and everyday work. 50 / 5 / 250
+    disabled: false
+  - id: gpt-6-luna
+    description: Fast and affordable model for easier tasks. 2.5 / 0.25 / 12.5
+    disabled: false
   - id: gpt-5.6-sol
     description: Latest frontier agentic coding model. 100 / 10 / 500
     disabled: false
@@ -17,7 +23,4 @@ models:
     disabled: false
   - id: gpt-5.5
     description: Frontier model for complex coding, research, and real-world work. 125 / 12.5 / 750
-    disabled: false
-  - id: gpt-5.4
-    description: Strong model for everyday coding. 62.5 / 6.25 / 375
     disabled: false

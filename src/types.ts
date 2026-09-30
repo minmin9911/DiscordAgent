@@ -1,5 +1,6 @@
 export type SessionStatus = "active" | "archived" | "busy" | "error";
 export type SandboxMode = "workspace-write" | "danger-full-access";
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh" | "max";
 export type TriggerStatus = "enabled" | "disabled";
 export type TriggerType = "daily" | "weekly" | "at" | "monthly";
 
@@ -16,6 +17,7 @@ export interface SessionRow {
   name: string;
   codex_thread_id: string | null;
   model_override: string | null;
+  reasoning_effort_override: ReasoningEffort | null;
   sandbox_mode: SandboxMode | null;
   danger_full_access_until: string | null;
   preferred_working_directory: string | null;

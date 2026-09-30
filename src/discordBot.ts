@@ -74,11 +74,19 @@ import {
   queueStopallExecuted,
   codexUsageStatusLine,
   modelSetDone,
+  formatModelCatalogLine,
+  modelListPriceHeader,
   modelListSourceLine,
+  modelListTitle,
   modelWarningLine,
+  reasoningEffortDefaultLabel,
+  reasoningEffortModelConflict,
+  reasoningEffortSetDone,
+  reasoningEffortUnsupported,
   permissionRequestDiscarded,
   permissionRequestBusy,
   permissionGrantedReexecutePrompt,
+  sessionHelpRedirect,
   permissionRequestNotFound,
   permissionRetryPrompt,
   sandboxMigrationNotice,
@@ -95,6 +103,7 @@ import {
   temporaryFullAccessDisabled,
   temporaryFullAccessEnabled,
   usageModel,
+  usageReasoningEffort,
   usageOk,
   usageSandbox,
   usageTrigger,
@@ -154,9 +163,16 @@ import {
   detectThreadBindingChange,
   isMissingCodexThreadError,
 } from "./threadBinding.js";
-import type { SandboxMode, SessionRow, TriggerRow, TriggerStatus } from "./types.js";
+import type {
+  ReasoningEffort,
+  SandboxMode,
+  SessionRow,
+  TriggerRow,
+  TriggerStatus,
+} from "./types.js";
 import { truncateExternalUserMessage } from "./externalSyncText.js";
-import { loadModelCatalog, type ModelCatalogItem } from "./modelCatalog.js";
+import { loadModelCatalog } from "./modelCatalog.js";
+import { isReasoningEffortSupported, supportedReasoningEfforts } from "./reasoningEffort.js";
 import { resolveSessionWorkingDirectoryState } from "./sessionWorkingDirectory.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
@@ -558,7 +574,7 @@ export class DiscordCodexBot {
         return;
       }
       if (content === "!help") {
-        await msg.reply(buildCommandReference(this.locale, getBuildLabel(), APP_NAME));
+        await this.sendCommandReference(msg);
         return;
       }
       if (isHelpAgent) {
@@ -640,17 +656,20 @@ export class DiscordCodexBot {
         await this.handleModelCommand(msg, content.slice("!model ".length).trim());
         return;
       }
+      if (content === "!effort") {
+        await this.handleReasoningEffortCommand(msg, "");
+        return;
+      }
+      if (content.startsWith("!effort ")) {
+        await this.handleReasoningEffortCommand(msg, content.slice("!effort ".length).trim());
+        return;
+      }
       if (content.startsWith("!attach ")) {
         await msg.reply("ERR_ATTACH_DISABLED_FOR_USER");
         return;
       }
       if (content.startsWith("!")) {
-        await msg.reply(
-          syntaxUnknownCommand(
-            this.locale,
-            buildCommandReference(this.locale, getBuildLabel(), APP_NAME),
-          ),
-        );
+        await msg.reply(syntaxUnknownCommand(this.locale));
         return;
       }
       this.discardPendingApprovalForNewPrompt(contextKey);
@@ -945,7 +964,7 @@ export class DiscordCodexBot {
     const shorthandId = subRaw?.trim() ?? "";
 
     if (sub === "help") {
-      await msg.reply(buildCommandReference(this.locale, getBuildLabel(), APP_NAME));
+      await msg.reply(sessionHelpRedirect(this.locale));
       return;
     }
 
@@ -1196,6 +1215,7 @@ export class DiscordCodexBot {
       const lines = [
         `codex_thread_id: ${current.codex_thread_id ?? notLinkedYet(this.locale)}`,
         `model: ${current.model_override ?? "default"}`,
+        `reasoning_effort: ${current.reasoning_effort_override ?? "default"}`,
         `sandbox: ${current.sandbox_mode ?? "workspace-write"}`,
         `danger_full_access_until: ${current.danger_full_access_until ?? "-"}`,
         `working_directory: ${workingDirectory}`,
@@ -1442,6 +1462,7 @@ export class DiscordCodexBot {
                 sessionId: session.id,
                 codexThreadId: session.codex_thread_id,
                 modelOverride: session.model_override,
+                reasoningEffortOverride: session.reasoning_effort_override,
                 sandboxMode,
                 additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
                 preferredWorkingDirectory: session.preferred_working_directory,
@@ -1736,8 +1757,12 @@ export class DiscordCodexBot {
             this.db.setAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL, resolvedDefaultModel);
           }
         }
-        const modelBlock = session.model_override
-          ? `${modelWarningLine(this.locale, session.model_override)}\n`
+        const settingsBlock = session.model_override || session.reasoning_effort_override
+          ? `${modelWarningLine(
+            this.locale,
+            session.model_override,
+            session.reasoning_effort_override,
+          )}\n`
           : "";
         const usageBlock = usageStatus
           ? `${codexUsageStatusLine(this.locale, usageStatus, usageStatusBefore)}\n`
@@ -1782,7 +1807,7 @@ export class DiscordCodexBot {
             sessionLabel,
             switchBlock,
             approvalBlock,
-            modelBlock,
+            settingsBlock,
             usageBlock,
             historyBlock,
           ),
@@ -2821,6 +2846,7 @@ export class DiscordCodexBot {
             sessionId: session.id,
             codexThreadId: threadId,
             modelOverride: session.model_override,
+            reasoningEffortOverride: session.reasoning_effort_override,
             sandboxMode,
             additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
             preferredWorkingDirectory: session.preferred_working_directory,
@@ -3516,12 +3542,9 @@ export class DiscordCodexBot {
     return resolved ? `default (${resolved})` : "default";
   }
 
-  private formatModelLine(index: number, item: ModelCatalogItem, currentModel: string): string {
-    const currentMark = item.id === currentModel ? " <= current" : "";
-    const disabledMark = item.disabled ? " [disabled]" : "";
-    const label = this.modelOptionLabel(item.id);
-    const description = item.description ? ` | ${item.description}` : "";
-    return `${index} | ${label}${disabledMark}${currentMark}${description}`;
+  private effectiveModelIdForSession(session: SessionRow): string | null {
+    return session.model_override
+      ?? this.db.getAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL);
   }
 
   private async handleModelCommand(msg: Message, body: string): Promise<void> {
@@ -3535,12 +3558,19 @@ export class DiscordCodexBot {
     const catalog = loadModelCatalog();
     const currentModel = session.model_override ?? "default";
     if (!arg) {
-      const lines = catalog.items.map((item, index) => (
-        this.formatModelLine(index, item, currentModel)
-      ));
+      const lines = [
+        modelListPriceHeader(this.locale),
+        ...catalog.items.map((item, index) => formatModelCatalogLine(
+          this.locale,
+          index,
+          item,
+          currentModel,
+          this.modelOptionLabel(item.id),
+        )),
+      ];
       lines.push("---");
       lines.push(modelListSourceLine(this.locale, "data/models.yaml"));
-      await msg.reply(`model list\n${lines.join("\n")}`);
+      await msg.reply(`${modelListTitle(this.locale)}\n${lines.join("\n")}`);
       return;
     }
     const index = Number(arg);
@@ -3554,10 +3584,76 @@ export class DiscordCodexBot {
       return;
     }
     const override = selected.id === "default" ? null : selected.id;
+    const selectedModelId = override
+      ?? this.db.getAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL);
+    if (
+      session.reasoning_effort_override
+      && !isReasoningEffortSupported(selectedModelId, session.reasoning_effort_override, catalog)
+    ) {
+      await msg.reply(reasoningEffortModelConflict(
+        this.locale,
+        this.modelOptionLabel(selected.id),
+        session.reasoning_effort_override,
+      ));
+      return;
+    }
     this.db.setSessionModelOverride(session.id, override);
     session.model_override = override;
     const label = override ?? "default";
     await msg.reply(modelSetDone(this.locale, label));
+  }
+
+  private async handleReasoningEffortCommand(msg: Message, body: string): Promise<void> {
+    const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
+    const session = this.sessionService.resolveOrCreateActiveSession({
+      contextKey,
+      requesterId: msg.author.id,
+      initialMessage: "effort",
+    });
+    const arg = body.trim();
+    const catalog = loadModelCatalog();
+    const modelId = this.effectiveModelIdForSession(session);
+    const efforts = supportedReasoningEfforts(modelId, catalog);
+    if (!arg) {
+      const current = session.reasoning_effort_override ?? "default";
+      const defaultLabel = reasoningEffortDefaultLabel(this.locale);
+      const lines = [
+        `0 | ${defaultLabel}${current === "default" ? " <= current" : ""}`,
+        ...efforts.map((effort, index) => (
+          `${index + 1} | ${effort}${current === effort ? " <= current" : ""}`
+        )),
+      ];
+      const modelLabel = modelId ?? (this.locale === "en" ? "unknown default" : "既定モデル未確認");
+      const title = this.locale === "en"
+        ? `reasoning effort list (model=${modelLabel})`
+        : `reasoning effort一覧（model=${modelLabel}）`;
+      await msg.reply(`${title}\n${lines.join("\n")}`);
+      return;
+    }
+
+    const index = Number(arg);
+    if (!Number.isInteger(index) || index < 0 || index > efforts.length) {
+      await msg.reply(usageReasoningEffort(this.locale));
+      return;
+    }
+    const override: ReasoningEffort | null = index === 0 ? null : efforts[index - 1]!;
+    if (
+      override
+      && !isReasoningEffortSupported(modelId, override, catalog)
+    ) {
+      await msg.reply(reasoningEffortUnsupported(
+        this.locale,
+        override,
+        modelId ?? (this.locale === "en" ? "the unresolved default model" : "未確認の既定モデル"),
+      ));
+      return;
+    }
+    this.db.setSessionReasoningEffortOverride(session.id, override);
+    session.reasoning_effort_override = override;
+    await msg.reply(reasoningEffortSetDone(
+      this.locale,
+      override ?? reasoningEffortDefaultLabel(this.locale),
+    ));
   }
 
   private resetExternalSyncCursorsToLatest(): number {
@@ -4407,6 +4503,7 @@ export class DiscordCodexBot {
             sessionId: session.id,
             codexThreadId: session.codex_thread_id,
             modelOverride: session.model_override,
+            reasoningEffortOverride: session.reasoning_effort_override,
             sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
             additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
             preferredWorkingDirectory: session.preferred_working_directory,
@@ -4564,6 +4661,15 @@ export class DiscordCodexBot {
     for (const block of blocks) {
       await msg.reply(block);
     }
+  }
+
+  private async sendCommandReference(msg: Message): Promise<void> {
+    const [header = APP_NAME, ...lines] = buildCommandReference(
+      this.locale,
+      getBuildLabel(),
+      APP_NAME,
+    ).split("\n");
+    await this.sendMultilineReply(msg, header, lines);
   }
 
   private async sendMultilineReplyByChannel(

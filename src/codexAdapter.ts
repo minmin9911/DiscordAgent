@@ -1,6 +1,8 @@
 import { exec, spawn, spawnSync, type ExecException } from "node:child_process";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
 import { existsSync, statSync } from "node:fs";
+import type { ReasoningEffort } from "./types.js";
+import { reasoningEffortCodexConfigArgs } from "./reasoningEffort.js";
 const DISCORD_AGENT_SYSTEM_PROMPT = [
   "You are running through DiscordAgent.",
   "DiscordAgent hint commands: !attach (upload local file), !trigger (schedule prompt execution), !help agent (show DiscordAgent command help).",
@@ -232,6 +234,7 @@ export class CodexAdapter {
     sessionId: string;
     codexThreadId?: string | null;
     modelOverride?: string | null;
+    reasoningEffortOverride?: ReasoningEffort | null;
     sandboxMode?: CodexSandboxMode;
     additionalReadDirs?: string[];
     preferredWorkingDirectory?: string | null;
@@ -315,6 +318,7 @@ export class CodexAdapter {
     prompt: string;
     codexThreadId?: string | null;
     modelOverride?: string | null;
+    reasoningEffortOverride?: ReasoningEffort | null;
     sandboxMode?: CodexSandboxMode;
     additionalReadDirs?: string[];
     preferredWorkingDirectory?: string | null;
@@ -341,6 +345,7 @@ export class CodexAdapter {
       "--skip-git-repo-check",
     ];
     const modelOptions = input.modelOverride ? ["--model", input.modelOverride] : [];
+    const reasoningEffortOptions = reasoningEffortCodexConfigArgs(input.reasoningEffortOverride);
     const rootOptions: string[] = [];
     if ((input.sandboxMode ?? "workspace-write") === "workspace-write") {
       for (const dir of input.additionalReadDirs ?? []) {
@@ -365,6 +370,7 @@ export class CodexAdapter {
         "resume",
         ...commonOptions,
         ...modelOptions,
+        ...reasoningEffortOptions,
         input.codexThreadId,
         "-",
       );
@@ -374,6 +380,7 @@ export class CodexAdapter {
         "exec",
         ...commonOptions,
         ...modelOptions,
+        ...reasoningEffortOptions,
         "-",
       );
     }

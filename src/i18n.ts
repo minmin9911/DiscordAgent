@@ -1,3 +1,5 @@
+import type { ModelCatalogItem } from "./modelCatalog.js";
+
 export type AppLocale = "ja" | "en";
 
 export type UsageLimitStatus = {
@@ -29,58 +31,47 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       `${appName} Command Reference`,
       `build: ${build}`,
       "",
-      "## Basic Commands",
-      "- !help",
-      "- !help agent",
-      "  - Send DiscordAgent command guidance to Codex/agent context (for teaching DA-specific commands).",
-      "- !ask <instruction>",
-      "  - Sending a normal message without `!` works the same way.",
-      "- !queue",
-      "  - Show the current execution queue status.",
-      "- !queue stopall",
-      "  - Emergency-stop all queues (cancel pending, force-stop running tasks).",
-      "- !queue fix",
-      "  - Repair orphaned running entries waiting on missing Codex processes.",
-      "- !sync",
-      "  - Show sync status for updates made by other clients.",
-      "- !sync on|off",
-      "  - Enable or disable external client sync.",
-      "- !sync reset",
-      "  - Mark all current Codex messages as already synced. Only future updates will be synced.",
+      "## Basic",
+      "- !help  Show this list",
+      "- !help agent  Send DiscordAgent command guidance to the agent",
+      "- !ask <prompt>  Send a prompt to Codex (a normal message also works)",
+      "- !queue  Show running and queued work",
+      "- !queue stopall  Emergency-stop all queues",
+      "- !queue fix  Repair orphaned executions",
+      "- !sync [on|off|reset]  Show or change external sync",
+      "",
+      "## Sessions",
+      "- !session new [name]  Start a new session",
+      "- !session current  Show current settings and queue",
+      "- !session workdir set <absolute_path>  Override the working directory",
+      "- !session workdir clear  Clear the override",
+      "- !codex [query]  Search Codex threads",
+      "- !codex pick <no>  Bind a search result by number",
+      "- !codex session <UUID>  Bind by UUID",
+      "- !model [no]  List or switch models (0 = Codex config)",
+      "- !effort [no]  List or switch reasoning effort (0 = Codex config)",
+      "",
+      "## Permissions",
+      "- !sandbox on|off  Toggle the sandbox",
+      "- !sandbox dir add <absolute_path>  Allow an extra directory",
+      "- !sandbox dir remove <absolute_path>  Remove an allowed directory",
+      "- !sandbox dir list / !sandbox dir clear  List or remove all extra directories",
+      "- !ok [minutes] [prompt]  Grant access once or for a duration",
+      "- !ng  Cancel pending approval or temporary access",
+      "",
+      "## Triggers",
       "- !trigger add daily HH:mm <prompt>",
       "- !trigger add weekly Mon,Wed HH:mm <prompt>",
       "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
       "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
       "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
-      "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
-      "- !trigger env show <id> | !trigger env set workdir <id> <absolute_path> | !trigger env set sandbox <id> <on|off> | !trigger env clear <id>",
-      "- !sandbox on|off",
-      "  - Use workspace-write sandbox or full access for this session.",
-      "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
-      "  - Manage extra directories allowed for this session's Codex thread.",
-      "- !ok / !ok <minutes> / !ok <prompt> / !ok <minutes> <prompt> / !ng",
-      "  - Retry the latest permission-limited request or temporarily allow full access.",
-      "",
-      "## Session Management",
-      "- !session new [name]",
-      "  - Disconnect from the current session and start a new one (with a new Codex thread).",
-      "- !session workdir set <absolute_path> | !session workdir clear",
-      "  - Override the working_directory used by DiscordAgent for this session.",
-      "- !session current",
-      "  - Show the current session's codex_thread_id / working_directory / status / queue.",
-      "- !model",
-      "  - Show available model list for this session.",
-      "- !model <no>",
-      "  - Switch model for this session (0 = default).",
-      "- !codex [query]",
-      "  - Search ~/.codex/sessions and list candidates (latest first if omitted).",
-      "- !codex pick <no>",
-      "  - Change the Codex thread_id linked to the current session.",
-      "  - Select by number from the last !codex result.",
-      "- !codex session <codex_thread_id>",
-      "  - Recommended: specify the Codex thread UUID directly.",
-      "  - Change the Codex thread_id linked to the current session.",
-      "  - Directly bind to the specified thread_id.",
+      "- !trigger list [full]  List triggers",
+      "- !trigger show <id>  Show details",
+      "- !trigger edit <id> <prompt>  Change the prompt",
+      "- !trigger stop <id> / !trigger delete <id>  Stop or delete",
+      "- !trigger env show <id> / !trigger env clear <id>  Show or clear overrides",
+      "- !trigger env set workdir <id> <absolute_path>",
+      "- !trigger env set sandbox <id> <on|off>",
     ].join("\n");
   }
 
@@ -88,58 +79,47 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     `${appName} Command Reference`,
     `build: ${build}`,
     "",
-    "## 基本コマンド",
-    "- !help",
-    "- !help agent",
-    "  - DiscordAgent専用コマンドをAgentに教え込むためのガイダンスを送信します。",
-    "- !ask <instruction>",
-    "  - 「!」コマンドをつけず、普通のメッセージ送信でも同様に実行されます。",
-    "- !queue",
-    "  - 実行キューの状況を表示します。",
-    "- !queue stopall",
-    "  - 全キューを緊急停止します（待機中は取消、実行中は強制停止）。",
-    "- !queue fix",
-    "  - running孤児（存在しないCodexプロセスを待機中のスレッド）を修復します。",
-    "- !sync",
-    "  - 他のクライアント更新の同期状態を表示します。",
-    "- !sync on|off",
-    "  - 他のクライアント更新の同期を有効/無効にします。",
-    "- !sync reset",
-    "  - 現時点でのCodexのメッセージを全て同期済みとして扱います。未来の更新のみ同期します。",
-    "- !trigger add daily HH:mm <prompt>",
-    "- !trigger add weekly Mon,Wed HH:mm <prompt>",
-      "- !trigger add monthly <day(1-31)> HH:mm <prompt>",
-      "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <prompt>",
-      "- !trigger add at YYYY-MM-DD HH:mm <prompt>",
-      "- !trigger list | !trigger show <id> | !trigger edit <id> <prompt> | !trigger stop <id> | !trigger delete <id>",
-      "- !trigger env show <id> | !trigger env set workdir <id> <absolute_path> | !trigger env set sandbox <id> <on|off> | !trigger env clear <id>",
-      "- !sandbox on|off",
-      "  - このセッションを workspace-write または full access で実行します。",
-    "- !sandbox dir add <absolute_path> | remove <absolute_path> | list | clear",
-    "  - このセッションのCodexスレッドに追加許可ディレクトリを設定します。",
-    "- !ok / !ok <minutes> / !ok <prompt> / !ok <minutes> <prompt> / !ng",
-    "  - 直近の権限不足リクエストを再実行、または一時的に full access を許可します。",
+    "## 基本",
+    "- !help  この一覧",
+    "- !help agent  AgentにDiscordAgent専用コマンドを教える",
+    "- !ask <指示>  Codexへ送信（通常投稿でも可）",
+    "- !queue  実行・待機状況",
+    "- !queue stopall  全キューを緊急停止",
+    "- !queue fix  孤児状態の実行を修復",
+    "- !sync [on|off|reset]  外部同期の確認・変更",
     "",
-    "## セッション管理",
-    "- !session new [name]",
-    "  - 現在のセッションとの接続を切り、新しいセッションを始めます（Codexのスレッドも新しくなります）。",
-    "- !session workdir set <absolute_path> | !session workdir clear",
-    "  - このセッションで DiscordAgent が使う working_directory を上書きします。",
-    "- !session current",
-    "  - 現在のセッションの codex_thread_id / working_directory / status / queue などを表示します。",
-    "- !model",
-    "  - このセッションで利用できるモデル一覧を表示します。",
-    "- !model <no>",
-    "  - このセッションのモデルを切り替えます（0 = default）。",
-    "- !codex [query]",
-    "  - ~/.codex/sessions を検索して候補表示します（省略時は最新候補）。",
-    "- !codex pick <no>",
-    "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
-    "  - 直前の !codex 結果から番号選択します。",
-    "- !codex session <codex_thread_id>",
-    "  - 【推奨】CodexのスレッドID（UUID）でスレッドを指定します。",
-    "  - 現在のセッションに紐づく Codex の thread_id を変更します。",
-    "  - 直接 thread_id を指定します。",
+    "## セッション",
+    "- !session new [name]  新しいセッション",
+    "- !session current  現在の設定とキュー",
+    "- !session workdir set <絶対パス>  作業フォルダを上書き",
+    "- !session workdir clear  上書きを解除",
+    "- !codex [検索語]  Codexスレッドを検索",
+    "- !codex pick <番号>  検索結果から割り当て",
+    "- !codex session <UUID>  UUIDで割り当て",
+    "- !model [番号]  モデル一覧・切替（0=Codex設定）",
+    "- !effort [番号]  推論量一覧・切替（0=Codex設定）",
+    "",
+    "## 権限",
+    "- !sandbox on|off  サンドボックスを切替",
+    "- !sandbox dir add <絶対パス>  追加許可フォルダを登録",
+    "- !sandbox dir remove <絶対パス>  登録を解除",
+    "- !sandbox dir list / !sandbox dir clear  表示・全解除",
+    "- !ok [分数] [指示]  1回または指定分数だけ権限を付与",
+    "- !ng  承諾待ち・一時権限を取り消す",
+    "",
+    "## トリガー",
+    "- !trigger add daily HH:mm <指示>",
+    "- !trigger add weekly Mon,Wed HH:mm <指示>",
+    "- !trigger add monthly <日(1-31)> HH:mm <指示>",
+    "- !trigger add monthly <1-4|last> <Mon|Tue|...> HH:mm <指示>",
+    "- !trigger add at YYYY-MM-DD HH:mm <指示>",
+    "- !trigger list [full]  一覧",
+    "- !trigger show <id>  詳細",
+    "- !trigger edit <id> <指示>  指示を変更",
+    "- !trigger stop <id> / !trigger delete <id>  停止・削除",
+    "- !trigger env show <id> / !trigger env clear <id>  実行環境の表示・上書き解除",
+    "- !trigger env set workdir <id> <絶対パス>",
+    "- !trigger env set sandbox <id> <on|off>",
   ].join("\n");
 }
 
@@ -149,10 +129,16 @@ export function dmDisabledVerbose(locale: AppLocale): string {
     : "ERR_DM_DISABLED: このBotはDMでは使用できません。";
 }
 
-export function syntaxUnknownCommand(locale: AppLocale, helpText: string): string {
+export function syntaxUnknownCommand(locale: AppLocale): string {
   return locale === "en"
-    ? `Syntax Error: Unknown command.\n\n${helpText}`
-    : `Syntax Error: 不明なコマンドです。\n\n${helpText}`;
+    ? "Syntax Error: Unknown command. Use !help to see available commands."
+    : "不明なコマンドです。コマンド一覧は !help を参照してください。";
+}
+
+export function sessionHelpRedirect(locale: AppLocale): string {
+  return locale === "en"
+    ? "Use !help to see the command list."
+    : "コマンド一覧は !help を参照してください。";
 }
 
 export function queuedMessage(_locale: AppLocale, position: number, label: string): string {
@@ -282,12 +268,12 @@ export function completeHeader(
   label: string,
   switchBlock: string,
   approvalBlock: string,
-  modelBlock: string,
+  settingsBlock: string,
   usageBlock: string,
   historyBlock: string,
 ): string {
   void _locale;
-  return `codex_session: ${label}\n${switchBlock}${historyBlock}${approvalBlock}complete: body is sent in next message(s)\n${modelBlock}${usageBlock}`.trimEnd();
+  return `codex_session: ${label}\n${switchBlock}${historyBlock}${approvalBlock}complete: body is sent in next message(s)\n${settingsBlock}${usageBlock}`.trimEnd();
 }
 
 export function usageModel(locale: AppLocale): string {
@@ -302,18 +288,94 @@ export function modelSetDone(locale: AppLocale, modelLabel: string): string {
     : `モデルを切り替えました: ${modelLabel}`;
 }
 
-export function modelWarningLine(locale: AppLocale, modelLabel: string): string {
-  const plain = locale === "en"
-    ? `[MODEL WARNING] model=${modelLabel}`
-    : `[モデル警告] model=${modelLabel}`;
+export function modelWarningLine(
+  locale: AppLocale,
+  modelLabel: string | null,
+  reasoningEffort: string | null,
+): string {
+  const values = [
+    modelLabel ? `model=${modelLabel}` : "",
+    reasoningEffort ? `reasoning=${reasoningEffort}` : "",
+  ].filter(Boolean);
+  const label = modelLabel && reasoningEffort
+    ? (locale === "en" ? "[MODEL / REASONING WARNING]" : "[モデル・推論設定警告]")
+    : modelLabel
+      ? (locale === "en" ? "[MODEL WARNING]" : "[モデル警告]")
+      : (locale === "en" ? "[REASONING WARNING]" : "[推論設定警告]");
+  const plain = `${label} ${values.join(" | ")}`;
   const ansi = `\u001b[1;31m${plain}\u001b[0m`;
   return `\`\`\`ansi\n${ansi}\n\`\`\``;
+}
+
+export function usageReasoningEffort(locale: AppLocale): string {
+  return locale === "en" ? "usage: !effort [no]" : "使い方: !effort [no]";
+}
+
+export function reasoningEffortSetDone(locale: AppLocale, label: string): string {
+  return locale === "en"
+    ? `reasoning effort set: ${label}`
+    : `reasoning effort を設定しました: ${label}`;
+}
+
+export function reasoningEffortDefaultLabel(locale: AppLocale): string {
+  return locale === "en" ? "default (Codex config)" : "default（Codex設定）";
+}
+
+export function reasoningEffortModelConflict(
+  locale: AppLocale,
+  modelLabel: string,
+  effort: string,
+): string {
+  return locale === "en"
+    ? `Cannot switch to ${modelLabel}: the current reasoning effort \`${effort}\` is not supported by that model. Change or reset it with \`!effort\` first.`
+    : `${modelLabel} には現在の reasoning effort \`${effort}\` を指定できないため、モデルを切り替えませんでした。先に \`!effort\` で変更またはdefaultに戻してください。`;
+}
+
+export function reasoningEffortUnsupported(
+  locale: AppLocale,
+  effort: string,
+  modelLabel: string,
+): string {
+  return locale === "en"
+    ? `\`${effort}\` is not supported by ${modelLabel}. No setting was changed.`
+    : `${modelLabel} は \`${effort}\` に対応していません。設定は変更していません。`;
 }
 
 export function modelListSourceLine(locale: AppLocale, sourcePath: string): string {
   return locale === "en"
     ? `model list source: ${sourcePath}`
     : `モデル一覧の定義: ${sourcePath}`;
+}
+
+export function modelListTitle(locale: AppLocale): string {
+  return locale === "en" ? "model list" : "モデル一覧";
+}
+
+export function modelListPriceHeader(locale: AppLocale): string {
+  return locale === "en"
+    ? "Codex credits / 1M tokens: input / cached input / output"
+    : "Codexクレジット / 100万トークン: 入力 / キャッシュ入力 / 出力";
+}
+
+export function formatModelCatalogLine(
+  locale: AppLocale,
+  index: number,
+  item: ModelCatalogItem,
+  currentModel: string,
+  label: string,
+): string {
+  const currentMark = item.id === currentModel
+    ? (locale === "en" ? " <= current" : " <= 使用中")
+    : "";
+  const disabledMark = item.disabled
+    ? (locale === "en" ? " [disabled]" : " [無効]")
+    : "";
+  const description = locale === "en"
+    ? (item.descriptionEn || item.descriptionJa || item.description)
+    : (item.descriptionJa || item.descriptionEn || item.description);
+  const credits = item.creditsPerMillion?.join(" / ");
+  const details = [description, credits].filter(Boolean).join(" | ");
+  return `${index} | ${label}${disabledMark}${currentMark}${details ? ` | ${details}` : ""}`;
 }
 
 export function permissionRetryPrompt(
@@ -678,8 +740,8 @@ export function usageSessionSwitch(locale: AppLocale): string {
 
 export function usageSessionRoot(locale: AppLocale): string {
   return locale === "en"
-    ? "usage: !session <new|current|workdir> ..."
-    : "使い方: !session <new|current|workdir> ...";
+    ? "usage: !session <new|current|workdir> ...\nSee !help for the command list."
+    : "使い方: !session <new|current|workdir> ...\nコマンド一覧は !help を参照してください。";
 }
 
 export function usageSessionWorkdir(locale: AppLocale): string {

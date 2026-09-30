@@ -4,6 +4,12 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.95 (2026-09-30)
+- Localize the `!model` list in Japanese and English and add GPT-6.1 Sol. Model descriptions and Codex credit rates are maintained separately.
+
+## v0.1.0 build.93 (2026-09-28)
+- Add `!effort` to set reasoning effort per session. Show active model and reasoning overrides in red before the completion message.
+
 ## v0.1.0 build.92 (2026-09-04)
 - Show the Codex usage change through the current completion in a `20%→16%` format when a previous observation from the last five minutes is available.
 - Added GPT-6 Astra to the `!model` catalog.

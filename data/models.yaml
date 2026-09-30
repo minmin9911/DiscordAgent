@@ -1,26 +1,54 @@
 models:
-  # Credits per 1M tokens: input / cached input / output
+  # Standard Codex credits per 1M tokens: input / cached input / output
   - id: default
-    description: Uses Codex default model(config.toml)
+    description_ja: Codexのconfig.tomlで指定されたモデルを使用
+    description_en: Uses the model specified in Codex config.toml
     disabled: false
   - id: gpt-6-astra
-    description: Our most capable model, built for the hardest end-to-end work. 250 / 25 / 1250
+    description_ja: 最も難しい一連の作業向けの高性能モデル
+    description_en: Most capable model for difficult end-to-end work
+    credits_per_million: [250, 25, 1250]
     disabled: false
+    reasoning_efforts: [low, medium, high, xhigh, max]
+  - id: gpt-6.1-sol
+    description_ja: 複雑な開発や専門的な作業向けの主力モデル
+    description_en: Workhorse model for complex coding and professional work
+    credits_per_million: [50, 2.5, 250]
+    disabled: false
+    reasoning_efforts: [low, medium, high, xhigh, max]
   - id: gpt-6-sol
-    description: Workhorse model for coding and everyday work. 50 / 5 / 250
+    description_ja: コーディングや日常作業向けの主力モデル
+    description_en: Workhorse model for coding and everyday work
+    credits_per_million: [50, 5, 250]
     disabled: false
+    reasoning_efforts: [none, low, medium, high, xhigh, max]
   - id: gpt-6-luna
-    description: Fast and affordable model for easier tasks. 2.5 / 0.25 / 12.5
+    description_ja: 比較的簡単な作業向けの高速・低コストモデル
+    description_en: Fast, affordable model for simpler tasks
+    credits_per_million: [2.5, 0.25, 12.5]
     disabled: false
+    reasoning_efforts: [none, low, medium, high, xhigh, max]
   - id: gpt-5.6-sol
-    description: Latest frontier agentic coding model. 100 / 10 / 500
+    description_ja: 自律的なコーディングに強いモデル
+    description_en: Capable model for agentic coding
+    credits_per_million: [100, 10, 500]
     disabled: false
+    reasoning_efforts: [none, low, medium, high, xhigh, max]
   - id: gpt-5.6-terra
-    description: Balanced agentic coding model for everyday work. 50 / 5 / 300
+    description_ja: 日常的な開発作業向けのバランス型モデル
+    description_en: Balanced model for everyday agentic coding
+    credits_per_million: [50, 5, 300]
     disabled: false
+    reasoning_efforts: [none, low, medium, high, xhigh, max]
   - id: gpt-5.6-luna
-    description: Fast and affordable agentic coding model. 5 / 0.5 / 30
+    description_ja: 軽い開発作業向けの高速・低コストモデル
+    description_en: Fast, affordable model for lighter coding tasks
+    credits_per_million: [5, 0.5, 30]
     disabled: false
+    reasoning_efforts: [none, low, medium, high, xhigh, max]
   - id: gpt-5.5
-    description: Frontier model for complex coding, research, and real-world work. 125 / 12.5 / 750
+    description_ja: 複雑な開発・調査・実務向けのモデル
+    description_en: Model for complex coding, research, and professional work
+    credits_per_million: [125, 12.5, 750]
     disabled: false
+    reasoning_efforts: [none, low, medium, high, xhigh]

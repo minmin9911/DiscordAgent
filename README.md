@@ -147,13 +147,19 @@ Notes:
 - `!session connect <codex_thread_id>`
   - When reconnecting to an existing Codex session, the working-directory override is not applied automatically. If needed, run `!session workdir set ...` after connecting.
 - `!model`
-  - Show available models for the current session.
+  - Show available models for the current session. Descriptions follow `APP_LOCALE` (Japanese or English).
 - `!model <no>`
   - Switch the model for the current session.
   - `0` uses the model specified in Codex `config.toml` (default model).
   - The list source is `data/models.yaml`.
-  - Each description includes pricing guidance per 1M tokens for input / cached input / output.
+  - The list shows model descriptions and Codex credit rates per 1M input / cached input / output tokens.
   - Codex `exec` does not currently provide a model-list API, so this list must be maintained manually unless that feature is added.
+- `!effort`
+  - Show reasoning effort values supported by the model selected for this session.
+- `!effort <no>`
+  - Set reasoning effort for this session. `0` uses the value from Codex `config.toml`.
+  - If either the model or reasoning effort is overridden, the selected setting is shown in red before the completion message.
+  - Per-model supported values are maintained in `data/models.yaml`.
 - `!codex [query]`
 - `!codex pick <no>`
 - `!codex session <codex_thread_id>`

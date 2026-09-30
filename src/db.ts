@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { randomUUID } from "node:crypto";
 import type {
   ExecutionStatus,
+  ReasoningEffort,
   SandboxMode,
   SessionRow,
   TriggerFireRow,
@@ -37,6 +38,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   name TEXT NOT NULL,
   codex_thread_id TEXT,
   model_override TEXT,
+  reasoning_effort_override TEXT,
   sandbox_mode TEXT,
   danger_full_access_until TEXT,
   preferred_working_directory TEXT,
@@ -192,6 +194,12 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
     const hasModelOverride = columns.some((c) => c.name === "model_override");
     if (!hasModelOverride) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN model_override TEXT");
+    }
+    const hasReasoningEffortOverride = columns.some(
+      (c) => c.name === "reasoning_effort_override",
+    );
+    if (!hasReasoningEffortOverride) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN reasoning_effort_override TEXT");
     }
     const hasSandboxMode = columns.some((c) => c.name === "sandbox_mode");
     if (!hasSandboxMode) {
@@ -567,6 +575,15 @@ INNER JOIN triggers ON triggers.id = old.trigger_id`);
     this.db
       .prepare("UPDATE sessions SET model_override = ? WHERE id = ?")
       .run(modelOverride, sessionId);
+  }
+
+  setSessionReasoningEffortOverride(
+    sessionId: string,
+    reasoningEffortOverride: ReasoningEffort | null,
+  ): void {
+    this.db
+      .prepare("UPDATE sessions SET reasoning_effort_override = ? WHERE id = ?")
+      .run(reasoningEffortOverride, sessionId);
   }
 
   setSessionSandboxMode(sessionId: string, sandboxMode: SandboxMode): void {

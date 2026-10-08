@@ -4,6 +4,9 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.96 (2026-10-08)
+- The default entries in `!model` and `!effort` now display the values specified in Codex `config.toml`.
+
 ## v0.1.0 build.95 (2026-09-30)
 - Localize the `!model` list in Japanese and English and add GPT-6.1 Sol. Model descriptions and Codex credit rates are maintained separately.
 

@@ -19,6 +19,7 @@ import { SessionService } from "./sessionService.js";
 import { ExecutionManager } from "./executionManager.js";
 import { maskSecrets } from "./mask.js";
 import { parseOkCommandBody } from "./okCommand.js";
+import { readCodexDisplayDefaults, type CodexDisplayDefaults } from "./codexDisplayDefaults.js";
 import { ProgressMessageController, getDiscordErrorCode } from "./progressMessageController.js";
 import {
   CodexAdapter,
@@ -29,6 +30,7 @@ import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
 import {
   attachAbsolutePathRequired,
+  codexConfigDefaultLabel,
   attachInvalidPath,
   attachNotFile,
   attachNotFound,
@@ -3538,8 +3540,15 @@ export class DiscordCodexBot {
 
   private modelOptionLabel(value: string): string {
     if (value !== "default") return value;
-    const resolved = this.db.getAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL);
-    return resolved ? `default (${resolved})` : "default";
+    return codexConfigDefaultLabel(this.locale, this.readDisplayDefaults().model);
+  }
+
+  private readDisplayDefaults(): CodexDisplayDefaults {
+    const defaults = readCodexDisplayDefaults();
+    if (defaults.errorCode) {
+      this.logger.warn({ error_code: defaults.errorCode }, "codex default display settings unavailable");
+    }
+    return defaults;
   }
 
   private effectiveModelIdForSession(session: SessionRow): string | null {
@@ -3616,14 +3625,16 @@ export class DiscordCodexBot {
     const efforts = supportedReasoningEfforts(modelId, catalog);
     if (!arg) {
       const current = session.reasoning_effort_override ?? "default";
-      const defaultLabel = reasoningEffortDefaultLabel(this.locale);
+      const defaults = this.readDisplayDefaults();
+      const defaultLabel = codexConfigDefaultLabel(this.locale, defaults.reasoningEffort);
       const lines = [
         `0 | ${defaultLabel}${current === "default" ? " <= current" : ""}`,
         ...efforts.map((effort, index) => (
           `${index + 1} | ${effort}${current === effort ? " <= current" : ""}`
         )),
       ];
-      const modelLabel = modelId ?? (this.locale === "en" ? "unknown default" : "既定モデル未確認");
+      const modelLabel = session.model_override ?? defaults.model
+        ?? (this.locale === "en" ? "unknown default" : "既定モデル未確認");
       const title = this.locale === "en"
         ? `reasoning effort list (model=${modelLabel})`
         : `reasoning effort一覧（model=${modelLabel}）`;

@@ -4,6 +4,9 @@ English CHANGELOG: [CHANGELOG.md](./CHANGELOG.md)
 
 上が最新ビルド、下へ行くほど古いビルド。
 
+## v0.1.0 build.96 (2026-10-08)
+- `!model`・`!effort` の一覧で、default欄にCodexの`config.toml`で指定された値を表示するようにしました。
+
 ## v0.1.0 build.95 (2026-09-30)
 - `!model` の一覧を日英対応し、GPT-6.1 Solを追加しました。説明文とCodexクレジット単価を分けて管理します。
 

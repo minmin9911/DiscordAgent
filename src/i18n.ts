@@ -321,6 +321,10 @@ export function reasoningEffortDefaultLabel(locale: AppLocale): string {
   return locale === "en" ? "default (Codex config)" : "default（Codex設定）";
 }
 
+export function codexConfigDefaultLabel(locale: AppLocale, value: string | null): string {
+  return `default (${value ?? (locale === "en" ? "setting unknown" : "指定値不明")})`;
+}
+
 export function reasoningEffortModelConflict(
   locale: AppLocale,
   modelLabel: string,

@@ -4,6 +4,11 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.105 (2026-10-21)
+- Fixed an issue where sending another message during a new session's first execution could start concurrent executions and cause an error.
+- Fixed file uploads failing when the path in `!attach` is enclosed in quotation marks.
+- CLI Codex executions are no longer stopped based on elapsed time. If process liveness cannot be confirmed, execution locks are retained while checks continue. `CODEX_TIMEOUT_SEC` no longer applies to CLI execution; `CODEX_LIVENESS_CHECK_SEC` controls the check interval (default: 60 seconds).
+
 ## v0.1.0 build.96 (2026-10-08)
 - The default entries in `!model` and `!effort` now display the values specified in Codex `config.toml`.
 

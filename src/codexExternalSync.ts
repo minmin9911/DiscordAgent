@@ -1,6 +1,9 @@
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { IncrementalJsonlReader } from "./incrementalJsonlReader.js";
+
+interface SyncRecord { lineNo: number; text: string }
 
 export type ExternalSyncItemType = "user_message" | "agent_message";
 
@@ -70,6 +73,7 @@ export interface ExternalSyncTurn {
 }
 
 export interface ExternalSyncTurnReadResult {
+  sourceReset?: boolean;
   sourceFound: boolean;
   latestLineNo: number;
   latestCompleteLineNo: number;
@@ -243,15 +247,6 @@ function parseJsonObject(line: string): Record<string, unknown> | null {
   }
 }
 
-function findLatestValidJsonLineNo(lines: readonly string[]): number {
-  for (let index = lines.length - 1; index >= 0; index -= 1) {
-    const trimmed = (lines[index] ?? "").trim();
-    if (!trimmed) continue;
-    if (parseJsonObject(trimmed)) return index + 1;
-  }
-  return 0;
-}
-
 function getLineEventId(obj: Record<string, unknown>, lineNo: number): string {
   if (typeof obj.id === "string" && obj.id.trim()) return obj.id.trim();
   if (obj.item && typeof obj.item === "object") {
@@ -287,6 +282,10 @@ export function parseCompletedExternalSyncTurns(
   afterLineNo = 0,
   lineNoOffset = 0,
 ): ExternalSyncTurn[] {
+  return parseCompletedRecords(lines.map((text, index) => ({ text, lineNo: lineNoOffset + index + 1 })), afterLineNo);
+}
+
+function parseCompletedRecords(records: readonly SyncRecord[], afterLineNo: number): ExternalSyncTurn[] {
   const completed: ExternalSyncTurn[] = [];
   let active: {
     turnId: string;
@@ -299,9 +298,8 @@ export function parseCompletedExternalSyncTurns(
     seenAgentMessages: Set<string>;
   } | null = null;
 
-  for (let index = 0; index < lines.length; index += 1) {
-    const lineNo = lineNoOffset + index + 1;
-    const obj = parseJsonObject(lines[index] ?? "");
+  for (const { text, lineNo } of records) {
+    const obj = parseJsonObject(text);
     if (!obj) continue;
 
     const startedTurnId = getTaskTurnId(obj, "task_started");
@@ -345,7 +343,7 @@ export function parseCompletedExternalSyncTurns(
       continue;
     }
 
-    const event = parseExternalSyncEventLine(lines[index] ?? "", lineNo);
+    const event = parseExternalSyncEventLine(text, lineNo);
     if (!event) continue;
     active.eventIds.push(event.eventId);
     const normalized = normalizeForDedup(event.text);
@@ -365,9 +363,10 @@ export function parseCompletedExternalSyncTurns(
   return completed;
 }
 
-function findSafeTurnParseStartIndex(lines: readonly string[], afterLineNo: number): number {
-  for (let index = Math.min(afterLineNo - 1, lines.length - 1); index >= 0; index -= 1) {
-    const obj = parseJsonObject(lines[index] ?? "");
+function findSafeTurnParseStartIndex(records: readonly SyncRecord[], afterLineNo: number): number {
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    if (records[index]!.lineNo > afterLineNo) continue;
+    const obj = parseJsonObject(records[index]!.text);
     if (!obj) continue;
     if (getTaskTurnId(obj, "task_started")) return index;
     if (getTaskTurnId(obj, "task_complete")) return index + 1;
@@ -380,15 +379,18 @@ export function parseStartedExternalSyncTurns(
   afterLineNo = 0,
   lineNoOffset = 0,
 ): ExternalSyncStartedTurn[] {
+  return parseStartedRecords(lines.map((text, index) => ({ text, lineNo: lineNoOffset + index + 1 })), afterLineNo);
+}
+
+function parseStartedRecords(records: readonly SyncRecord[], afterLineNo: number): ExternalSyncStartedTurn[] {
   const turns: ExternalSyncStartedTurn[] = [];
   let active: ExternalSyncStartedTurn | null = null;
   const flushActive = (): void => {
     if (active && active.startLineNo > afterLineNo) turns.push(active);
     active = null;
   };
-  for (let index = 0; index < lines.length; index += 1) {
-    const lineNo = lineNoOffset + index + 1;
-    const obj = parseJsonObject(lines[index] ?? "");
+  for (const { text, lineNo } of records) {
+    const obj = parseJsonObject(text);
     if (!obj) continue;
     const startedTurnId = getTaskTurnId(obj, "task_started");
     if (startedTurnId) {
@@ -412,7 +414,7 @@ export function parseStartedExternalSyncTurns(
       flushActive();
       continue;
     }
-    const event = parseExternalSyncEventLine(lines[index] ?? "", lineNo);
+    const event = parseExternalSyncEventLine(text, lineNo);
     if (!event) continue;
     active.eventIds.push(event.eventId);
     if (event.itemType === "user_message" && !active.userMessage) {
@@ -423,87 +425,146 @@ export function parseStartedExternalSyncTurns(
   return turns;
 }
 
-export function readCodexThreadCompletedTurnsSinceLine(
-  codexThreadId: string,
-  afterLineNo: number,
-): ExternalSyncTurnReadResult {
-  const sessionsRoot = join(homedir(), ".codex", "sessions");
-  if (!existsSync(sessionsRoot)) {
+// Cache only synchronization metadata, never image/tool payloads or the whole file.
+export class CodexExternalSyncFileReader {
+  private reader: IncrementalJsonlReader;
+  private records: SyncRecord[] = [];
+  private latestLineNo = 0;
+  private coveredAfter = 0;
+  private queue: Promise<unknown> = Promise.resolve();
+
+  constructor(readonly path: string) {
+    this.reader = new IncrementalJsonlReader(path);
+  }
+
+  get lastReadBytes(): number { return this.reader.lastReadBytes; }
+
+  async completed(afterLineNo: number): Promise<ExternalSyncTurnReadResult> {
+    const read = await this.read(afterLineNo);
+    const candidates = read.records.slice(findSafeTurnParseStartIndex(read.records, afterLineNo));
+    const turns = parseCompletedRecords(candidates, afterLineNo);
     return {
-      sourceFound: false,
-      latestLineNo: 0,
-      latestCompleteLineNo: afterLineNo,
-      hasTaskBoundary: false,
-      turns: [],
+      sourceFound: true, latestLineNo: read.latestLineNo, sourceReset: read.sourceReset,
+      latestCompleteLineNo: turns.at(-1)?.completeLineNo ?? afterLineNo,
+      hasTaskBoundary: candidates.some(({ text }) => {
+        const obj = parseJsonObject(text);
+        return Boolean(obj && (getTaskTurnId(obj, "task_started") || getTaskTurnId(obj, "task_complete")));
+      }), turns,
     };
   }
-  const sessionFile = findSessionFileByThreadId(sessionsRoot, codexThreadId);
-  if (!sessionFile) {
-    return {
-      sourceFound: false,
-      latestLineNo: 0,
-      latestCompleteLineNo: afterLineNo,
-      hasTaskBoundary: false,
-      turns: [],
-    };
+
+  read(afterLineNo: number): Promise<{ records: SyncRecord[]; latestLineNo: number; sourceReset: boolean }> {
+    const work = this.queue.then(async () => {
+      let sourceReset = false;
+      const reset = (): void => {
+        this.records = [];
+        this.latestLineNo = 0;
+        this.coveredAfter = 0;
+      };
+      if (afterLineNo < this.coveredAfter) {
+        this.reader = new IncrementalJsonlReader(this.path);
+        reset();
+      }
+      try {
+        await this.reader.read((text, lineNo) => {
+          const obj = parseJsonObject(text);
+          if (!obj) return;
+          this.latestLineNo = lineNo;
+          const record = compactSyncRecord(obj, lineNo, text);
+          if (record) this.records.push({ lineNo, text: record });
+          // Discard acknowledged history while bootstrapping, not just after a full scan.
+          if (afterLineNo !== Number.MAX_SAFE_INTEGER && lineNo <= afterLineNo
+            && (getTaskTurnId(obj, "task_started") || getTaskTurnId(obj, "task_complete"))) {
+            const keep = getTaskTurnId(obj, "task_started") ? 1 : 0;
+            this.records = keep ? this.records.slice(-keep) : [];
+          }
+        }, () => { reset(); sourceReset = true; });
+      } catch (error) {
+        this.reader = new IncrementalJsonlReader(this.path);
+        reset();
+        throw error;
+      }
+      if (afterLineNo !== Number.MAX_SAFE_INTEGER) {
+        let firstLine = afterLineNo + 1;
+        for (let index = this.records.length - 1; index >= 0; index -= 1) {
+          const record = this.records[index]!;
+          if (record.lineNo > afterLineNo) continue;
+          const obj = parseJsonObject(record.text);
+          if (!obj) continue;
+          if (getTaskTurnId(obj, "task_started")) { firstLine = record.lineNo; break; }
+          if (getTaskTurnId(obj, "task_complete")) { firstLine = record.lineNo + 1; break; }
+        }
+        // Keep three adjacent physical lines for the older response_item identity fallback.
+        this.records = this.records.filter((record) => record.lineNo >= firstLine - 3);
+        this.coveredAfter = afterLineNo;
+      }
+      return { records: this.records.slice(), latestLineNo: this.latestLineNo, sourceReset };
+    });
+    this.queue = work.catch(() => {});
+    return work;
   }
-  const text = readFileSync(sessionFile, "utf8");
-  const lines = text.split(/\r?\n/);
-  const safeLatestLineNo = findLatestValidJsonLineNo(lines);
-  const safeLines = lines.slice(0, safeLatestLineNo);
-  const parseStartIndex = findSafeTurnParseStartIndex(safeLines, afterLineNo);
-  const candidateLines = safeLines.slice(parseStartIndex);
-  const turns = parseCompletedExternalSyncTurns(
-    candidateLines,
-    afterLineNo,
-    parseStartIndex,
-  );
-  let hasTaskBoundary = false;
-  for (let index = 0; index < candidateLines.length; index += 1) {
-    const obj = parseJsonObject(candidateLines[index] ?? "");
-    if (!obj) continue;
-    if (getTaskTurnId(obj, "task_started") || getTaskTurnId(obj, "task_complete")) {
-      hasTaskBoundary = true;
-      break;
-    }
-  }
-  const latestCompleteLineNo = turns.length > 0
-    ? turns[turns.length - 1]!.completeLineNo
-    : afterLineNo;
-  return {
-    sourceFound: true,
-    latestLineNo: safeLatestLineNo,
-    latestCompleteLineNo,
-    hasTaskBoundary,
-    turns,
-  };
 }
 
-export function readCodexThreadStartedTurnsSinceLine(
-  codexThreadId: string,
-  afterLineNo: number,
-): ExternalSyncStartedTurnReadResult {
+function compactSyncRecord(obj: Record<string, unknown>, lineNo: number, text: string): string | null {
+  const type = obj.type;
+  const payload = obj.payload as Record<string, unknown> | undefined;
+  if (getTaskTurnId(obj, "task_started") || getTaskTurnId(obj, "task_complete")) {
+    return JSON.stringify({ type, timestamp: obj.timestamp, id: obj.id,
+      payload: { type: payload!.type, turn_id: payload!.turn_id,
+        last_agent_message: payload!.last_agent_message } });
+  }
+  const event = parseExternalSyncEventLine(text, lineNo);
+  if (!event) return null;
+  if (type === "event_msg") {
+    return JSON.stringify({ type, timestamp: obj.timestamp,
+      payload: { type: event.itemType, message: event.text } });
+  }
+  if (type === "item.completed") {
+    return JSON.stringify({ type, timestamp: obj.timestamp,
+      item: { id: event.eventId, type: event.itemType, text: event.text } });
+  }
+  return JSON.stringify({ type, timestamp: obj.timestamp,
+    payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: event.text }] } });
+}
+
+const fileReaders = new Map<string, CodexExternalSyncFileReader>();
+
+export function retainCodexExternalSyncReaders(threadIds: ReadonlySet<string>): void {
+  for (const id of fileReaders.keys()) {
+    if (!threadIds.has(id)) { fileReaders.delete(id); sessionFilePathCache.delete(id); }
+  }
+}
+
+function threadFileReader(codexThreadId: string): CodexExternalSyncFileReader | null {
   const sessionsRoot = join(homedir(), ".codex", "sessions");
-  if (!existsSync(sessionsRoot)) {
-    return { sourceFound: false, latestLineNo: 0, turns: [] };
-  }
+  if (!existsSync(sessionsRoot)) return null;
   const sessionFile = findSessionFileByThreadId(sessionsRoot, codexThreadId);
-  if (!sessionFile) {
-    return { sourceFound: false, latestLineNo: 0, turns: [] };
+  if (!sessionFile) { fileReaders.delete(codexThreadId); return null; }
+  let reader = fileReaders.get(codexThreadId);
+  if (!reader || reader.path !== sessionFile) {
+    reader = new CodexExternalSyncFileReader(sessionFile);
+    fileReaders.set(codexThreadId, reader);
   }
-  const lines = readFileSync(sessionFile, "utf8").split(/\r?\n/);
-  const latestLineNo = findLatestValidJsonLineNo(lines);
-  const safeLines = lines.slice(0, latestLineNo);
-  const parseStartIndex = findSafeTurnParseStartIndex(safeLines, afterLineNo);
-  return {
-    sourceFound: true,
-    latestLineNo,
-    turns: parseStartedExternalSyncTurns(
-      safeLines.slice(parseStartIndex),
-      afterLineNo,
-      parseStartIndex,
-    ),
-  };
+  return reader;
+}
+
+export async function readCodexThreadCompletedTurnsSinceLine(
+  codexThreadId: string, afterLineNo: number,
+): Promise<ExternalSyncTurnReadResult> {
+  const reader = threadFileReader(codexThreadId);
+  if (!reader) return { sourceFound: false, latestLineNo: 0,
+    latestCompleteLineNo: afterLineNo, hasTaskBoundary: false, turns: [] };
+  return reader.completed(afterLineNo);
+}
+
+export async function readCodexThreadStartedTurnsSinceLine(
+  codexThreadId: string, afterLineNo: number,
+): Promise<ExternalSyncStartedTurnReadResult> {
+  const reader = threadFileReader(codexThreadId);
+  if (!reader) return { sourceFound: false, latestLineNo: 0, turns: [] };
+  const read = await reader.read(afterLineNo);
+  return { sourceFound: true, latestLineNo: read.latestLineNo,
+    turns: parseStartedRecords(read.records, afterLineNo) };
 }
 
 function findSessionFileByThreadId(rootDir: string, threadId: string): string | null {
@@ -531,113 +592,44 @@ function findSessionFileByThreadId(rootDir: string, threadId: string): string | 
   return null;
 }
 
-export function readCodexThreadEventsSinceLine(
-  codexThreadId: string,
-  afterLineNo: number,
-): ExternalSyncReadResult {
-  const sessionsRoot = join(homedir(), ".codex", "sessions");
-  if (!existsSync(sessionsRoot)) {
-    return { sourceFound: false, latestLineNo: 0, events: [] };
-  }
-  const sessionFile = findSessionFileByThreadId(sessionsRoot, codexThreadId);
-  if (!sessionFile) {
-    return { sourceFound: false, latestLineNo: 0, events: [] };
-  }
-  const text = readFileSync(sessionFile, "utf8");
-  const lines = text.split(/\r?\n/);
+export async function readCodexThreadEventsSinceLine(
+  codexThreadId: string, afterLineNo: number,
+): Promise<ExternalSyncReadResult> {
+  const reader = threadFileReader(codexThreadId);
+  if (!reader) return { sourceFound: false, latestLineNo: 0, events: [] };
+  const read = await reader.read(afterLineNo);
+  return { sourceFound: true, latestLineNo: read.latestLineNo,
+    events: parseRecordEvents(read.records, afterLineNo) };
+}
+
+export function parseRecordEvents(records: readonly SyncRecord[], afterLineNo: number): ExternalSyncEvent[] {
   const events: ExternalSyncEvent[] = [];
   const recentBySignature = new Map<string, number>();
-  for (let i = 0; i < lines.length; i += 1) {
-    const lineNo = i + 1;
+  const adjacentLines = new Map(records.map((record) => [record.lineNo, record.text]));
+  for (const { text, lineNo } of records) {
     if (lineNo <= afterLineNo) continue;
-    const line = lines[i] ?? "";
-    const trimmed = line.trim();
-    const parsed = parseExternalSyncEventLine(line, lineNo);
-    if (!parsed) continue;
-    let occurredAtMs: number | null = null;
-    if (trimmed) {
-      try {
-        const obj = JSON.parse(trimmed) as { timestamp?: unknown };
-        if (typeof obj.timestamp === "string") {
-          const ms = Date.parse(obj.timestamp);
-          if (Number.isFinite(ms)) occurredAtMs = ms;
-        }
-      } catch {
-        // ignore
-      }
-    }
-    const normalized = normalizeForDedup(parsed.text);
-    if (normalized) {
-      const sig = `${parsed.itemType}:${normalized}`;
-      const prevLineNo = recentBySignature.get(sig);
-      if (typeof prevLineNo === "number" && parsed.lineNo - prevLineNo <= 3) {
-        recentBySignature.set(sig, parsed.lineNo);
-        continue;
-      }
-      recentBySignature.set(sig, parsed.lineNo);
-    }
-    let eventSignature: string | undefined;
+    const parsed = parseExternalSyncEventLine(text, lineNo);
+    const obj = parseJsonObject(text);
+    if (!parsed || !obj) continue;
+    const ms = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
+    const sig = parsed.itemType + ":" + normalizeForDedup(parsed.text);
+    const previous = recentBySignature.get(sig);
+    recentBySignature.set(sig, lineNo);
+    if (previous !== undefined && lineNo - previous <= 3) continue;
+    const payload = obj.payload as Record<string, unknown> | undefined;
     let stableEventId: string | undefined;
-    if (trimmed) {
-      try {
-        const obj = JSON.parse(trimmed) as {
-          type?: unknown;
-          timestamp?: unknown;
-          payload?: {
-            type?: unknown;
-            message?: unknown;
-            role?: unknown;
-            content?: unknown;
-          };
-        };
-        if (
-          obj.type === "event_msg"
-          && typeof obj.timestamp === "string"
-          && obj.payload
-          && typeof obj.payload === "object"
-          && (obj.payload.type === "user_message" || obj.payload.type === "agent_message")
-          && typeof obj.payload.message === "string"
-        ) {
-          stableEventId = buildExternalSyncEventMsgId({
-            itemType: obj.payload.type,
-            timestamp: obj.timestamp,
-            text: obj.payload.message,
-          });
-          eventSignature = buildExternalSyncEventSignature({
-            itemType: obj.payload.type,
-            timestamp: obj.timestamp,
-            text: obj.payload.message,
-          });
-        }
-        if (
-          !stableEventId
-          && obj.type === "response_item"
-          && obj.payload
-          && typeof obj.payload === "object"
-          && obj.payload.type === "message"
-          && obj.payload.role === "assistant"
-        ) {
-          const adjacent = tryBuildStableIdentityFromAdjacentEventMsg(
-            lines,
-            i,
-            "agent_message",
-            parsed.text,
-          );
-          if (adjacent) {
-            stableEventId = adjacent.stableEventId;
-            eventSignature = adjacent.eventSignature;
-          }
-        }
-      } catch {
-        // ignore
-      }
+    let eventSignature: string | undefined;
+    if (obj.type === "event_msg" && typeof obj.timestamp === "string" && payload) {
+      const identity = { itemType: parsed.itemType, timestamp: obj.timestamp, text: parsed.text };
+      stableEventId = buildExternalSyncEventMsgId(identity);
+      eventSignature = buildExternalSyncEventSignature(identity);
+    } else if (obj.type === "response_item") {
+      const lines = [lineNo - 3, lineNo - 2, lineNo - 1].map((n) => adjacentLines.get(n) ?? "");
+      const adjacent = tryBuildStableIdentityFromAdjacentEventMsg([...lines, text], 3, parsed.itemType, parsed.text);
+      stableEventId = adjacent?.stableEventId;
+      eventSignature = adjacent?.eventSignature;
     }
-    events.push({ ...parsed, occurredAtMs, stableEventId, eventSignature });
+    events.push({ ...parsed, occurredAtMs: Number.isFinite(ms) ? ms : null, stableEventId, eventSignature });
   }
-  const safeLatestLineNo = findLatestValidJsonLineNo(lines);
-  return {
-    sourceFound: true,
-    latestLineNo: safeLatestLineNo,
-    events,
-  };
+  return events;
 }

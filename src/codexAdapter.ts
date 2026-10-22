@@ -1,8 +1,10 @@
-import { exec, spawn, spawnSync, type ExecException } from "node:child_process";
+import { exec, spawn, type ExecException } from "node:child_process";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
 import { existsSync, statSync } from "node:fs";
 import type { ReasoningEffort } from "./types.js";
 import { reasoningEffortCodexConfigArgs } from "./reasoningEffort.js";
+import { stopWindowsProcessTree } from "./processTermination.js";
+import { LivenessWarningGate, ProcessLivenessTracker } from "./processLiveness.js";
 const DISCORD_AGENT_SYSTEM_PROMPT = [
   "You are running through DiscordAgent.",
   "DiscordAgent hint commands: !attach (upload local file), !trigger (schedule prompt execution), !help agent (show DiscordAgent command help).",
@@ -203,7 +205,8 @@ export function isCodexRuntimeCommandLine(commandLine: string | null | undefined
   return normalized.includes("@openai\\codex\\bin\\codex.js")
     || normalized.includes("@openai/codex/bin/codex.js")
     || normalized.includes("codex.cmd exec")
-    || normalized.includes(" codex exec ");
+    || normalized.includes(" codex exec ")
+    || /codex\.exe(?:"|\s)/.test(normalized);
 }
 
 export function selectCodexUserOutput(input: {
@@ -221,17 +224,28 @@ export function selectCodexUserOutput(input: {
 export class CodexAdapter {
   private readonly activeChildPids = new Set<number>();
   private readonly pidToThreadId = new Map<number, string>();
+  private readonly pidToSessionId = new Map<number, string>();
+  private readonly stopBySession = new Map<string, () => Promise<void>>();
 
   constructor(
     private readonly mode: "cli" | "template",
     private readonly commandTemplate: string,
-    private readonly timeoutMs: number,
+    private readonly livenessCheckIntervalMs: number,
     private readonly closeGraceMs: number,
+    private readonly onDiagnostic?: (info: {
+      type: string;
+      sessionId: string;
+      executionId?: string;
+      codexThreadId?: string | null;
+      pid?: number; code?: number | null; errors?: string[];
+    }) => void,
+    private readonly templateTimeoutMs = 1800_000,
   ) {}
 
   async run(input: {
     prompt: string;
     sessionId: string;
+    executionId?: string;
     codexThreadId?: string | null;
     modelOverride?: string | null;
     reasoningEffortOverride?: ReasoningEffort | null;
@@ -246,9 +260,12 @@ export class CodexAdapter {
     onClose?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
     onLifecycle?: (
       info: {
-        type: "logical_complete" | "close_grace_expired";
+        type: "logical_complete" | "close_grace_expired" | "process_exit" | "stop_requested" | "stop_confirmed" | "stop_failed" | "liveness_unknown";
         source?: "turn.completed" | "task_complete";
         graceMs?: number;
+        pid?: number;
+        code?: number | null;
+        errors?: string[];
       },
     ) => void | Promise<void>;
   }): Promise<CodexResult> {
@@ -276,20 +293,32 @@ export class CodexAdapter {
   }
 
   getActiveCodexThreadIds(): string[] {
-    this.pruneDeadTrackedProcesses();
+    // Keep unresolved executions protected even when their wrapper PID has exited.
     return [...new Set(this.pidToThreadId.values())];
+  }
+
+  getUnresolvedExecutionLockKeys(): Set<string> {
+    return new Set([
+      ...[...this.pidToThreadId.values()].map(id => `codex:${id}`),
+      ...[...this.pidToSessionId.values()].map(id => `session:${id}`),
+    ]);
+  }
+
+  async requestStopSession(sessionId: string): Promise<void> {
+    await this.stopBySession.get(sessionId)?.();
   }
 
   private async runWithTemplate(input: {
     prompt: string;
     sessionId: string;
+    executionId?: string;
   }): Promise<CodexResult> {
     const command = this.commandTemplate
       .replaceAll("{input}", this.escapeForShell(input.prompt))
       .replaceAll("{sessionId}", input.sessionId);
 
     return new Promise<CodexResult>((resolve) => {
-      exec(command, { timeout: this.timeoutMs }, (error, stdout, stderr) => {
+      exec(command, { timeout: this.templateTimeoutMs }, (error, stdout, stderr) => {
         if (error) {
           const output = [stdout, stderr].filter(Boolean).join("\n").trim();
           if ((error as ExecException).killed) {
@@ -316,6 +345,8 @@ export class CodexAdapter {
 
   private async runWithCodexCli(input: {
     prompt: string;
+    sessionId: string;
+    executionId?: string;
     codexThreadId?: string | null;
     modelOverride?: string | null;
     reasoningEffortOverride?: ReasoningEffort | null;
@@ -328,9 +359,12 @@ export class CodexAdapter {
     onClose?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
     onLifecycle?: (
       info: {
-        type: "logical_complete" | "close_grace_expired";
+        type: "logical_complete" | "close_grace_expired" | "process_exit" | "stop_requested" | "stop_confirmed" | "stop_failed" | "liveness_unknown";
         source?: "turn.completed" | "task_complete";
         graceMs?: number;
+        pid?: number;
+        code?: number | null;
+        errors?: string[];
       },
     ) => void | Promise<void>;
   }): Promise<CodexResult> {
@@ -391,6 +425,7 @@ export class CodexAdapter {
       const spawnArgs = isWin
         ? ["/d", "/s", "/c", "codex.cmd", ...args]
         : args;
+      const spawnStartedAt = Date.now();
       const child = spawn(command, spawnArgs, {
         shell: false,
         windowsHide: true,
@@ -398,6 +433,8 @@ export class CodexAdapter {
       });
       if (child.pid) {
         this.activeChildPids.add(child.pid);
+        this.pidToSessionId.set(child.pid, input.sessionId);
+        this.onDiagnostic?.({ type: "process_spawned", sessionId: input.sessionId, executionId: input.executionId, codexThreadId: input.codexThreadId, pid: child.pid });
         if (input.codexThreadId) {
           this.pidToThreadId.set(child.pid, input.codexThreadId);
         }
@@ -410,16 +447,25 @@ export class CodexAdapter {
       let logicalComplete = false;
       let forcedCloseAfterLogicalComplete = false;
       let settled = false;
-      let watchdogTimer: NodeJS.Timeout | null = setTimeout(() => {
-        timedOut = true;
-        this.killProcessTree(child.pid);
-      }, this.timeoutMs);
+      let rootExited = false;
+      let stopping: Promise<void> | null = null;
+      let exitGraceTimer: NodeJS.Timeout | null = null;
+      let livenessTimer: NodeJS.Timeout | null = null;
       let closeGraceTimer: NodeJS.Timeout | null = null;
+      const tracker = child.pid && isWin
+        ? new ProcessLivenessTracker(child.pid, isCodexRuntimeCommandLine, undefined, spawnStartedAt) : null;
+      let checking = false;
+      let checkAgain = false;
+      let closeReceived = false;
+      let closedCode: number | null = null;
+      let processDisappeared = false;
+      let lastLivenessState: string | null = null;
+      const livenessWarning = new LivenessWarningGate();
 
-      const clearWatchdog = (): void => {
-        if (!watchdogTimer) return;
-        clearTimeout(watchdogTimer);
-        watchdogTimer = null;
+      const clearLivenessTimer = (): void => {
+        if (!livenessTimer) return;
+        clearTimeout(livenessTimer);
+        livenessTimer = null;
       };
       const clearCloseGrace = (): void => {
         if (!closeGraceTimer) return;
@@ -429,11 +475,14 @@ export class CodexAdapter {
       const finalize = (code: number | null): void => {
         if (settled) return;
         settled = true;
-        clearWatchdog();
+        clearLivenessTimer();
         clearCloseGrace();
+        if (exitGraceTimer) clearTimeout(exitGraceTimer);
+        this.stopBySession.delete(input.sessionId);
         if (child.pid) {
           this.activeChildPids.delete(child.pid);
           this.pidToThreadId.delete(child.pid);
+          this.pidToSessionId.delete(child.pid);
         }
         if (timedOut) {
           resolve({
@@ -452,6 +501,11 @@ export class CodexAdapter {
             logicalComplete = true;
           }
           stdoutLineBuffer = "";
+        }
+        if (processDisappeared && !logicalComplete) {
+          resolve({ ok: false, output: "Codex process exited without a completion notification.",
+            errorCode: "ERR_CODEX_PROCESS_DISAPPEARED" });
+          return;
         }
         const lastStderrLine = stderrLineBuffer.trim();
         if (lastStderrLine && input.onStdErrLine) {
@@ -511,12 +565,108 @@ export class CodexAdapter {
           warnings: mergedWarnings,
         });
       };
+      const stopAndFinalize = (): Promise<void> => {
+        if (stopping) return stopping;
+        if (settled) return Promise.resolve();
+        const notify = (type: "stop_requested" | "stop_confirmed" | "stop_failed", errors?: string[]): void => {
+          this.onDiagnostic?.({ type, sessionId: input.sessionId, executionId: input.executionId,
+            codexThreadId: input.codexThreadId, pid: child.pid, errors });
+          if (input.onLifecycle) {
+            void Promise.resolve(input.onLifecycle({ type, pid: child.pid, errors })).catch(() => {});
+          }
+        };
+        notify("stop_requested");
+        stopping = (async () => {
+          try {
+            let result: { stopped: boolean; errors: string[] };
+            if (child.pid && process.platform === "win32") {
+              result = await stopWindowsProcessTree(child.pid, rootExited, undefined, undefined,
+                timedOut ? undefined : row => isCodexRuntimeCommandLine(row.commandLine ?? ""),
+                child.pid ? this.pidToThreadId.get(child.pid) : input.codexThreadId);
+            } else if (child.pid) {
+              this.killProcessTree(child.pid);
+              for (let i = 0; i < 20 && this.isProcessAlive(child.pid); i += 1) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+              }
+              result = { stopped: !this.isProcessAlive(child.pid), errors: [] };
+            } else {
+              result = { stopped: true, errors: [] };
+            }
+            if (!result.stopped) {
+              notify("stop_failed", result.errors);
+              stopping = null;
+              return;
+            }
+            notify("stop_confirmed", result.errors);
+            child.stdout.destroy();
+            child.stderr.destroy();
+            child.stdin?.destroy();
+            finalize(child.exitCode);
+          } catch (error) {
+            notify("stop_failed", [error instanceof Error ? error.message : String(error)]);
+            stopping = null;
+          }
+        })();
+        return stopping;
+      };
+      this.stopBySession.set(input.sessionId, () => {
+        timedOut = true;
+        return stopAndFinalize();
+      });
+      const scheduleCheck = (delayMs = this.livenessCheckIntervalMs): void => {
+        clearLivenessTimer();
+        if (!settled && !logicalComplete) {
+          livenessTimer = setTimeout(() => { void checkLiveness(); }, delayMs);
+        }
+      };
+      const checkLiveness = async (): Promise<void> => {
+        if (settled || logicalComplete || stopping) return;
+        if (checking) { checkAgain = true; return; }
+        checking = true;
+        let retrySoon = false;
+        try {
+          const status = tracker
+            ? await tracker.check(rootExited, child.pid ? this.pidToThreadId.get(child.pid) : input.codexThreadId,
+              closeReceived)
+            : { state: child.pid && this.isProcessAlive(child.pid) ? "alive" as const
+              : rootExited ? "dead" as const : "unknown" as const, errors: [] };
+          if (settled || logicalComplete || stopping) return;
+          const warning = livenessWarning.observe(status.state);
+          retrySoon = warning.retrySoon;
+          if (status.state !== lastLivenessState) {
+            this.onDiagnostic?.({ type: `liveness_${status.state}`, sessionId: input.sessionId,
+              executionId: input.executionId, codexThreadId: child.pid ? this.pidToThreadId.get(child.pid) : input.codexThreadId,
+              pid: child.pid, errors: status.errors });
+            lastLivenessState = status.state;
+          }
+          if (status.state === "unknown") {
+            if (warning.notify) {
+              if (input.onLifecycle) {
+                void Promise.resolve(input.onLifecycle({ type: "liveness_unknown", pid: child.pid,
+                  errors: status.errors })).catch(() => {});
+              }
+            }
+          } else if (status.state === "dead") {
+            // No kill: the independently observed execution is already gone.
+            processDisappeared = !closeReceived;
+            child.stdout.destroy(); child.stderr.destroy(); child.stdin?.destroy();
+            finalize(closeReceived ? closedCode : child.exitCode);
+          }
+        } finally {
+          checking = false;
+          const delayMs = checkAgain ? 1000 : retrySoon ? 5000 : this.livenessCheckIntervalMs;
+          checkAgain = false;
+          scheduleCheck(delayMs);
+        }
+      };
+      // Observe process identity early, before a short-lived wrapper can disappear.
+      void checkLiveness();
       const startLogicalCompletionGrace = (
         source: "turn.completed" | "task_complete",
       ): void => {
         if (logicalComplete) return;
         logicalComplete = true;
-        clearWatchdog();
+        clearLivenessTimer();
         if (input.onLifecycle) {
           void Promise.resolve(
             input.onLifecycle({ type: "logical_complete", source, graceMs: this.closeGraceMs }),
@@ -530,14 +680,7 @@ export class CodexAdapter {
               input.onLifecycle({ type: "close_grace_expired", source, graceMs: this.closeGraceMs }),
             ).catch(() => {});
           }
-          const processAlive = child.pid ? this.isProcessAlive(child.pid) : false;
-          const action = decideCloseGraceAction(processAlive);
-          if (action === "finalize") {
-            finalize(null);
-            return;
-          }
-          this.terminateCodexProcesses(child.pid);
-          finalize(null);
+          void stopAndFinalize();
         }, this.closeGraceMs);
       };
 
@@ -548,6 +691,14 @@ export class CodexAdapter {
         const lines = stdoutLineBuffer.split(/\r?\n/);
         stdoutLineBuffer = lines.pop() ?? "";
         for (const line of lines) {
+          if (child.pid && line.includes('"thread.started"')) {
+            try {
+              const event = JSON.parse(line) as { type?: string; thread_id?: string };
+              if (event.type === "thread.started" && typeof event.thread_id === "string") {
+                this.pidToThreadId.set(child.pid, event.thread_id);
+              }
+            } catch { /* handled as a non-JSON line below */ }
+          }
           this.handleStdoutJsonlLine(line, input.onEvent, input.onAgentMessage);
           const logicalCompletionSource = detectLogicalCompletionFromJsonlLine(line);
           if (logicalCompletionSource) {
@@ -576,11 +727,14 @@ export class CodexAdapter {
       child.on("error", (err) => {
         if (settled) return;
         settled = true;
-        clearWatchdog();
+        clearLivenessTimer();
         clearCloseGrace();
+        if (exitGraceTimer) clearTimeout(exitGraceTimer);
+        this.stopBySession.delete(input.sessionId);
         if (child.pid) {
           this.activeChildPids.delete(child.pid);
           this.pidToThreadId.delete(child.pid);
+          this.pidToSessionId.delete(child.pid);
         }
         resolve({
           ok: false,
@@ -592,7 +746,22 @@ export class CodexAdapter {
         if (input.onClose) {
           void Promise.resolve(input.onClose({ code, signal })).catch(() => {});
         }
-        finalize(code);
+        closeReceived = true;
+        closedCode = code;
+        if (timedOut || stopping) void stopAndFinalize();
+        else if (logicalComplete || !isWin) finalize(code);
+        else void checkLiveness();
+      });
+      child.on("exit", (code) => {
+        rootExited = true;
+        this.onDiagnostic?.({ type: "process_exit", sessionId: input.sessionId, executionId: input.executionId,
+          codexThreadId: input.codexThreadId, pid: child.pid, code });
+        if (input.onLifecycle) {
+          void Promise.resolve(input.onLifecycle({ type: "process_exit", pid: child.pid, code })).catch(() => {});
+        }
+        if (settled || stopping) return;
+        // A wrapper exit is not permission to kill a still-running native Codex.
+        exitGraceTimer = setTimeout(() => { void checkLiveness(); }, 1000);
       });
     });
   }
@@ -613,80 +782,6 @@ export class CodexAdapter {
       process.kill(pid, "SIGKILL");
     } catch {
       // 既に終了済みの場合は無視。
-    }
-  }
-
-  private pruneDeadTrackedProcesses(): void {
-    const pids = [...this.activeChildPids];
-    for (const pid of pids) {
-      if (this.isProcessAlive(pid)) continue;
-      this.activeChildPids.delete(pid);
-      this.pidToThreadId.delete(pid);
-    }
-  }
-
-  private terminateCodexProcesses(pid: number | undefined): void {
-    if (!pid) return;
-    if (process.platform === "win32") {
-      const directChildren = this.getDirectChildProcesses(pid);
-      const codexChildPids = directChildren
-        .filter((child) => isCodexRuntimeCommandLine(child.commandLine))
-        .map((child) => child.pid);
-      for (const targetPid of [pid, ...codexChildPids]) {
-        this.terminateProcess(targetPid);
-      }
-      return;
-    }
-    this.terminateProcess(pid);
-  }
-
-  private terminateProcess(pid: number): void {
-    if (!pid) return;
-    if (process.platform === "win32") {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/F"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-      killer.on("error", () => {
-        // taskkill が使えない環境のフォールバック。
-      });
-      return;
-    }
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // 既に終了済みの場合は無視。
-    }
-  }
-
-  private getDirectChildProcesses(pid: number): Array<{ pid: number; commandLine: string | null }> {
-    if (process.platform !== "win32") return [];
-    const ps = spawnSync(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-Command",
-        `$rows = Get-CimInstance Win32_Process -Filter "ParentProcessId = ${pid}" | Select-Object ProcessId, CommandLine; $rows | ConvertTo-Json -Compress`,
-      ],
-      {
-        windowsHide: true,
-        encoding: "utf8",
-      },
-    );
-    if (ps.status !== 0 || !ps.stdout) return [];
-    try {
-      const parsed = JSON.parse(ps.stdout) as
-        | { ProcessId?: unknown; CommandLine?: unknown }
-        | Array<{ ProcessId?: unknown; CommandLine?: unknown }>;
-      const rows = Array.isArray(parsed) ? parsed : [parsed];
-      return rows
-        .map((row) => ({
-          pid: typeof row.ProcessId === "number" ? row.ProcessId : Number(row.ProcessId),
-          commandLine: typeof row.CommandLine === "string" ? row.CommandLine : null,
-        }))
-        .filter((row) => Number.isInteger(row.pid) && row.pid > 0);
-    } catch {
-      return [];
     }
   }
 

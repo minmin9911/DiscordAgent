@@ -30,6 +30,8 @@ import { appConfig } from "./config.js";
 import { APP_NAME, getBuildLabel } from "./buildInfo.js";
 import {
   attachAbsolutePathRequired,
+  codexStopUnconfirmed,
+  codexLivenessUnknown,
   codexConfigDefaultLabel,
   attachInvalidPath,
   attachNotFile,
@@ -150,6 +152,7 @@ import {
   buildExternalSyncEventSignature,
   getCodexThreadFileFingerprint,
   hasCodexThreadFileChanged,
+  retainCodexExternalSyncReaders,
   readCodexThreadCompletedTurnsSinceLine,
   readCodexThreadEventsSinceLine,
   readCodexThreadStartedTurnsSinceLine,
@@ -408,6 +411,7 @@ export class DiscordCodexBot {
     }
   >();
   private readonly activeLocalSyncRuns = new Map<string, number>();
+  private readonly externalSyncRetryAt = new Map<string, number>();
   private readonly externalSyncFileFingerprints = new Map<
     string,
     { path: string; size: number; mtimeMs: number }
@@ -430,13 +434,18 @@ export class DiscordCodexBot {
     this.codex = new CodexAdapter(
       appConfig.codexMode,
       appConfig.codexExecTemplate,
-      appConfig.codexTimeoutSec * 1000,
+      appConfig.codexLivenessCheckSec * 1000,
       appConfig.codexCloseGraceSec * 1000,
+      info => this.logger.info({ ...info,
+        errors: info.errors?.map(error => maskSecrets(error)),
+        errorCode: info.type === "stop_failed" ? "ERR_CODEX_STOP_UNCONFIRMED"
+          : info.type === "liveness_unknown" ? "ERR_CODEX_LIVENESS_UNKNOWN" : null,
+      }, "codex process diagnostic"),
+      appConfig.codexTemplateTimeoutSec * 1000,
     );
     this.manager = new ExecutionManager(
       appConfig.queueLimitPerSession,
       appConfig.progressIntervalSec,
-      appConfig.codexTimeoutSec * 1000,
       this.logger,
     );
   }
@@ -1246,11 +1255,6 @@ export class DiscordCodexBot {
       approvalStatusOverride?: "one_shot";
     },
   ): Promise<void> {
-    const stale = this.db.cancelStaleRunningExecutions(appConfig.codexTimeoutSec + 60);
-    if (stale > 0) {
-      this.logger.warn({ stale }, "stale running executions were timed out");
-    }
-
     const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
     const session = this.sessionService.resolveOrCreateActiveSession({
       contextKey,
@@ -1339,10 +1343,10 @@ export class DiscordCodexBot {
     let permissionFailureDetected = false;
     let retryableSandboxFailureDetected = false;
     const executionLockKey = this.getExecutionLockKey(session);
-    const storedThreadIdAtStart = session.codex_thread_id ?? null;
+    let storedThreadIdAtStart = session.codex_thread_id ?? null;
     let observedThreadId: string | null = storedThreadIdAtStart;
     let usageStatusBefore: CodexUsageStatus | null = null;
-    let lateLocalSyncAttempt: LocalExternalSyncAttempt | null = null;
+    let lateLocalSyncAttempt: Promise<LocalExternalSyncAttempt | null> | null = null;
     let threadSwitchNotice: string | null = null;
     let threadSwitchAnnounced = false;
     const applyObservedThreadId = async (
@@ -1353,6 +1357,9 @@ export class DiscordCodexBot {
       observedThreadId = nextThreadId;
       const change = detectThreadBindingChange(session.codex_thread_id, nextThreadId);
       if (change.kind === "none") return;
+      if (change.kind === "bound") {
+        this.manager.bindLockKey(executionLockKey, `codex:${change.nextThreadId}`);
+      }
       this.db.setSessionCodexThreadId(session.id, change.nextThreadId);
       session.codex_thread_id = change.nextThreadId;
       lateLocalSyncAttempt ??= this.beginLocalExternalSyncAttempt(
@@ -1361,6 +1368,8 @@ export class DiscordCodexBot {
         prompt,
         0,
       );
+      // The stdout callback is detached; retain errors for the awaited finalizer.
+      void lateLocalSyncAttempt.catch(() => {});
       this.addLocalSyncSuppressionText(change.nextThreadId, "user_message", content);
       if (change.kind === "bound") {
         this.logger.info(
@@ -1437,6 +1446,13 @@ export class DiscordCodexBot {
         await editProgressMessage(progressText);
       },
       run: async () => {
+        if (!session.codex_thread_id) {
+          const current = this.db.getSessionById(session.id);
+          session.codex_thread_id = current?.codex_thread_id ?? null;
+          session.attach_instruction_sent_at = current?.attach_instruction_sent_at ?? null;
+          storedThreadIdAtStart = session.codex_thread_id;
+          observedThreadId = session.codex_thread_id;
+        }
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
         usageStatusBefore = this.getRecentUsageSnapshot();
         const shouldInjectAttachInstruction = !session.attach_instruction_sent_at;
@@ -1461,6 +1477,7 @@ export class DiscordCodexBot {
               prompt,
               () => this.codex.run({
                 prompt,
+                executionId,
                 sessionId: session.id,
                 codexThreadId: session.codex_thread_id,
                 modelOverride: session.model_override,
@@ -1635,7 +1652,7 @@ export class DiscordCodexBot {
               "codex process closed",
             );
                 },
-                onLifecycle: async ({ type, source, graceMs }) => {
+                onLifecycle: async ({ type, source, graceMs, pid, code, errors }) => {
             this.logger.info(
               {
                 executionId,
@@ -1643,15 +1660,22 @@ export class DiscordCodexBot {
                 codexThreadId: observedThreadId ?? session.codex_thread_id ?? null,
                 type,
                 source: source ?? null,
-                graceMs: graceMs ?? null,
+                  graceMs: graceMs ?? null,
+                  pid: pid ?? null,
+                  code: code ?? null,
+                  errors: errors?.map(error => maskSecrets(error)) ?? [],
+                  errorCode: type === "stop_failed" ? "ERR_CODEX_STOP_UNCONFIRMED" : null,
               },
               "codex lifecycle event",
             );
+            if (type === "stop_failed" || type === "liveness_unknown") {
+              await this.notifyUnconfirmedStop([contextKey], type === "liveness_unknown");
+            }
                 },
               }),
             );
           } finally {
-            this.finishLocalExternalSyncAttempt(lateLocalSyncAttempt);
+            await this.finishLocalExternalSyncAttempt(await lateLocalSyncAttempt);
             lateLocalSyncAttempt = null;
           }
         })();
@@ -1914,7 +1938,8 @@ export class DiscordCodexBot {
       const staleLockKeys = this.manager
         .getQueueSnapshots()
         .map((v) => v.lockKey)
-        .filter((lockKey) => !dbLockKeys.has(lockKey));
+        .filter((lockKey) => !dbLockKeys.has(lockKey)
+          && !this.codex.getUnresolvedExecutionLockKeys().has(lockKey));
       const releasedLocks = this.manager.forceReleaseLocks(staleLockKeys);
       this.logger.warn(
         {
@@ -2845,6 +2870,12 @@ export class DiscordCodexBot {
           promptText,
           () => this.codex.run({
             prompt: promptText,
+            executionId,
+            onLifecycle: async info => {
+              if (info.type === "stop_failed" || info.type === "liveness_unknown") {
+                await this.notifyUnconfirmedStop([contextKey], info.type === "liveness_unknown");
+              }
+            },
             sessionId: session.id,
             codexThreadId: threadId,
             modelOverride: session.model_override,
@@ -2987,7 +3018,7 @@ export class DiscordCodexBot {
       return;
     }
     if (arg === "reset") {
-      const anchored = this.resetExternalSyncCursorsToLatest();
+      const anchored = await this.resetExternalSyncCursorsToLatest();
       await msg.reply(syncResetDone(this.locale, anchored));
       return;
     }
@@ -3667,11 +3698,11 @@ export class DiscordCodexBot {
     ));
   }
 
-  private resetExternalSyncCursorsToLatest(): number {
+  private async resetExternalSyncCursorsToLatest(): Promise<number> {
     const threadIds = this.db.listActiveCodexThreadIds();
     let anchored = 0;
     for (const threadId of threadIds) {
-      const read = readCodexThreadEventsSinceLine(threadId, 0);
+      const read = await readCodexThreadEventsSinceLine(threadId, 0);
       if (!read.sourceFound) continue;
       this.db.setExternalSyncCursor(threadId, read.latestLineNo);
       anchored += 1;
@@ -3679,17 +3710,24 @@ export class DiscordCodexBot {
     return anchored;
   }
 
-  private beginLocalExternalSyncAttempt(
+  private async beginLocalExternalSyncAttempt(
     codexThreadId: string | null | undefined,
     executionId: string,
     expectedPrompt: string,
     startLineNoOverride?: number,
-  ): LocalExternalSyncAttempt | null {
+  ): Promise<LocalExternalSyncAttempt | null> {
     const threadId = codexThreadId?.trim();
     if (!threadId) return null;
-    const read = readCodexThreadEventsSinceLine(threadId, Number.MAX_SAFE_INTEGER);
     const activeCount = this.activeLocalSyncRuns.get(threadId) ?? 0;
     this.activeLocalSyncRuns.set(threadId, activeCount + 1);
+    let read;
+    try {
+      read = await readCodexThreadEventsSinceLine(threadId, Number.MAX_SAFE_INTEGER);
+    } catch (error) {
+      if (activeCount === 0) this.activeLocalSyncRuns.delete(threadId);
+      else this.activeLocalSyncRuns.set(threadId, activeCount);
+      throw error;
+    }
     const attempt = {
       executionId,
       codexThreadId: threadId,
@@ -3708,10 +3746,10 @@ export class DiscordCodexBot {
     return attempt;
   }
 
-  private finishLocalExternalSyncAttempt(attempt: LocalExternalSyncAttempt | null): void {
+  private async finishLocalExternalSyncAttempt(attempt: LocalExternalSyncAttempt | null): Promise<void> {
     if (!attempt) return;
     try {
-      const read = readCodexThreadStartedTurnsSinceLine(
+      const read = await readCodexThreadStartedTurnsSinceLine(
         attempt.codexThreadId,
         attempt.startLineNo,
       );
@@ -3781,6 +3819,12 @@ export class DiscordCodexBot {
         },
         "external sync turn classified",
       );
+    } catch (err) {
+      this.logger.warn(
+        { err, executionId: attempt.executionId, codexThreadId: attempt.codexThreadId,
+          error_code: "ERR_EXTERNAL_LOCAL_TRACKING" },
+        "local external sync turn tracking failed",
+      );
     } finally {
       const activeCount = this.activeLocalSyncRuns.get(attempt.codexThreadId) ?? 0;
       if (activeCount <= 1) {
@@ -3797,7 +3841,7 @@ export class DiscordCodexBot {
     expectedPrompt: string,
     run: () => Promise<CodexResult>,
   ): Promise<CodexResult> {
-    const attempt = this.beginLocalExternalSyncAttempt(
+    const attempt = await this.beginLocalExternalSyncAttempt(
       codexThreadId,
       executionId,
       expectedPrompt,
@@ -3805,7 +3849,7 @@ export class DiscordCodexBot {
     try {
       return await run();
     } finally {
-      this.finishLocalExternalSyncAttempt(attempt);
+      await this.finishLocalExternalSyncAttempt(attempt);
     }
   }
 
@@ -3909,6 +3953,10 @@ export class DiscordCodexBot {
         { path: string; size: number; mtimeMs: number }
       >();
       const activeThreadIds = new Set(threadIds);
+      retainCodexExternalSyncReaders(new Set([...threadIds, ...this.activeLocalSyncRuns.keys()]));
+      for (const threadId of this.externalSyncRetryAt.keys()) {
+        if (!activeThreadIds.has(threadId)) this.externalSyncRetryAt.delete(threadId);
+      }
       for (const cachedThreadId of this.externalSyncFileFingerprints.keys()) {
         if (!activeThreadIds.has(cachedThreadId)) {
           this.externalSyncFileFingerprints.delete(cachedThreadId);
@@ -3919,31 +3967,41 @@ export class DiscordCodexBot {
         // A local execution may still be writing this JSONL. Leave its fingerprint untouched
         // so the completed turn is inspected after the local-run suppression window closes.
         if ((this.activeLocalSyncRuns.get(threadId) ?? 0) > 0) continue;
-        const fingerprint = getCodexThreadFileFingerprint(threadId);
-        const previousFingerprint = this.externalSyncFileFingerprints.get(threadId);
-        if (!fingerprint) {
-          this.externalSyncFileFingerprints.delete(threadId);
-          continue;
+        if ((this.externalSyncRetryAt.get(threadId) ?? 0) > Date.now()) continue;
+        try {
+          const fingerprint = getCodexThreadFileFingerprint(threadId);
+          const previousFingerprint = this.externalSyncFileFingerprints.get(threadId);
+          if (!fingerprint) {
+            this.externalSyncFileFingerprints.delete(threadId);
+            continue;
+          }
+          if (!hasCodexThreadFileChanged(previousFingerprint, fingerprint)) continue;
+          const chunk = await this.collectExternalEventsForThread(reason, threadId);
+          this.externalSyncRetryAt.delete(threadId);
+          if (!chunk) {
+            this.externalSyncFileFingerprints.set(threadId, fingerprint);
+            continue;
+          }
+          // Commit this fingerprint only after Discord delivery and cursor updates succeed.
+          fingerprintsAfterDelivery.set(threadId, fingerprint);
+          collected.push(...chunk.events.map((event) => ({
+            codexThreadId: chunk.codexThreadId,
+            contextKeys: chunk.contextKeys,
+            latestLineNo: chunk.latestLineNo,
+            event: {
+              ...event,
+              text: event.itemType === "user_message"
+                ? truncateExternalUserMessage(event.text, appConfig.externalSyncUserMaxChars)
+                : event.text,
+            },
+          })));
+        } catch (err) {
+          this.externalSyncRetryAt.set(threadId, Date.now() + 60_000);
+          this.logger.warn(
+            { err, reason, codexThreadId: threadId, error_code: "ERR_EXTERNAL_SYNC_READ", retryAfterMs: 60_000 },
+            "external sync thread read failed; other threads continue",
+          );
         }
-        if (!hasCodexThreadFileChanged(previousFingerprint, fingerprint)) continue;
-        const chunk = this.collectExternalEventsForThread(reason, threadId);
-        if (!chunk) {
-          this.externalSyncFileFingerprints.set(threadId, fingerprint);
-          continue;
-        }
-        // Commit this fingerprint only after Discord delivery and cursor updates succeed.
-        fingerprintsAfterDelivery.set(threadId, fingerprint);
-        collected.push(...chunk.events.map((event) => ({
-          codexThreadId: chunk.codexThreadId,
-          contextKeys: chunk.contextKeys,
-          latestLineNo: chunk.latestLineNo,
-          event: {
-            ...event,
-            text: event.itemType === "user_message"
-              ? truncateExternalUserMessage(event.text, appConfig.externalSyncUserMaxChars)
-              : event.text,
-          },
-        })));
       }
 
       if (collected.length > 0) {
@@ -3971,21 +4029,33 @@ export class DiscordCodexBot {
         );
       }
       const target = dropCount > 0 ? collected.slice(dropCount) : collected;
+      const failedThreads = new Set<string>();
       for (const row of target) {
-        await this.broadcastExternalEventToContexts(
-          row.codexThreadId,
-          row.contextKeys,
-          row.event.itemType,
-          row.event.text,
-        );
-        this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.eventId);
-        if (row.event.stableEventId) {
-          this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.stableEventId);
+        if (failedThreads.has(row.codexThreadId)) continue;
+        try {
+          await this.broadcastExternalEventToContexts(
+            row.codexThreadId,
+            row.contextKeys,
+            row.event.itemType,
+            row.event.text,
+          );
+          this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.eventId);
+          if (row.event.stableEventId) {
+            this.db.markExternalSyncEventSeen(row.codexThreadId, row.event.stableEventId);
+          }
+        } catch (err) {
+          failedThreads.add(row.codexThreadId);
+          this.externalSyncRetryAt.set(row.codexThreadId, Date.now() + 60_000);
+          this.logger.warn(
+            { err, codexThreadId: row.codexThreadId, error_code: "ERR_EXTERNAL_SYNC_DELIVERY" },
+            "external sync thread delivery failed; cursor retained",
+          );
         }
       }
 
       const latestByThread = new Map<string, number>();
       for (const row of collected) {
+        if (failedThreads.has(row.codexThreadId)) continue;
         const prev = latestByThread.get(row.codexThreadId) ?? 0;
         if (row.latestLineNo > prev) latestByThread.set(row.codexThreadId, row.latestLineNo);
       }
@@ -3993,6 +4063,7 @@ export class DiscordCodexBot {
         this.db.setExternalSyncCursor(threadId, latestLineNo);
       }
       for (const [threadId, fingerprint] of fingerprintsAfterDelivery.entries()) {
+        if (failedThreads.has(threadId)) continue;
         this.externalSyncFileFingerprints.set(threadId, fingerprint);
       }
     } finally {
@@ -4000,10 +4071,10 @@ export class DiscordCodexBot {
     }
   }
 
-  private collectExternalEventsForThread(
+  private async collectExternalEventsForThread(
     reason: string,
     codexThreadId: string,
-  ): {
+  ): Promise<{
     codexThreadId: string;
     contextKeys: string[];
     latestLineNo: number;
@@ -4015,7 +4086,7 @@ export class DiscordCodexBot {
       lineNo: number;
       occurredAtMs: number | null;
     }>;
-  } | null {
+  } | null> {
     if ((this.activeLocalSyncRuns.get(codexThreadId) ?? 0) > 0) {
       this.logger.debug(
         { reason, codexThreadId, action: "defer" },
@@ -4024,7 +4095,9 @@ export class DiscordCodexBot {
       return null;
     }
     const cursor = this.db.getExternalSyncCursor(codexThreadId);
-    const turnRead = readCodexThreadCompletedTurnsSinceLine(codexThreadId, cursor ?? 0);
+    const turnRead = await readCodexThreadCompletedTurnsSinceLine(codexThreadId, cursor ?? 0);
+    // A local run can start while the asynchronous bootstrap scan yields.
+    if ((this.activeLocalSyncRuns.get(codexThreadId) ?? 0) > 0) return null;
     if (!turnRead.sourceFound) return null;
 
     if (cursor === null) {
@@ -4036,7 +4109,7 @@ export class DiscordCodexBot {
       return null;
     }
 
-    if (turnRead.latestLineNo < cursor) {
+    if (turnRead.sourceReset || turnRead.latestLineNo < cursor) {
       this.db.setExternalSyncCursor(codexThreadId, turnRead.latestLineNo);
       this.logger.warn(
         {
@@ -4131,7 +4204,7 @@ export class DiscordCodexBot {
     }
 
     // Older JSONL variants without task boundaries retain the original line-based fallback.
-    const read = readCodexThreadEventsSinceLine(codexThreadId, cursor ?? 0);
+    const read = await readCodexThreadEventsSinceLine(codexThreadId, cursor ?? 0);
     if (!read.sourceFound) return null;
 
     if (read.events.length === 0) {
@@ -4206,6 +4279,19 @@ export class DiscordCodexBot {
           continue;
         }
         await channel.send(`[External ${role} cont.${i + 1}]\n${body}`);
+      }
+    }
+  }
+
+  private async notifyUnconfirmedStop(contextKeys: string[], livenessUnknown = false): Promise<void> {
+    for (const contextKey of new Set(contextKeys)) {
+      try {
+        const channel = await this.resolveSendableChannelByContextKey(contextKey);
+        if (channel) await channel.send(livenessUnknown
+          ? codexLivenessUnknown(this.locale) : codexStopUnconfirmed(this.locale));
+      } catch (err) {
+        this.logger.warn({ err, errorCode: livenessUnknown
+          ? "ERR_CODEX_LIVENESS_UNKNOWN" : "ERR_CODEX_STOP_UNCONFIRMED" }, "process state notification failed");
       }
     }
   }
@@ -4511,6 +4597,12 @@ export class DiscordCodexBot {
           trigger.prompt,
           () => this.codex.run({
             prompt: trigger.prompt,
+            executionId,
+            onLifecycle: async info => {
+              if (info.type === "stop_failed" || info.type === "liveness_unknown") {
+                await this.notifyUnconfirmedStop(contextKeys, info.type === "liveness_unknown");
+              }
+            },
             sessionId: session.id,
             codexThreadId: session.codex_thread_id,
             modelOverride: session.model_override,

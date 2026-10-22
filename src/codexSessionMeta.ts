@@ -3,13 +3,13 @@ import {
   existsSync,
   fstatSync,
   openSync,
-  readFileSync,
   readSync,
   readdirSync,
   statSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { JSONL_MAX_LINE_BYTES, JsonlLineTooLargeError } from "./incrementalJsonlReader.js";
 
 const cwdCache = new Map<string, string | null>();
 const THREAD_ID_RE =
@@ -190,9 +190,51 @@ export function readLatestCodexResolvedModelByThreadId(
   return readLatestCodexResolvedModelFromSessionFile(sessionFile);
 }
 
-function parseCwdFromSessionMeta(sessionFile: string): string | null {
-  const text = readFileSync(sessionFile, "utf8");
-  const lines = text.split(/\r?\n/).filter(Boolean);
+export function readSessionPrefixLines(sessionFile: string, limit: number): string[] {
+  const fd = openSync(sessionFile, "r");
+  const lines: string[] = [];
+  const chunk = Buffer.alloc(64 * 1024);
+  let fragments: Buffer[] = [];
+  let bytes = 0;
+  let lineNo = 1;
+  const append = (part: Buffer): void => {
+    bytes += part.length;
+    if (bytes > JSONL_MAX_LINE_BYTES) {
+      throw new JsonlLineTooLargeError(lineNo, JSONL_MAX_LINE_BYTES);
+    }
+    if (part.length) fragments.push(Buffer.from(part));
+  };
+  const finish = (): void => {
+    const line = Buffer.concat(fragments, bytes).toString("utf8").replace(/\r$/, "");
+    if (line) lines.push(line);
+    fragments = [];
+    bytes = 0;
+    lineNo += 1;
+  };
+  try {
+    while (lines.length < limit) {
+      const count = readSync(fd, chunk, 0, chunk.length, null);
+      if (!count) {
+        if (bytes) finish();
+        break;
+      }
+      let start = 0;
+      for (let i = 0; i < count; i += 1) {
+        if (chunk[i] !== 10) continue;
+        append(chunk.subarray(start, i));
+        finish();
+        start = i + 1;
+        if (lines.length >= limit) return lines;
+      }
+      append(chunk.subarray(start, count));
+    }
+    return lines;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function parseCwdFromSessionMeta(lines: string[]): string | null {
   for (const line of lines.slice(0, 30)) {
     try {
       const obj = JSON.parse(line) as {
@@ -209,9 +251,7 @@ function parseCwdFromSessionMeta(sessionFile: string): string | null {
   return null;
 }
 
-function parseWorkspaceRootFromEnvironmentContext(sessionFile: string): string | null {
-  const text = readFileSync(sessionFile, "utf8");
-  const lines = text.split(/\r?\n/).filter(Boolean);
+function parseWorkspaceRootFromEnvironmentContext(lines: string[]): string | null {
   const rootRe = /<workspace_roots>\s*<root>(.*?)<\/root>[\s\S]*?<\/workspace_roots>/i;
 
   for (const line of lines.slice(0, 80)) {
@@ -239,18 +279,18 @@ function parseWorkspaceRootFromEnvironmentContext(sessionFile: string): string |
 }
 
 export function resolveWorkingDirectoryFromSessionFile(sessionFile: string): string | null {
+  const lines = readSessionPrefixLines(sessionFile, 80);
   return (
-    parseWorkspaceRootFromEnvironmentContext(sessionFile)
-    ?? parseCwdFromSessionMeta(sessionFile)
+    parseWorkspaceRootFromEnvironmentContext(lines)
+    ?? parseCwdFromSessionMeta(lines)
   );
 }
 
 function parseSessionMeta(sessionFile: string): CodexSessionMeta | null {
-  const text = readFileSync(sessionFile, "utf8");
-  const lines = text.split(/\r?\n/).filter(Boolean);
+  const lines = readSessionPrefixLines(sessionFile, 400);
 
   let threadId: string | null = null;
-  let cwd = resolveWorkingDirectoryFromSessionFile(sessionFile);
+  let cwd = parseWorkspaceRootFromEnvironmentContext(lines) ?? parseCwdFromSessionMeta(lines);
   let summary: string | null = null;
   const searchPieces: string[] = [];
 

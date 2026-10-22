@@ -128,7 +128,9 @@ npm start
 
 * `CODEX_MODE`: `cli`（推奨）または `template`（非推奨・実験用）
 
-* `CODEX_TIMEOUT_SEC`: Codex 実行タイムアウト秒
+* `CODEX_LIVENESS_CHECK_SEC`: CLIプロセスの生存確認間隔（秒、既定60）。生存中の実行は経過時間によって停止しません。確認できない場合も停止せず、実行ロックを保持して再確認します。全キューを緊急停止する場合は `!queue stopall` を使用してください。
+
+* `CODEX_TIMEOUT_SEC`: 旧タイムアウト設定（秒）。実験用 `template` モードのみ有効で、`cli` モードでは無視します。
 
 * `INCOMING_ATTACH_DIR`: Discord受信添付の保存先ディレクトリ
 

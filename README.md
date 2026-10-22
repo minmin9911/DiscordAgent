@@ -92,7 +92,8 @@ npm start
 - `SQLITE_PATH`: SQLite database path
 - `DEFAULT_AGENT_WORKDIR_ROOT`: root directory for new session working directories (default: `./workspaces`)
 - `CODEX_MODE`: usually `cli`
-- `CODEX_TIMEOUT_SEC`: Codex timeout in seconds
+- `CODEX_LIVENESS_CHECK_SEC`: CLI process liveness check interval in seconds (default: 60). Live executions are not stopped based on elapsed time. If liveness cannot be confirmed, the execution lock is retained while checks continue. Use `!queue stopall` to emergency-stop all queues.
+- `CODEX_TIMEOUT_SEC`: Legacy timeout in seconds. Applies only to experimental `template` mode; ignored in `cli` mode.
 - `INCOMING_ATTACH_DIR`: temp storage directory for incoming attachments
 - `INCOMING_ATTACH_TTL_HOURS`: retention period for incoming attachments
 - `INCOMING_ATTACH_MAX_BYTES`: per-file attachment limit

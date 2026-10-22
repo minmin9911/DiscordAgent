@@ -46,9 +46,3 @@ models:
     credits_per_million: [5, 0.5, 30]
     disabled: false
     reasoning_efforts: [none, low, medium, high, xhigh, max]
-  - id: gpt-5.5
-    description_ja: 複雑な開発・調査・実務向けのモデル
-    description_en: Model for complex coding, research, and professional work
-    credits_per_million: [125, 12.5, 750]
-    disabled: false
-    reasoning_efforts: [none, low, medium, high, xhigh]

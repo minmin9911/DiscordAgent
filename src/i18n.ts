@@ -2,6 +2,18 @@ import type { ModelCatalogItem } from "./modelCatalog.js";
 
 export type AppLocale = "ja" | "en";
 
+export function codexLivenessUnknown(locale: AppLocale): string {
+  return locale === "ja"
+    ? "ERR_CODEX_LIVENESS_UNKNOWN: Codexの生存状態を確認できません。停止せず、実行ロックを保持して再確認します。"
+    : "ERR_CODEX_LIVENESS_UNKNOWN: Codex process liveness could not be confirmed. It will not be stopped; the execution lock is retained while checks continue.";
+}
+
+export function codexStopUnconfirmed(locale: AppLocale): string {
+  return locale === "ja"
+    ? "ERR_CODEX_STOP_UNCONFIRMED: Codexの停止を確認できません。安全のため、このスレッドの実行ロックを保持しています。"
+    : "ERR_CODEX_STOP_UNCONFIRMED: Codex termination could not be confirmed. This thread remains locked for safety.";
+}
+
 export type UsageLimitStatus = {
   planType: string | null;
   primaryUsedPercent: number | null;

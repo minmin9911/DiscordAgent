@@ -38,16 +38,39 @@ export interface QueueSnapshot {
 
 export class ExecutionManager {
   private readonly queues = new Map<string, SessionQueue>();
+  private readonly lockAliases = new Map<string, string>();
+
+  private resolveLockKey(lockKey: string): string {
+    return this.lockAliases.get(lockKey) ?? lockKey;
+  }
+
+  bindLockKey(previousKey: string, nextKey: string): void {
+    const previous = this.resolveLockKey(previousKey);
+    const next = this.resolveLockKey(nextKey);
+    if (previous === next) return;
+    const source = this.queues.get(previous);
+    const target = this.queues.get(next);
+    if (target?.running) throw new Error("ERR_QUEUE_BIND_CONFLICT");
+    if (source) {
+      if (target) source.tasks.push(...target.tasks);
+      this.queues.delete(previous);
+      this.queues.set(next, source);
+    }
+    // Running callbacks retain their original key; resolve it until they finish.
+    for (const [alias, key] of this.lockAliases) {
+      if (key === previous) this.lockAliases.set(alias, next);
+    }
+    this.lockAliases.set(previous, next);
+  }
 
   constructor(
     private readonly queueLimitPerSession: number,
     private readonly progressIntervalSec: number,
-    private readonly taskTimeoutMs: number,
     private readonly logger: pino.Logger,
   ) {}
 
   getRuntimeState(lockKey: string): RuntimeSessionState {
-    const q = this.queues.get(lockKey);
+    const q = this.queues.get(this.resolveLockKey(lockKey));
     if (!q) return { queueLength: 0, runningSince: null };
     return {
       queueLength: q.tasks.length,
@@ -101,7 +124,7 @@ export class ExecutionManager {
   forceReleaseLocks(lockKeys: string[]): number {
     let released = 0;
     for (const lockKey of lockKeys) {
-      const queue = this.queues.get(lockKey);
+      const queue = this.queues.get(this.resolveLockKey(lockKey));
       if (!queue) continue;
       if (!queue.running && queue.tasks.length === 0) continue;
       this.resetQueue(lockKey, queue);
@@ -111,6 +134,7 @@ export class ExecutionManager {
   }
 
   async enqueue(task: ExecutionTask): Promise<{ ok: true; position: number } | { ok: false; code: string }> {
+    task.lockKey = this.resolveLockKey(task.lockKey);
     let queue = this.queues.get(task.lockKey);
     if (!queue) {
       queue = { running: false, runningSince: null, tasks: [], generation: 0, runningExecutionId: null };
@@ -142,7 +166,7 @@ export class ExecutionManager {
   }
 
   private async startNext(lockKey: string): Promise<void> {
-    const queue = this.queues.get(lockKey);
+    const queue = this.queues.get(this.resolveLockKey(lockKey));
     if (!queue || queue.running) return;
 
     const task = queue.tasks.shift();
@@ -155,9 +179,8 @@ export class ExecutionManager {
 
     let retries = 0;
     let finishStarted = false;
-    let waitForUnderlyingCompletion: Promise<void> | null = null;
     let progressTimer: NodeJS.Timeout | null = setInterval(() => {
-      const q = this.queues.get(lockKey);
+      const q = this.queues.get(this.resolveLockKey(lockKey));
       const elapsedSec = q?.runningSince ? Math.floor((Date.now() - q.runningSince) / 1000) : 0;
       const queueLength = q?.tasks.length ?? 0;
       task.onProgress(elapsedSec, queueLength).catch((err) => {
@@ -183,9 +206,8 @@ export class ExecutionManager {
 
     try {
       while (true) {
-        const timedRun = await this.runWithHardTimeout(task.run);
-        const result = timedRun.result;
-        waitForUnderlyingCompletion = timedRun.waitForCompletion;
+        // The adapter owns process lifetime. Elapsed time must not release a live execution.
+        const result = await task.run();
         if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
           this.logger.warn(
             { lockKey, executionId: task.executionId },
@@ -204,13 +226,6 @@ export class ExecutionManager {
           retries,
           errorCode: result.errorCode,
         });
-        if (waitForUnderlyingCompletion) {
-          clearProgressTimer();
-          this.logger.warn(
-            { lockKey, executionId: task.executionId },
-            "watchdog expired; retaining queue lock until the task actually settles",
-          );
-        }
         break;
       }
     } catch (err) {
@@ -244,10 +259,7 @@ export class ExecutionManager {
       }
     } finally {
       clearProgressTimer();
-      if (waitForUnderlyingCompletion) {
-        await waitForUnderlyingCompletion;
-      }
-      const current = this.queues.get(lockKey);
+      const current = this.queues.get(this.resolveLockKey(lockKey));
       if (!current) return;
       if (current.generation !== generationAtStart || current.runningExecutionId !== task.executionId) {
         return;
@@ -271,41 +283,9 @@ export class ExecutionManager {
   }
 
   private isTaskStale(lockKey: string, generation: number, executionId: string): boolean {
-    const queue = this.queues.get(lockKey);
+    const queue = this.queues.get(this.resolveLockKey(lockKey));
     if (!queue) return true;
     return queue.generation !== generation || queue.runningExecutionId !== executionId;
   }
 
-  private async runWithHardTimeout(
-    run: () => Promise<TaskRunResult>,
-  ): Promise<{ result: TaskRunResult; waitForCompletion: Promise<void> | null }> {
-    let timer: NodeJS.Timeout | null = null;
-    let watchdogExpired = false;
-    const runPromise = Promise.resolve().then(run);
-    try {
-      const result = await Promise.race([
-        runPromise,
-        new Promise<TaskRunResult>(
-          (resolve) => {
-            timer = setTimeout(() => {
-              watchdogExpired = true;
-              resolve({
-                status: "timeout",
-                output: "Codex execution timed out by watchdog.",
-                errorCode: "ERR_EXEC_WATCHDOG_TIMEOUT",
-              });
-            }, this.taskTimeoutMs);
-          },
-        ),
-      ]);
-      return {
-        result,
-        waitForCompletion: watchdogExpired
-          ? runPromise.then(() => undefined, () => undefined)
-          : null,
-      };
-    } finally {
-      if (timer) clearTimeout(timer);
-    }
-  }
 }

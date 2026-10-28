@@ -1,4 +1,5 @@
 import type { ModelCatalogItem } from "./modelCatalog.js";
+import type { ResolvedModelSettings } from "./modelProfiles.js";
 
 export type AppLocale = "ja" | "en";
 
@@ -31,6 +32,9 @@ type LimitLeftInfo = {
   resetsAt: number | null;
 };
 
+// Codex can report slightly different reset timestamps for the same limit window.
+const RESET_TIME_JITTER_TOLERANCE_SECONDS = 5;
+
 export function resolveAppLocale(explicitLocale: string | null | undefined): AppLocale {
   if (explicitLocale === "ja" || explicitLocale === "en") return explicitLocale;
   const runtimeLocale = Intl.DateTimeFormat().resolvedOptions().locale.toLowerCase();
@@ -48,6 +52,7 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "- !help agent  Send DiscordAgent command guidance to the agent",
       "- !ask <prompt>  Send a prompt to Codex (a normal message also works)",
       "- !queue  Show running and queued work",
+      "- !stop [this]  Stop running and queued work in this thread",
       "- !queue stopall  Emergency-stop all queues",
       "- !queue fix  Repair orphaned executions",
       "- !sync [on|off|reset]  Show or change external sync",
@@ -61,7 +66,8 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
       "- !codex pick <no>  Bind a search result by number",
       "- !codex session <UUID>  Bind by UUID",
       "- !model [no]  List or switch models (0 = Codex config)",
-      "- !effort [no]  List or switch reasoning effort (0 = Codex config)",
+      "- !model c[oding]|o[ffice] [no] [effort]  Select a profile; a number updates its shared definition",
+      "- !effort [no]  List or switch reasoning effort (0 = selected profile/config)",
       "",
       "## Permissions",
       "- !sandbox on|off  Toggle the sandbox",
@@ -96,6 +102,7 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "- !help agent  AgentにDiscordAgent専用コマンドを教える",
     "- !ask <指示>  Codexへ送信（通常投稿でも可）",
     "- !queue  実行・待機状況",
+    "- !stop [this]  このスレッドの実行・待機を停止",
     "- !queue stopall  全キューを緊急停止",
     "- !queue fix  孤児状態の実行を修復",
     "- !sync [on|off|reset]  外部同期の確認・変更",
@@ -109,7 +116,8 @@ export function buildCommandReference(locale: AppLocale, build: string, appName:
     "- !codex pick <番号>  検索結果から割り当て",
     "- !codex session <UUID>  UUIDで割り当て",
     "- !model [番号]  モデル一覧・切替（0=Codex設定）",
-    "- !effort [番号]  推論量一覧・切替（0=Codex設定）",
+    "- !model c[oding]|o[ffice] [番号] [effort]  用途を選択（番号付きは共通定義も更新）",
+    "- !effort [番号]  推論量一覧・切替（0=用途またはCodex設定）",
     "",
     "## 権限",
     "- !sandbox on|off  サンドボックスを切替",
@@ -235,7 +243,9 @@ export function codexUsageStatusLine(
   const parts = limitInfos.map((current) => {
     const previous = previousLimitInfos.find(
       (candidate) => candidate.windowMinutes === current.windowMinutes
-        && candidate.resetsAt === current.resetsAt,
+        && (candidate.resetsAt === current.resetsAt
+          || (candidate.resetsAt != null && current.resetsAt != null
+            && Math.abs(candidate.resetsAt - current.resetsAt) <= RESET_TIME_JITTER_TOLERANCE_SECONDS)),
     );
     const value = previous
       ? `${previous.leftPercent}%→${current.leftPercent}%`
@@ -290,8 +300,20 @@ export function completeHeader(
 
 export function usageModel(locale: AppLocale): string {
   return locale === "en"
-    ? "usage: !model [no]"
-    : "使い方: !model [no]";
+    ? "usage: !model [no | c[oding] [no] [effort] | o[ffice] [no] [effort]] (0=Codex config)"
+    : "使い方: !model [番号 | c[oding] [番号] [effort] | o[ffice] [番号] [effort]]（0=Codex設定）";
+}
+
+export function modelSettingsLine(locale: AppLocale, settings: ResolvedModelSettings): string {
+  const model = `model=${settings.model ?? "?"}(${settings.source})`;
+  const effort = `effort=${settings.effort ?? "?"}`;
+  if (!settings.warnModel && !settings.warnEffort) return `${model} | ${effort}`;
+  const red = (text: string): string => `\u001b[1;31m${text}\u001b[0m`;
+  const label = settings.warnModel && settings.warnEffort
+    ? (locale === "en" ? "[MODEL / REASONING WARNING]" : "[モデル・推論設定警告]")
+    : settings.warnModel ? (locale === "en" ? "[MODEL WARNING]" : "[モデル警告]")
+      : (locale === "en" ? "[REASONING WARNING]" : "[推論設定警告]");
+  return `\`\`\`ansi\n${red(label)} ${settings.warnModel ? red(model) : model} | ${settings.warnEffort ? red(effort) : effort}\n\`\`\``;
 }
 
 export function modelSetDone(locale: AppLocale, modelLabel: string): string {
@@ -799,16 +821,23 @@ export function sessionWorkdirPathNotDirectory(locale: AppLocale, path: string):
 export function queueStopallExecuted(
   locale: AppLocale,
   canceled: number,
-  killed: number,
-  resetLocks: number,
+  confirmed: number,
+  unconfirmed: number,
   droppedPending: number,
+  requested: number,
+  scope: "all" | "this" = "all",
 ): string {
   return [
-    locale === "en" ? "queue stopall executed" : "queue stopall を実行しました",
-    `cancelled_inflight: ${canceled}`,
-    `killed_running_processes: ${killed}`,
-    `reset_locks: ${resetLocks}`,
+    scope === "this" ? (locale === "en" ? "stop requested for this thread" : "このスレッドの停止を要求しました")
+      : locale === "en" ? "queue stopall executed" : "queue stopall を実行しました",
+    `cancelled_pending_executions: ${canceled}`,
+    `stop_requested_executions: ${requested}`,
+    `confirmed_stopped_executions: ${confirmed}`,
+    `unconfirmed_executions: ${unconfirmed}`,
     `dropped_pending_queue: ${droppedPending}`,
+    ...(unconfirmed > 0 ? [locale === "en"
+      ? "ERR_CODEX_STOP_UNCONFIRMED: Execution locks are retained until termination is confirmed."
+      : "ERR_CODEX_STOP_UNCONFIRMED: 停止を確認できない実行のロックは保持し、再確認します。"] : []),
   ].join("\n");
 }
 

@@ -3,7 +3,7 @@ import tsparser from "@typescript-eslint/parser";
 
 export default [
   {
-    ignores: ["dist/**", "node_modules/**", "logs/**"],
+    ignores: ["dist/**", "node_modules/**", "logs/**", ".local/**", "backups/**", "workspaces/**"],
   },
   {
     files: ["src/**/*.ts", "test/**/*.ts"],

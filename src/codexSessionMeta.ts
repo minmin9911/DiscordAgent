@@ -24,6 +24,7 @@ export interface CodexSessionMeta {
 }
 
 export interface CodexUsageStatus {
+  recordedAtMs?: number;
   planType: string | null;
   primaryUsedPercent: number | null;
   primaryWindowMinutes: number | null;
@@ -83,7 +84,9 @@ function parseUsageStatusFromTokenCountLine(line: string): CodexUsageStatus | nu
     const secondary = rateLimitsObj.secondary && typeof rateLimitsObj.secondary === "object"
       ? rateLimitsObj.secondary as Record<string, unknown>
       : null;
+    const recordedAtMs = typeof obj.timestamp === "string" ? Date.parse(obj.timestamp) : NaN;
     return {
+      ...(Number.isFinite(recordedAtMs) ? { recordedAtMs } : {}),
       planType: readNullableString(rateLimitsObj.plan_type),
       primaryUsedPercent: readNullableNumber(primary?.used_percent),
       primaryWindowMinutes: readNullableNumber(primary?.window_minutes),
@@ -99,6 +102,7 @@ function parseUsageStatusFromTokenCountLine(line: string): CodexUsageStatus | nu
 
 export function readLatestCodexUsageStatusFromSessionFile(
   sessionFile: string,
+  observedSinceMs?: number,
 ): CodexUsageStatus | null {
   const tailSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024];
   const fd = openSync(sessionFile, "r");
@@ -115,6 +119,14 @@ export function readLatestCodexUsageStatusFromSessionFile(
       for (let i = lines.length - 1; i >= 0; i -= 1) {
         const line = lines[i]?.trim();
         if (!line || !line.includes('"token_count"')) continue;
+        if (observedSinceMs != null) {
+          try {
+            const timestamp = Date.parse((JSON.parse(line) as { timestamp?: string }).timestamp ?? "");
+            if (!Number.isFinite(timestamp) || timestamp < observedSinceMs) continue;
+          } catch {
+            continue;
+          }
+        }
         const parsed = parseUsageStatusFromTokenCountLine(line);
         if (parsed) return parsed;
       }
@@ -128,12 +140,13 @@ export function readLatestCodexUsageStatusFromSessionFile(
 
 export function readLatestCodexUsageStatusByThreadId(
   threadId: string,
+  observedSinceMs?: number,
 ): CodexUsageStatus | null {
   const sessionsRoot = join(homedir(), ".codex", "sessions");
   if (!existsSync(sessionsRoot)) return null;
   const sessionFile = findSessionFileByThreadId(sessionsRoot, threadId);
   if (!sessionFile) return null;
-  return readLatestCodexUsageStatusFromSessionFile(sessionFile);
+  return readLatestCodexUsageStatusFromSessionFile(sessionFile, observedSinceMs);
 }
 
 export function readLatestCodexResolvedModelFromSessionFile(

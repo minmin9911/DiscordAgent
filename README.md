@@ -32,7 +32,7 @@ Codex can also return files to Discord by emitting `!attach <absolute_path>`.
 
 ## Requirements
 
-- Node.js 20+ on Windows
+- Node.js running natively on Windows
 - A Discord Bot application
 - A local Codex CLI running natively on Windows
 
@@ -149,20 +149,27 @@ Notes:
   - When reconnecting to an existing Codex session, the working-directory override is not applied automatically. If needed, run `!session workdir set ...` after connecting.
 - `!model`
   - Show available models for the current session. Descriptions follow `APP_LOCALE` (Japanese or English).
-- `!model <no>`
+- `!model <number>`
   - Switch the model for the current session.
   - `0` uses the model specified in Codex `config.toml` (default model).
   - The list source is `data/models.yaml`.
   - The list shows model descriptions and Codex credit rates per 1M input / cached input / output tokens.
   - Codex `exec` does not currently provide a model-list API, so this list must be maintained manually unless that feature is added.
+- `!model c[oding] [number] [effort]` / `!model o[ffice] [number] [effort]`
+  - Select the coding or office model-and-effort profile. `!model c` and `!model o` are aliases.
+  - Example: `!model c 3 medium` sets the coding profile to model number 3 in the list with `medium` reasoning effort. The model is saved by name, so later changes to the list order do not affect the profile.
+  - Supplying a model number updates the shared definition and selects that profile for this session. Specify effort by name, such as `medium` or `high`; omitting it preserves the existing profile effort. For a new profile, an omitted effort follows Codex configuration.
+  - Definitions persist in the database and apply to all sessions following that profile on their next execution. Codex `config.toml` is not modified. Check model numbers with `!model`. An undefined profile must be configured with a model number first.
+  - `!model 0` clears the profile selection and follows Codex configuration. Individually numbered models are pinned and do not follow profile changes.
 - `!effort`
   - Show reasoning effort values supported by the model selected for this session.
-- `!effort <no>`
-  - Set reasoning effort for this session. `0` uses the value from Codex `config.toml`.
-  - If either the model or reasoning effort is overridden, the selected setting is shown in red before the completion message.
+- `!effort <number>`
+  - Override reasoning effort for this session. `0` follows the selected profile's effort, or Codex `config.toml` when no profile or no profile effort is set.
+  - The model, its source (config / coding / office / explicit), and effort are always displayed before the completed response. Profile/config defaults use normal text. Individually pinned models and effort overrides are warned in red, even when their values currently match a profile default.
+  - An individual effort override remains selected when switching profiles. Use `!effort 0` to follow the profile effort. Unsupported model/effort combinations are rejected rather than silently changed.
   - Per-model supported values are maintained in `data/models.yaml`.
 - `!codex [query]`
-- `!codex pick <no>`
+- `!codex pick <number>`
 - `!codex session <codex_thread_id>`
 
 ### Triggers
@@ -225,7 +232,12 @@ Trigger firing is implemented through Windows Task Scheduler.
 ### Maintenance
 
 - `!queue`
+- `!stop` / `!stop this`
+  - Request termination of running work and cancel waiting tasks for this thread, without stopping other Codex queues.
+  - Discord threads bound to the same Codex UUID share one execution queue and are stopped together.
+  - If termination cannot be confirmed, the execution lock is retained; the next task does not start before confirmation.
 - `!queue stopall`
+  - Cancels queued tasks and requests termination of running executions. If termination cannot be confirmed, the execution lock is retained and rechecked; the next task in that queue does not start.
   - `!stopall` and `!allstop` are also available as shorthand aliases.
 - `!queue fix`
 - `!sandbox on`

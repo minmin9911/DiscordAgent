@@ -12,7 +12,7 @@ export interface ExecutionTask {
   maxRetries: number;
   onQueued: (position: number) => Promise<void>;
   onProgress: (elapsedSec: number, queueLength: number) => Promise<void>;
-  run: () => Promise<TaskRunResult>;
+  run: (signal: AbortSignal) => Promise<TaskRunResult>;
   onFinish: (result: {
     status: TaskStatus;
     output: string;
@@ -27,6 +27,7 @@ interface SessionQueue {
   tasks: ExecutionTask[];
   generation: number;
   runningExecutionId: string | null;
+  runningAbortController: AbortController | null;
 }
 
 export interface QueueSnapshot {
@@ -39,6 +40,8 @@ export interface QueueSnapshot {
 export class ExecutionManager {
   private readonly queues = new Map<string, SessionQueue>();
   private readonly lockAliases = new Map<string, string>();
+  private paused = false;
+  private readonly pausedLocks = new Set<string>();
 
   private resolveLockKey(lockKey: string): string {
     return this.lockAliases.get(lockKey) ?? lockKey;
@@ -61,6 +64,7 @@ export class ExecutionManager {
       if (key === previous) this.lockAliases.set(alias, next);
     }
     this.lockAliases.set(previous, next);
+    if (this.pausedLocks.delete(previous)) this.pausedLocks.add(next);
   }
 
   constructor(
@@ -107,6 +111,62 @@ export class ExecutionManager {
     return drained;
   }
 
+  pauseLock(lockKey: string): void { this.pausedLocks.add(this.resolveLockKey(lockKey)); }
+
+  isLockPaused(lockKey: string): boolean { return this.pausedLocks.has(this.resolveLockKey(lockKey)); }
+
+  resumeLock(lockKey: string): void {
+    this.pausedLocks.delete(this.resolveLockKey(lockKey));
+    void this.startNext(lockKey).catch(err => this.logger.error({ err, lockKey }, "failed to resume queue"));
+  }
+
+  drainPending(lockKey: string): ExecutionTask[] {
+    const queue = this.queues.get(this.resolveLockKey(lockKey));
+    if (!queue) return [];
+    return queue.tasks.splice(0);
+  }
+
+  cancelRunning(lockKey: string): string | null {
+    const queue = this.queues.get(this.resolveLockKey(lockKey));
+    if (!queue?.runningExecutionId || !queue.runningAbortController) return null;
+    queue.runningAbortController.abort();
+    return queue.runningExecutionId;
+  }
+
+  pauseAll(): void {
+    this.paused = true;
+  }
+
+  resumeAll(): void {
+    if (!this.paused) return;
+    this.paused = false;
+    for (const lockKey of this.queues.keys()) {
+      this.startNext(lockKey).catch((err) => {
+        this.logger.error({ err, lockKey }, "failed to resume queue");
+      });
+    }
+  }
+
+  cancelRunningAll(): number {
+    let cancelled = 0;
+    for (const queue of this.queues.values()) {
+      const controller = queue.runningAbortController;
+      const executionId = queue.runningExecutionId;
+      if (!queue.running || !controller || !executionId || controller.signal.aborted) continue;
+      controller.abort();
+      cancelled += 1;
+    }
+    return cancelled;
+  }
+
+  getActiveExecutionIds(): Set<string> {
+    const active = new Set<string>();
+    for (const queue of this.queues.values()) {
+      if (queue.runningExecutionId) active.add(queue.runningExecutionId);
+    }
+    return active;
+  }
+
   forceResetAll(): { clearedLocks: number; droppedQueued: number; resetRunning: number } {
     let clearedLocks = 0;
     let droppedQueued = 0;
@@ -126,6 +186,7 @@ export class ExecutionManager {
     for (const lockKey of lockKeys) {
       const queue = this.queues.get(this.resolveLockKey(lockKey));
       if (!queue) continue;
+      if (queue.running) continue;
       if (!queue.running && queue.tasks.length === 0) continue;
       this.resetQueue(lockKey, queue);
       released += 1;
@@ -134,10 +195,20 @@ export class ExecutionManager {
   }
 
   async enqueue(task: ExecutionTask): Promise<{ ok: true; position: number } | { ok: false; code: string }> {
+    if (this.paused || this.pausedLocks.has(this.resolveLockKey(task.lockKey))) {
+      return { ok: false, code: "ERR_QUEUE_STOPPING" };
+    }
     task.lockKey = this.resolveLockKey(task.lockKey);
     let queue = this.queues.get(task.lockKey);
     if (!queue) {
-      queue = { running: false, runningSince: null, tasks: [], generation: 0, runningExecutionId: null };
+      queue = {
+        running: false,
+        runningSince: null,
+        tasks: [],
+        generation: 0,
+        runningExecutionId: null,
+        runningAbortController: null,
+      };
       this.queues.set(task.lockKey, queue);
     }
 
@@ -166,6 +237,7 @@ export class ExecutionManager {
   }
 
   private async startNext(lockKey: string): Promise<void> {
+    if (this.paused || this.pausedLocks.has(this.resolveLockKey(lockKey))) return;
     const queue = this.queues.get(this.resolveLockKey(lockKey));
     if (!queue || queue.running) return;
 
@@ -175,17 +247,27 @@ export class ExecutionManager {
     queue.running = true;
     queue.runningSince = Date.now();
     queue.runningExecutionId = task.executionId;
+    const abortController = new AbortController();
+    queue.runningAbortController = abortController;
     const generationAtStart = queue.generation;
 
     let retries = 0;
     let finishStarted = false;
+    let progressCallbackRunning = false;
     let progressTimer: NodeJS.Timeout | null = setInterval(() => {
+      if (progressCallbackRunning) return;
       const q = this.queues.get(this.resolveLockKey(lockKey));
       const elapsedSec = q?.runningSince ? Math.floor((Date.now() - q.runningSince) / 1000) : 0;
       const queueLength = q?.tasks.length ?? 0;
-      task.onProgress(elapsedSec, queueLength).catch((err) => {
-        this.logger.warn({ err }, "progress callback failed");
-      });
+      progressCallbackRunning = true;
+      Promise.resolve()
+        .then(() => task.onProgress(elapsedSec, queueLength))
+        .catch((err) => {
+          this.logger.warn({ err }, "progress callback failed");
+        })
+        .finally(() => {
+          progressCallbackRunning = false;
+        });
     }, this.progressIntervalSec * 1000);
 
     const clearProgressTimer = (): void => {
@@ -206,13 +288,38 @@ export class ExecutionManager {
 
     try {
       while (true) {
+        if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
+          this.logger.warn(
+            { lockKey, executionId: task.executionId },
+            "ignoring stale task after queue reset",
+          );
+          break;
+        }
+        if (abortController.signal.aborted) {
+          await finishOnce({
+            status: "error",
+            output: "Execution stopped.",
+            retries,
+            errorCode: "ERR_EMERGENCY_STOP",
+          });
+          break;
+        }
         // The adapter owns process lifetime. Elapsed time must not release a live execution.
-        const result = await task.run();
+        const result = await task.run(abortController.signal);
         if (this.isTaskStale(lockKey, generationAtStart, task.executionId)) {
           this.logger.warn(
             { lockKey, executionId: task.executionId },
             "ignoring stale task completion after queue reset",
           );
+          break;
+        }
+        if (abortController.signal.aborted) {
+          await finishOnce({
+            status: "error",
+            output: "Execution stopped.",
+            retries,
+            errorCode: "ERR_EMERGENCY_STOP",
+          });
           break;
         }
         if (result.status === "error" && retries < task.maxRetries) {
@@ -244,6 +351,22 @@ export class ExecutionManager {
         );
         return;
       }
+      if (abortController.signal.aborted) {
+        try {
+          await finishOnce({
+            status: "error",
+            output: "Execution stopped.",
+            retries,
+            errorCode: "ERR_EMERGENCY_STOP",
+          });
+        } catch (finishError) {
+          this.logger.error(
+            { err: finishError, lockKey, executionId: task.executionId },
+            "task finish callback failed",
+          );
+        }
+        return;
+      }
       try {
         await finishOnce({
           status: "error",
@@ -267,6 +390,7 @@ export class ExecutionManager {
       current.running = false;
       current.runningSince = null;
       current.runningExecutionId = null;
+      current.runningAbortController = null;
       if (current.tasks.length > 0) {
         await this.startNext(lockKey);
       }
@@ -274,10 +398,12 @@ export class ExecutionManager {
   }
 
   private resetQueue(lockKey: string, queue: SessionQueue): void {
+    queue.runningAbortController?.abort();
     queue.running = false;
     queue.runningSince = null;
     queue.tasks = [];
     queue.runningExecutionId = null;
+    queue.runningAbortController = null;
     queue.generation += 1;
     this.logger.warn({ lockKey, generation: queue.generation }, "queue forcibly reset");
   }

@@ -1,8 +1,9 @@
-import { queryWindowsProcesses, type ProcessIdentity } from "./processTermination.js";
+import { processObservationTime, queryWindowsProcessSnapshot, type ProcessIdentity, type ProcessSnapshot } from "./processTermination.js";
 
 export interface LivenessResult {
   state: "alive" | "dead" | "unknown";
   errors: string[];
+  targets?: ProcessIdentity[];
 }
 
 /** Transient snapshot failures retain the lock, but do not immediately notify users. */
@@ -37,63 +38,91 @@ function describeQueryError(error: unknown): string {
 
 /** Read-only identity tracking: a missing wrapper does not mean its runtime has exited. */
 export class ProcessLivenessTracker {
-  private readonly known = new Map<number, string>();
+  private readonly known = new Map<number, ProcessIdentity>();
 
   constructor(
     private readonly rootPid: number,
     private readonly isRuntime: (commandLine: string) => boolean,
-    private readonly query: () => Promise<ProcessIdentity[]> = queryWindowsProcesses,
-    private readonly startedAt = Date.now(),
+    private readonly query: (notBefore?: number) => Promise<ProcessIdentity[] | ProcessSnapshot> = queryWindowsProcessSnapshot,
+    private readonly startedAt = processObservationTime(),
   ) {}
 
-  async check(rootExited: boolean, threadId?: string | null, closeReceived = false): Promise<LivenessResult> {
+  async check(
+    rootExited: boolean | (() => boolean), threadId?: string | null,
+    closeReceived: boolean | (() => boolean) = false,
+    options: { includeDescendants?: boolean; notBefore?: number; forTermination?: boolean } = {},
+  ): Promise<LivenessResult> {
     try {
-      const rows = await this.query();
+      const { includeDescendants = false, notBefore = this.startedAt, forTermination = false } = options;
+      const requestedAt = processObservationTime();
+      const snapshot = await this.query(Math.max(this.startedAt, notBefore));
+      const rows = Array.isArray(snapshot) ? snapshot : snapshot.rows;
+      const snapshotStartedAt = Array.isArray(snapshot) ? requestedAt : snapshot.startedAt;
+      if (snapshotStartedAt < Math.max(this.startedAt, notBefore)) {
+        return { state: "unknown", errors: ["Snapshot predates the execution or termination request"] };
+      }
+      const exited = typeof rootExited === "function" ? rootExited() : rootExited;
+      const closed = typeof closeReceived === "function" ? closeReceived() : closeReceived;
       const root = rows.find(row => row.pid === this.rootPid);
-      if (root && ((rootExited && !this.known.has(root.pid))
-        || (this.known.has(root.pid) && this.known.get(root.pid) !== root.created))) {
+      const rootReused = Boolean(root && this.known.has(root.pid)
+        && this.known.get(root.pid)?.created !== root.created);
+      if (root && !this.known.has(root.pid)
+        && (exited || Date.parse(root.created) < Math.floor(this.startedAt))) {
         return { state: "unknown", errors: ["Root PID identity changed"] };
       }
-      const seeds = new Set<number>([this.rootPid]);
+      const seeds = new Set<number>();
+      if (root && !exited && !rootReused) seeds.add(root.pid);
       for (const row of rows) {
-        if (this.known.get(row.pid) === row.created) seeds.add(row.pid);
+        if (this.known.get(row.pid)?.created === row.created) seeds.add(row.pid);
       }
       let changed = true;
       while (changed) {
         changed = false;
         for (const row of rows) {
           if (!seeds.has(row.parentPid) || seeds.has(row.pid)) continue;
+          // A recycled PID proves the old identity ended, not that we own the new one.
+          if (this.known.has(row.pid) && this.known.get(row.pid)?.created !== row.created) continue;
+          const parent = rows.find(candidate => candidate.pid === row.parentPid);
+          if (!parent || Date.parse(row.created) < Date.parse(parent.created)) continue;
           seeds.add(row.pid);
           changed = true;
         }
       }
-      const descendantIdentityChanged = rows.some(row => seeds.has(row.pid) && this.known.has(row.pid)
-        && this.known.get(row.pid) !== row.created);
-      if (threadId && rows.some(row => this.isRuntime(row.commandLine ?? "")
-        && row.commandLine?.includes(threadId) && !seeds.has(row.pid)
-        // A runtime already present before this spawn cannot be its orphaned child.
-        && !(Date.parse(row.created) < this.startedAt))) {
-        return { state: "unknown", errors: ["Unattributed runtime references the Codex thread"] };
-      }
-      if (descendantIdentityChanged) {
-        // A recycled child PID does not invalidate an independently known live runtime.
-        // Do not remember new identities through the ambiguous descendant tree.
-        const knownAlive = rows.some(row => this.known.get(row.pid) === row.created
-          && (row.pid === this.rootPid ? !rootExited : this.isRuntime(row.commandLine ?? "")));
-        return knownAlive ? { state: "alive", errors: [] }
-          : { state: "unknown", errors: ["Descendant PID identity changed"] };
-      }
-      // Remember intermediaries too, so an orphaned native runtime remains attributable.
       for (const row of rows) {
-        if (seeds.has(row.pid)) this.known.set(row.pid, row.created);
+        if (seeds.has(row.pid)) this.known.set(row.pid, row);
       }
-      const alive = rows.some(row => seeds.has(row.pid)
-        && (row.pid === this.rootPid ? !rootExited : this.isRuntime(row.commandLine ?? "")));
-      if (alive) return { state: "alive", errors: [] };
+      const targets = rows.filter(row => seeds.has(row.pid)
+        && (row.pid === this.rootPid ? !exited : includeDescendants || this.isRuntime(row.commandLine ?? "")));
+      if (targets.length && !forTermination) return { state: "alive", errors: [], targets };
+      // Follow uncertain ancestry separately, including unobserved intermediate shells.
+      // These IDs are evidence against absence, never authority to terminate anything.
+      const uncertainAncestors = new Set([...this.known.keys(), this.rootPid].filter(pid => !seeds.has(pid)));
+      // A missing parent alone cannot connect another execution or shared daemon to ours.
+      let uncertainChanged = true;
+      while (uncertainChanged) {
+        uncertainChanged = false;
+        for (const row of rows) {
+          if (seeds.has(row.pid) || uncertainAncestors.has(row.pid)
+            || !uncertainAncestors.has(row.parentPid)
+            || Date.parse(row.created) < Math.floor(this.startedAt)) continue;
+          uncertainAncestors.add(row.pid);
+          uncertainChanged = true;
+        }
+      }
+      const unattributed = rows.some(row => !seeds.has(row.pid)
+        && !(Date.parse(row.created) < Math.floor(this.startedAt))
+        && ((threadId && this.isRuntime(row.commandLine ?? "") && row.commandLine?.includes(threadId))
+          || (this.isRuntime(row.commandLine ?? "")
+            && uncertainAncestors.has(row.parentPid))
+          || (includeDescendants && uncertainAncestors.has(row.parentPid))));
+      if (unattributed) {
+        return { state: "unknown", errors: ["Unattributed runtime or descendant remains"] };
+      }
+      if (targets.length) return { state: "alive", errors: [], targets };
       if (rows.some(row => seeds.has(row.pid) && row.pid !== this.rootPid && !row.commandLine)) {
         return { state: "unknown", errors: ["Descendant command line is unavailable"] };
       }
-      if (!this.known.size && !closeReceived) {
+      if ((!exited && !rootReused) || (!this.known.size && !closed)) {
         return { state: "unknown", errors: ["Process identity was not observed before disappearance"] };
       }
       return { state: "dead", errors: [] };

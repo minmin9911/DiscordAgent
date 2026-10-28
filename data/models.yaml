@@ -16,6 +16,12 @@ models:
     credits_per_million: [50, 2.5, 250]
     disabled: false
     reasoning_efforts: [low, medium, high, xhigh, max]
+  - id: gpt-6.1-terra
+    description_ja: 画像の理解・正確な画面操作・自然な文章作成向けの高速・効率的なモデル
+    description_en: Fast, efficient model for visual reasoning, precise computer use, and natural writing
+    credits_per_million: [25, 1.25, 125]
+    disabled: false
+    reasoning_efforts: [low, medium, high, xhigh, max]
   - id: gpt-6-sol
     description_ja: コーディングや日常作業向けの主力モデル
     description_en: Workhorse model for coding and everyday work

@@ -5,6 +5,7 @@ import { randomUUID } from "node:crypto";
 import type {
   ExecutionStatus,
   ReasoningEffort,
+  ModelProfileName,
   SandboxMode,
   SessionRow,
   TriggerFireRow,
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   name TEXT NOT NULL,
   codex_thread_id TEXT,
   model_override TEXT,
+  model_profile TEXT CHECK (model_profile IN ('coding', 'office')),
   reasoning_effort_override TEXT,
   sandbox_mode TEXT,
   danger_full_access_until TEXT,
@@ -192,6 +194,9 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_extra_dirs_thread_id ON sandbox_extra_dir
       this.db.exec("ALTER TABLE sessions ADD COLUMN attach_instruction_sent_at TEXT");
     }
     const hasModelOverride = columns.some((c) => c.name === "model_override");
+    if (!columns.some(c => c.name === "model_profile")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN model_profile TEXT CHECK (model_profile IN ('coding', 'office'))");
+    }
     if (!hasModelOverride) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN model_override TEXT");
     }
@@ -573,8 +578,16 @@ INNER JOIN triggers ON triggers.id = old.trigger_id`);
 
   setSessionModelOverride(sessionId: string, modelOverride: string | null): void {
     this.db
-      .prepare("UPDATE sessions SET model_override = ? WHERE id = ?")
+      .prepare("UPDATE sessions SET model_override = ?, model_profile = NULL WHERE id = ?")
       .run(modelOverride, sessionId);
+  }
+
+  setSessionModelProfile(sessionId: string, name: ModelProfileName, definition?: string): void {
+    this.db.transaction(() => {
+      if (!this.getSessionById(sessionId)) throw new Error("ERR_SESSION_NOT_FOUND");
+      if (definition !== undefined) this.setAppState(`model_profile:${name}`, definition);
+      this.db.prepare("UPDATE sessions SET model_profile = ?, model_override = NULL WHERE id = ?").run(name, sessionId);
+    })();
   }
 
   setSessionReasoningEffortOverride(

@@ -1,9 +1,11 @@
-import { exec, spawn, type ExecException } from "node:child_process";
+import { spawn } from "node:child_process";
+import { StringDecoder } from "node:string_decoder";
+import { BoundedLineDecoder, BoundedTextTail } from "./boundedOutput.js";
 import { resolveWorkingDirectoryFromThreadId } from "./codexSessionMeta.js";
 import { existsSync, statSync } from "node:fs";
 import type { ReasoningEffort } from "./types.js";
 import { reasoningEffortCodexConfigArgs } from "./reasoningEffort.js";
-import { stopWindowsProcessTree } from "./processTermination.js";
+import { processObservationTime, stopWindowsProcessTree } from "./processTermination.js";
 import { LivenessWarningGate, ProcessLivenessTracker } from "./processLiveness.js";
 const DISCORD_AGENT_SYSTEM_PROMPT = [
   "You are running through DiscordAgent.",
@@ -171,6 +173,36 @@ export function parseCodexJsonl(raw: string): ParsedCodexJsonl {
   return { threadId, agentMessages, hasAgentMessage, warnings, errors };
 }
 
+/** Preserve semantic results, not the unbounded stream of tool and image records. */
+export class CodexOutputCollector {
+  readonly parsed: ParsedCodexJsonl = { agentMessages: [], hasAgentMessage: false, warnings: [], errors: [] };
+  private readonly issues = new Set<string>();
+  private retainedChars = 0;
+  overflowed = false;
+  constructor(private readonly maxChars = 16 * 1024 * 1024) {}
+  consume(line: string): void {
+    const next = parseCodexJsonl(line);
+    if (next.threadId) this.parsed.threadId = next.threadId;
+    this.parsed.hasAgentMessage ||= next.hasAgentMessage;
+    for (const text of next.agentMessages) this.keep(this.parsed.agentMessages, text);
+    for (const [kind, values] of [["warning", next.warnings], ["error", next.errors]] as const) {
+      for (const text of values) {
+        const key = `${kind}:${text}`;
+        if (this.issues.has(key)) continue;
+        if (this.keep(kind === "warning" ? this.parsed.warnings : this.parsed.errors, text)) this.issues.add(key);
+      }
+    }
+  }
+  private keep(target: string[], text: string): boolean {
+    // Include per-entry overhead so even millions of empty messages stay bounded.
+    const size = text.length + 64;
+    if (this.retainedChars + size > this.maxChars) { this.overflowed = true; return false; }
+    this.retainedChars += size;
+    target.push(text);
+    return true;
+  }
+}
+
 export function detectLogicalCompletionFromJsonlLine(
   line: string,
 ): "turn.completed" | "task_complete" | null {
@@ -201,12 +233,12 @@ export function decideCloseGraceAction(processAlive: boolean): "finalize" | "ter
 
 export function isCodexRuntimeCommandLine(commandLine: string | null | undefined): boolean {
   if (!commandLine) return false;
-  const normalized = commandLine.toLowerCase();
-  return normalized.includes("@openai\\codex\\bin\\codex.js")
-    || normalized.includes("@openai/codex/bin/codex.js")
-    || normalized.includes("codex.cmd exec")
-    || normalized.includes(" codex exec ")
-    || /codex\.exe(?:"|\s)/.test(normalized);
+  const tokens = (commandLine.toLowerCase().match(/"[^"]*"|\S+/g) ?? [])
+    .map(token => token.replace(/^"|"$/g, "").replaceAll("\\", "/"));
+  const executable = tokens[0]?.split("/").pop();
+  if (executable === "codex.exe" || executable === "codex") return true;
+  return (executable === "node.exe" || executable === "node")
+    && /(?:^|\/)@openai\/codex\/bin\/codex\.js$/.test(tokens[1] ?? "");
 }
 
 export function selectCodexUserOutput(input: {
@@ -222,10 +254,9 @@ export function selectCodexUserOutput(input: {
 }
 
 export class CodexAdapter {
-  private readonly activeChildPids = new Set<number>();
-  private readonly pidToThreadId = new Map<number, string>();
-  private readonly pidToSessionId = new Map<number, string>();
-  private readonly stopBySession = new Map<string, () => Promise<void>>();
+  private readonly executions = new Map<symbol, {
+    sessionId: string; executionId?: string; threadId?: string | null; stop: () => Promise<boolean>;
+  }>();
 
   constructor(
     private readonly mode: "cli" | "template",
@@ -243,6 +274,7 @@ export class CodexAdapter {
   ) {}
 
   async run(input: {
+    signal?: AbortSignal;
     prompt: string;
     sessionId: string;
     executionId?: string;
@@ -269,6 +301,9 @@ export class CodexAdapter {
       },
     ) => void | Promise<void>;
   }): Promise<CodexResult> {
+    if (input.signal?.aborted) {
+      return { ok: false, output: "Execution stopped.", errorCode: "ERR_EMERGENCY_STOP" };
+    }
     const promptWithSystem = input.includeDiscordAgentSystemPrompt === false
       ? input.prompt
       : this.buildPromptWithSystem(input.prompt);
@@ -284,90 +319,42 @@ export class CodexAdapter {
     });
   }
 
-  emergencyStopAllRunning(): number {
-    const pids = [...this.activeChildPids];
-    for (const pid of pids) {
-      this.killProcessTree(pid);
-    }
-    return pids.length;
+  async emergencyStopAllRunning(): Promise<{ requested: number; confirmed: number; unconfirmed: number }> {
+    const requests = [...this.executions.values()];
+    const results = await Promise.all(requests.map(entry => entry.stop().catch(() => false)));
+    const confirmed = results.filter(Boolean).length;
+    return { requested: requests.length, confirmed, unconfirmed: requests.length - confirmed };
+  }
+
+  async emergencyStopExecutions(ids: ReadonlySet<string>): Promise<{ requested: number; confirmed: number; unconfirmed: number }> {
+    const requests = [...this.executions.values()].filter(entry => entry.executionId && ids.has(entry.executionId));
+    const results = await Promise.all(requests.map(entry => entry.stop().catch(() => false)));
+    const confirmed = results.filter(Boolean).length;
+    return { requested: requests.length, confirmed, unconfirmed: requests.length - confirmed };
   }
 
   getActiveCodexThreadIds(): string[] {
     // Keep unresolved executions protected even when their wrapper PID has exited.
-    return [...new Set(this.pidToThreadId.values())];
+    return [...new Set([...this.executions.values()].flatMap(entry => entry.threadId ? [entry.threadId] : []))];
   }
 
   getUnresolvedExecutionLockKeys(): Set<string> {
     return new Set([
-      ...[...this.pidToThreadId.values()].map(id => `codex:${id}`),
-      ...[...this.pidToSessionId.values()].map(id => `session:${id}`),
+      ...this.getActiveCodexThreadIds().map(id => `codex:${id}`),
+      ...[...this.executions.values()].map(entry => `session:${entry.sessionId}`),
     ]);
   }
 
   async requestStopSession(sessionId: string): Promise<void> {
-    await this.stopBySession.get(sessionId)?.();
+    await Promise.all([...this.executions.values()]
+      .filter(entry => entry.sessionId === sessionId).map(entry => entry.stop()));
   }
 
-  private async runWithTemplate(input: {
-    prompt: string;
-    sessionId: string;
-    executionId?: string;
-  }): Promise<CodexResult> {
-    const command = this.commandTemplate
-      .replaceAll("{input}", this.escapeForShell(input.prompt))
-      .replaceAll("{sessionId}", input.sessionId);
-
-    return new Promise<CodexResult>((resolve) => {
-      exec(command, { timeout: this.templateTimeoutMs }, (error, stdout, stderr) => {
-        if (error) {
-          const output = [stdout, stderr].filter(Boolean).join("\n").trim();
-          if ((error as ExecException).killed) {
-            resolve({
-              ok: false,
-              output: output || "Codex execution timed out.",
-              errorCode: "ERR_CODEX_TIMEOUT",
-              timedOut: true,
-            });
-            return;
-          }
-          resolve({
-            ok: false,
-            output: output || error.message,
-            errorCode: "ERR_CODEX_EXEC_FAILED",
-          });
-          return;
-        }
-        const out = [stdout, stderr].filter(Boolean).join("\n").trim();
-        resolve({ ok: true, output: out || "(no output)" });
-      });
-    });
+  private async runWithTemplate(input: Parameters<CodexAdapter["run"]>[0]): Promise<CodexResult> {
+    return this.runWithCodexCli(input, true);
   }
 
-  private async runWithCodexCli(input: {
-    prompt: string;
-    sessionId: string;
-    executionId?: string;
-    codexThreadId?: string | null;
-    modelOverride?: string | null;
-    reasoningEffortOverride?: ReasoningEffort | null;
-    sandboxMode?: CodexSandboxMode;
-    additionalReadDirs?: string[];
-    preferredWorkingDirectory?: string | null;
-    onEvent?: (event: CodexStreamEvent) => void | Promise<void>;
-    onAgentMessage?: (message: { itemId: string; text: string }) => void | Promise<void>;
-    onStdErrLine?: (line: string) => void | Promise<void>;
-    onClose?: (info: { code: number | null; signal: NodeJS.Signals | null }) => void | Promise<void>;
-    onLifecycle?: (
-      info: {
-        type: "logical_complete" | "close_grace_expired" | "process_exit" | "stop_requested" | "stop_confirmed" | "stop_failed" | "liveness_unknown";
-        source?: "turn.completed" | "task_complete";
-        graceMs?: number;
-        pid?: number;
-        code?: number | null;
-        errors?: string[];
-      },
-    ) => void | Promise<void>;
-  }): Promise<CodexResult> {
+  private async runWithCodexCli(input: Parameters<CodexAdapter["run"]>[0], template = false): Promise<CodexResult> {
     const commonOptions: string[] = [
       "-c",
       `sandbox_mode="${input.sandboxMode ?? "workspace-write"}"`,
@@ -420,35 +407,42 @@ export class CodexAdapter {
     }
 
     return new Promise<CodexResult>((resolve) => {
+      if (input.signal?.aborted) {
+        resolve({ ok: false, output: "Execution stopped.", errorCode: "ERR_EMERGENCY_STOP" });
+        return;
+      }
       const isWin = process.platform === "win32";
-      const command = isWin ? "cmd.exe" : "codex";
-      const spawnArgs = isWin
+      const command = template ? this.commandTemplate
+        .replaceAll("{input}", this.escapeForShell(input.prompt)).replaceAll("{sessionId}", input.sessionId)
+        : isWin ? "cmd.exe" : "codex";
+      const spawnArgs = template ? [] : isWin
         ? ["/d", "/s", "/c", "codex.cmd", ...args]
         : args;
-      const spawnStartedAt = Date.now();
+      const spawnStartedAt = processObservationTime();
       const child = spawn(command, spawnArgs, {
-        shell: false,
+        shell: template,
         windowsHide: true,
         cwd: resolvedCwd,
       });
       if (child.pid) {
-        this.activeChildPids.add(child.pid);
-        this.pidToSessionId.set(child.pid, input.sessionId);
         this.onDiagnostic?.({ type: "process_spawned", sessionId: input.sessionId, executionId: input.executionId, codexThreadId: input.codexThreadId, pid: child.pid });
-        if (input.codexThreadId) {
-          this.pidToThreadId.set(child.pid, input.codexThreadId);
-        }
       }
-      let stdout = "";
-      let stderr = "";
-      let stdoutLineBuffer = "";
-      let stderrLineBuffer = "";
-      let timedOut = false;
+      const executionKey = Symbol(input.executionId);
+      const execution = { sessionId: input.sessionId, executionId: input.executionId, threadId: input.codexThreadId,
+        stop: (): Promise<boolean> => requestStop("ERR_EMERGENCY_STOP") };
+      const stdoutTail = new BoundedTextTail();
+      const stderrTail = new BoundedTextTail();
+      const stdoutTextDecoder = new StringDecoder("utf8");
+      const stderrTextDecoder = new StringDecoder("utf8");
+      const outputCollector = new CodexOutputCollector();
+      let outputLimitExceeded = false;
+      let stopReason: "ERR_CODEX_TIMEOUT" | "ERR_EMERGENCY_STOP" | null = null;
       let logicalComplete = false;
       let forcedCloseAfterLogicalComplete = false;
       let settled = false;
       let rootExited = false;
-      let stopping: Promise<void> | null = null;
+      let stopping: Promise<boolean> | null = null;
+      let templateTimer: NodeJS.Timeout | null = null;
       let exitGraceTimer: NodeJS.Timeout | null = null;
       let livenessTimer: NodeJS.Timeout | null = null;
       let closeGraceTimer: NodeJS.Timeout | null = null;
@@ -478,43 +472,36 @@ export class CodexAdapter {
         clearLivenessTimer();
         clearCloseGrace();
         if (exitGraceTimer) clearTimeout(exitGraceTimer);
-        this.stopBySession.delete(input.sessionId);
-        if (child.pid) {
-          this.activeChildPids.delete(child.pid);
-          this.pidToThreadId.delete(child.pid);
-          this.pidToSessionId.delete(child.pid);
-        }
-        if (timedOut) {
+        if (templateTimer) clearTimeout(templateTimer);
+        input.signal?.removeEventListener("abort", onAbort);
+        this.executions.delete(executionKey);
+        if (stopReason) {
           resolve({
             ok: false,
-            output: "Codex execution timed out.",
-            errorCode: "ERR_CODEX_TIMEOUT",
-            timedOut: true,
+            output: stopReason === "ERR_EMERGENCY_STOP" ? "Execution stopped." : "Codex execution timed out.",
+            errorCode: stopReason,
+            timedOut: stopReason === "ERR_CODEX_TIMEOUT",
           });
           return;
         }
-        const lastStdoutLine = stdoutLineBuffer.trim();
-        if (lastStdoutLine) {
-          this.handleStdoutJsonlLine(lastStdoutLine, input.onEvent, input.onAgentMessage);
-          const logicalCompletionSource = detectLogicalCompletionFromJsonlLine(lastStdoutLine);
-          if (logicalCompletionSource) {
-            logicalComplete = true;
-          }
-          stdoutLineBuffer = "";
+        stdoutLines.end();
+        stderrLines.end();
+        stdoutTail.append(stdoutTextDecoder.end());
+        stderrTail.append(stderrTextDecoder.end());
+        if (outputLimitExceeded || outputCollector.overflowed) {
+          resolve({ ok: false, output: "ERR_CODEX_OUTPUT_LIMIT: Codex output exceeded the safe capture limit; the complete result could not be retained.",
+            errorCode: "ERR_CODEX_OUTPUT_LIMIT", threadId: outputCollector.parsed.threadId,
+            workingDirectoryUsed: resolvedCwd });
+          return;
         }
         if (processDisappeared && !logicalComplete) {
           resolve({ ok: false, output: "Codex process exited without a completion notification.",
             errorCode: "ERR_CODEX_PROCESS_DISAPPEARED" });
           return;
         }
-        const lastStderrLine = stderrLineBuffer.trim();
-        if (lastStderrLine && input.onStdErrLine) {
-          void Promise.resolve(input.onStdErrLine(lastStderrLine)).catch(() => {});
-          stderrLineBuffer = "";
-        }
-        const parsed = parseCodexJsonl(stdout);
+        const parsed = outputCollector.parsed;
         const fallback = this.sanitizeOutput(
-          [stdout, stderr].filter(Boolean).join("\n").trim(),
+          [stdoutTail.text, stderrTail.text].filter(Boolean).join("\n").trim(),
         );
         if (!parsed.hasAgentMessage && fallback.length === 0) {
           resolve({
@@ -565,9 +552,9 @@ export class CodexAdapter {
           warnings: mergedWarnings,
         });
       };
-      const stopAndFinalize = (): Promise<void> => {
+      const stopAndFinalize = (): Promise<boolean> => {
         if (stopping) return stopping;
-        if (settled) return Promise.resolve();
+        if (settled) return Promise.resolve(true);
         const notify = (type: "stop_requested" | "stop_confirmed" | "stop_failed", errors?: string[]): void => {
           this.onDiagnostic?.({ type, sessionId: input.sessionId, executionId: input.executionId,
             codexThreadId: input.codexThreadId, pid: child.pid, errors });
@@ -579,12 +566,13 @@ export class CodexAdapter {
         stopping = (async () => {
           try {
             let result: { stopped: boolean; errors: string[] };
-            if (child.pid && process.platform === "win32") {
-              result = await stopWindowsProcessTree(child.pid, rootExited, undefined, undefined,
-                timedOut ? undefined : row => isCodexRuntimeCommandLine(row.commandLine ?? ""),
-                child.pid ? this.pidToThreadId.get(child.pid) : input.codexThreadId);
+            if (tracker) {
+              result = await stopWindowsProcessTree({ observe: notBefore => tracker.check(
+                () => rootExited, execution.threadId, () => closeReceived,
+                { includeDescendants: Boolean(stopReason) || template, notBefore, forTermination: true },
+              ) });
             } else if (child.pid) {
-              this.killProcessTree(child.pid);
+              child.kill("SIGKILL");
               for (let i = 0; i < 20 && this.isProcessAlive(child.pid); i += 1) {
                 await new Promise(resolve => setTimeout(resolve, 100));
               }
@@ -594,48 +582,58 @@ export class CodexAdapter {
             }
             if (!result.stopped) {
               notify("stop_failed", result.errors);
-              stopping = null;
-              return;
+              return false;
             }
             notify("stop_confirmed", result.errors);
             child.stdout.destroy();
             child.stderr.destroy();
             child.stdin?.destroy();
             finalize(child.exitCode);
+            return true;
           } catch (error) {
             notify("stop_failed", [error instanceof Error ? error.message : String(error)]);
+            return false;
+          } finally {
             stopping = null;
+            if (!settled) scheduleCheck(5000);
           }
         })();
         return stopping;
       };
-      this.stopBySession.set(input.sessionId, () => {
-        timedOut = true;
+      const requestStop = (reason: "ERR_EMERGENCY_STOP" | "ERR_CODEX_TIMEOUT"): Promise<boolean> => {
+        if (settled) return Promise.resolve(true);
+        if (reason === "ERR_EMERGENCY_STOP" || !stopReason) stopReason = reason;
+        if (templateTimer) clearTimeout(templateTimer);
+        clearCloseGrace();
         return stopAndFinalize();
-      });
+      };
+      const onAbort = (): void => { void requestStop("ERR_EMERGENCY_STOP"); };
+      this.executions.set(executionKey, execution);
+      input.signal?.addEventListener("abort", onAbort, { once: true });
       const scheduleCheck = (delayMs = this.livenessCheckIntervalMs): void => {
         clearLivenessTimer();
-        if (!settled && !logicalComplete) {
+        if (!settled) {
           livenessTimer = setTimeout(() => { void checkLiveness(); }, delayMs);
         }
       };
       const checkLiveness = async (): Promise<void> => {
-        if (settled || logicalComplete || stopping) return;
+        if (settled) return;
+        if (stopping) { scheduleCheck(5000); return; }
         if (checking) { checkAgain = true; return; }
         checking = true;
         let retrySoon = false;
         try {
           const status = tracker
-            ? await tracker.check(rootExited, child.pid ? this.pidToThreadId.get(child.pid) : input.codexThreadId,
-              closeReceived)
+            ? await tracker.check(() => rootExited, execution.threadId, () => closeReceived,
+              { includeDescendants: Boolean(stopReason) || template, forTermination: Boolean(stopReason) })
             : { state: child.pid && this.isProcessAlive(child.pid) ? "alive" as const
               : rootExited ? "dead" as const : "unknown" as const, errors: [] };
-          if (settled || logicalComplete || stopping) return;
+          if (settled || stopping) return;
           const warning = livenessWarning.observe(status.state);
           retrySoon = warning.retrySoon;
           if (status.state !== lastLivenessState) {
             this.onDiagnostic?.({ type: `liveness_${status.state}`, sessionId: input.sessionId,
-              executionId: input.executionId, codexThreadId: child.pid ? this.pidToThreadId.get(child.pid) : input.codexThreadId,
+              executionId: input.executionId, codexThreadId: execution.threadId,
               pid: child.pid, errors: status.errors });
             lastLivenessState = status.state;
           }
@@ -666,7 +664,6 @@ export class CodexAdapter {
       ): void => {
         if (logicalComplete) return;
         logicalComplete = true;
-        clearLivenessTimer();
         if (input.onLifecycle) {
           void Promise.resolve(
             input.onLifecycle({ type: "logical_complete", source, graceMs: this.closeGraceMs }),
@@ -684,72 +681,80 @@ export class CodexAdapter {
         }, this.closeGraceMs);
       };
 
-      child.stdout.on("data", (buf: Buffer) => {
-        const chunk = buf.toString("utf8");
-        stdout += chunk;
-        stdoutLineBuffer += chunk;
-        const lines = stdoutLineBuffer.split(/\r?\n/);
-        stdoutLineBuffer = lines.pop() ?? "";
-        for (const line of lines) {
+      const markOutputLimit = (): void => {
+        if (outputLimitExceeded) return;
+        outputLimitExceeded = true;
+        this.onDiagnostic?.({ type: "output_limit_exceeded", sessionId: input.sessionId,
+          executionId: input.executionId, codexThreadId: execution.threadId, pid: child.pid,
+          errors: ["ERR_CODEX_OUTPUT_LIMIT"] });
+      };
+      const stdoutLines = new BoundedLineDecoder((line) => {
+          outputCollector.consume(line);
+          if (outputCollector.overflowed) markOutputLimit();
           if (child.pid && line.includes('"thread.started"')) {
             try {
               const event = JSON.parse(line) as { type?: string; thread_id?: string };
               if (event.type === "thread.started" && typeof event.thread_id === "string") {
-                this.pidToThreadId.set(child.pid, event.thread_id);
+                execution.threadId = event.thread_id;
               }
             } catch { /* handled as a non-JSON line below */ }
           }
-          this.handleStdoutJsonlLine(line, input.onEvent, input.onAgentMessage);
+          if (!outputLimitExceeded) this.handleStdoutJsonlLine(line, input.onEvent, input.onAgentMessage);
           const logicalCompletionSource = detectLogicalCompletionFromJsonlLine(line);
           if (logicalCompletionSource) {
-            startLogicalCompletionGrace(logicalCompletionSource);
+            if (settled) logicalComplete = true;
+            else startLogicalCompletionGrace(logicalCompletionSource);
           }
-        }
-      });
-      child.stderr.on("data", (buf: Buffer) => {
-        const chunk = buf.toString("utf8");
-        stderr += chunk;
-        stderrLineBuffer += chunk;
-        const lines = stderrLineBuffer.split(/\r?\n/);
-        stderrLineBuffer = lines.pop() ?? "";
-        for (const line of lines) {
+      }, markOutputLimit);
+      const stderrLines = new BoundedLineDecoder((line) => {
           const text = line.trim();
-          if (!text) continue;
+          if (!text) return;
           if (input.onStdErrLine) {
             void Promise.resolve(input.onStdErrLine(text)).catch(() => {});
           }
-        }
+      }, markOutputLimit);
+      child.stdout.on("data", (buf: Buffer) => {
+        stdoutTail.append(stdoutTextDecoder.write(buf));
+        stdoutLines.write(buf);
       });
-      if (child.stdin) {
-        child.stdin.write(input.prompt);
-        child.stdin.end();
-      }
-      child.on("error", (err) => {
+      child.stderr.on("data", (buf: Buffer) => {
+        stderrTail.append(stderrTextDecoder.write(buf));
+        stderrLines.write(buf);
+      });
+      const onProcessError = (err: Error): void => {
         if (settled) return;
+        if (child.pid) {
+          this.onDiagnostic?.({ type: "process_error", sessionId: input.sessionId,
+            executionId: input.executionId, codexThreadId: execution.threadId,
+            pid: child.pid, errors: [err.message] });
+          scheduleCheck(1000);
+          return;
+        }
         settled = true;
         clearLivenessTimer();
         clearCloseGrace();
         if (exitGraceTimer) clearTimeout(exitGraceTimer);
-        this.stopBySession.delete(input.sessionId);
-        if (child.pid) {
-          this.activeChildPids.delete(child.pid);
-          this.pidToThreadId.delete(child.pid);
-          this.pidToSessionId.delete(child.pid);
-        }
+        if (templateTimer) clearTimeout(templateTimer);
+        input.signal?.removeEventListener("abort", onAbort);
+        this.executions.delete(executionKey);
         resolve({
           ok: false,
           output: err.message,
-          errorCode: "ERR_CODEX_EXEC_FAILED",
+          errorCode: stopReason ?? "ERR_CODEX_EXEC_FAILED",
+          timedOut: stopReason === "ERR_CODEX_TIMEOUT",
         });
-      });
+      };
+      child.on("error", onProcessError);
+      child.stdin?.on("error", onProcessError);
+      child.stdout.on("error", onProcessError);
+      child.stderr.on("error", onProcessError);
       child.on("close", (code, signal) => {
         if (input.onClose) {
           void Promise.resolve(input.onClose({ code, signal })).catch(() => {});
         }
         closeReceived = true;
         closedCode = code;
-        if (timedOut || stopping) void stopAndFinalize();
-        else if (logicalComplete || !isWin) finalize(code);
+        if (!isWin && !stopReason) finalize(code);
         else void checkLiveness();
       });
       child.on("exit", (code) => {
@@ -763,26 +768,15 @@ export class CodexAdapter {
         // A wrapper exit is not permission to kill a still-running native Codex.
         exitGraceTimer = setTimeout(() => { void checkLiveness(); }, 1000);
       });
+      if (template && this.templateTimeoutMs > 0) {
+        templateTimer = setTimeout(() => { void requestStop("ERR_CODEX_TIMEOUT"); }, this.templateTimeoutMs);
+      }
+      if (input.signal?.aborted) onAbort();
+      if (child.stdin && !input.signal?.aborted) {
+        if (!template) child.stdin.write(input.prompt);
+        child.stdin.end();
+      }
     });
-  }
-
-  private killProcessTree(pid: number | undefined): void {
-    if (!pid) return;
-    if (process.platform === "win32") {
-      const killer = spawn("taskkill", ["/PID", String(pid), "/T", "/F"], {
-        windowsHide: true,
-        stdio: "ignore",
-      });
-      killer.on("error", () => {
-        // taskkill が使えない環境のフォールバック。
-      });
-      return;
-    }
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      // 既に終了済みの場合は無視。
-    }
   }
 
   private isProcessAlive(pid: number): boolean {
@@ -809,6 +803,7 @@ export class CodexAdapter {
     } catch {
       return;
     }
+    if (!obj || typeof obj !== "object") return;
     const eventType = typeof obj.type === "string" ? obj.type : "unknown";
     let threadId: string | undefined;
     if (typeof obj.thread_id === "string") {

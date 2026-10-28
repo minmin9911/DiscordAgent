@@ -5,6 +5,17 @@ import { IncrementalJsonlReader } from "./incrementalJsonlReader.js";
 
 interface SyncRecord { lineNo: number; text: string }
 
+export interface ExternalSyncReadDiagnostics {
+  skippedLineCount: number;
+  firstSkippedLineNo: number | null;
+  lastSkippedLineNo: number | null;
+}
+
+export interface ExternalSyncLineCursor extends ExternalSyncReadDiagnostics {
+  sourceFound: boolean;
+  latestLineNo: number;
+}
+
 export type ExternalSyncItemType = "user_message" | "agent_message";
 
 export interface ExternalSyncEvent {
@@ -21,6 +32,7 @@ export interface ExternalSyncReadResult {
   sourceFound: boolean;
   latestLineNo: number;
   events: ExternalSyncEvent[];
+  diagnostics?: ExternalSyncReadDiagnostics;
 }
 
 export interface CodexThreadFileFingerprint {
@@ -76,6 +88,7 @@ export interface ExternalSyncTurnReadResult {
   sourceReset?: boolean;
   sourceFound: boolean;
   latestLineNo: number;
+  diagnostics?: ExternalSyncReadDiagnostics;
   latestCompleteLineNo: number;
   hasTaskBoundary: boolean;
   turns: ExternalSyncTurn[];
@@ -87,6 +100,7 @@ export interface ExternalSyncStartedTurn {
   completeLineNo: number | null;
   occurredAtMs: number | null;
   userMessage: string | null;
+  localUserMessages?: string[];
   eventIds: string[];
 }
 
@@ -94,6 +108,7 @@ export interface ExternalSyncStartedTurnReadResult {
   sourceFound: boolean;
   latestLineNo: number;
   turns: ExternalSyncStartedTurn[];
+  diagnostics?: ExternalSyncReadDiagnostics;
 }
 
 export function buildExternalSyncEventSignature(input: {
@@ -236,6 +251,27 @@ export function parseExternalSyncEventLine(
 
 function normalizeForDedup(text: string): string {
   return text.replace(/\s+/g, " ").trim();
+}
+
+function getLocalResponseUserText(obj: Record<string, unknown>): string | null {
+  if (obj.type !== "response_item" || !obj.payload || typeof obj.payload !== "object") return null;
+  const payload = obj.payload as Record<string, unknown>;
+  if (payload.type !== "message" || payload.role !== "user" || !Array.isArray(payload.content)) return null;
+  const text = payload.content.flatMap(part => {
+    if (!part || typeof part !== "object") return [];
+    const value = part as Record<string, unknown>;
+    return value.type === "input_text" && typeof value.text === "string" ? [value.text] : [];
+  }).join("\n");
+  return text.trim() ? text : null;
+}
+
+export function localTurnMatchesPrompt(turn: ExternalSyncStartedTurn, expected: string): boolean {
+  const normalized = normalizeForDedup(expected);
+  return Boolean(normalized) && [turn.userMessage, ...(turn.localUserMessages ?? [])].some(text => {
+    if (!text) return false;
+    const actual = normalizeForDedup(text);
+    return actual === normalized || actual.endsWith(normalized);
+  });
 }
 
 function parseJsonObject(line: string): Record<string, unknown> | null {
@@ -414,6 +450,12 @@ function parseStartedRecords(records: readonly SyncRecord[], afterLineNo: number
       flushActive();
       continue;
     }
+    const localInput = getLocalResponseUserText(obj);
+    if (localInput) {
+      (active.localUserMessages ??= []).push(localInput);
+      active.eventIds.push(getLineEventId(obj, lineNo));
+      continue;
+    }
     const event = parseExternalSyncEventLine(text, lineNo);
     if (!event) continue;
     active.eventIds.push(event.eventId);
@@ -428,16 +470,47 @@ function parseStartedRecords(records: readonly SyncRecord[], afterLineNo: number
 // Cache only synchronization metadata, never image/tool payloads or the whole file.
 export class CodexExternalSyncFileReader {
   private reader: IncrementalJsonlReader;
+  private cursorReader: IncrementalJsonlReader;
   private records: SyncRecord[] = [];
   private latestLineNo = 0;
+  private latestCursorLineNo = 0;
   private coveredAfter = 0;
   private queue: Promise<unknown> = Promise.resolve();
 
   constructor(readonly path: string) {
     this.reader = new IncrementalJsonlReader(path);
+    this.cursorReader = new IncrementalJsonlReader(path);
   }
 
   get lastReadBytes(): number { return this.reader.lastReadBytes; }
+
+  latestLineNumber(): Promise<ExternalSyncLineCursor> {
+    const work = this.queue.then(async () => {
+      try {
+        const summary = await this.cursorReader.read((_text, lineNo) => {
+          this.latestCursorLineNo = lineNo;
+        }, () => {
+          this.latestCursorLineNo = 0;
+        }, (lineNo) => {
+          this.latestCursorLineNo = lineNo;
+        });
+        // Keep cursor scans independent so an older DB cursor does not rewind sync state.
+        return {
+          sourceFound: true,
+          latestLineNo: this.latestCursorLineNo,
+          skippedLineCount: summary.skippedLineCount,
+          firstSkippedLineNo: summary.firstSkippedLineNo,
+          lastSkippedLineNo: summary.lastSkippedLineNo,
+        };
+      } catch (error) {
+        this.cursorReader = new IncrementalJsonlReader(this.path);
+        this.latestCursorLineNo = 0;
+        throw error;
+      }
+    });
+    this.queue = work.catch(() => {});
+    return work;
+  }
 
   async completed(afterLineNo: number): Promise<ExternalSyncTurnReadResult> {
     const read = await this.read(afterLineNo);
@@ -445,6 +518,7 @@ export class CodexExternalSyncFileReader {
     const turns = parseCompletedRecords(candidates, afterLineNo);
     return {
       sourceFound: true, latestLineNo: read.latestLineNo, sourceReset: read.sourceReset,
+      diagnostics: read.diagnostics,
       latestCompleteLineNo: turns.at(-1)?.completeLineNo ?? afterLineNo,
       hasTaskBoundary: candidates.some(({ text }) => {
         const obj = parseJsonObject(text);
@@ -453,9 +527,17 @@ export class CodexExternalSyncFileReader {
     };
   }
 
-  read(afterLineNo: number): Promise<{ records: SyncRecord[]; latestLineNo: number; sourceReset: boolean }> {
+  read(afterLineNo: number): Promise<{
+    records: SyncRecord[];
+    latestLineNo: number;
+    sourceReset: boolean;
+    diagnostics: ExternalSyncReadDiagnostics;
+  }> {
     const work = this.queue.then(async () => {
       let sourceReset = false;
+      let diagnostics: ExternalSyncReadDiagnostics = {
+        skippedLineCount: 0, firstSkippedLineNo: null, lastSkippedLineNo: null,
+      };
       const reset = (): void => {
         this.records = [];
         this.latestLineNo = 0;
@@ -466,10 +548,10 @@ export class CodexExternalSyncFileReader {
         reset();
       }
       try {
-        await this.reader.read((text, lineNo) => {
+        const summary = await this.reader.read((text, lineNo) => {
+          this.latestLineNo = lineNo;
           const obj = parseJsonObject(text);
           if (!obj) return;
-          this.latestLineNo = lineNo;
           const record = compactSyncRecord(obj, lineNo, text);
           if (record) this.records.push({ lineNo, text: record });
           // Discard acknowledged history while bootstrapping, not just after a full scan.
@@ -478,7 +560,14 @@ export class CodexExternalSyncFileReader {
             const keep = getTaskTurnId(obj, "task_started") ? 1 : 0;
             this.records = keep ? this.records.slice(-keep) : [];
           }
-        }, () => { reset(); sourceReset = true; });
+        }, () => { reset(); sourceReset = true; }, (lineNo) => {
+          this.latestLineNo = lineNo;
+        });
+        diagnostics = {
+          skippedLineCount: summary.skippedLineCount,
+          firstSkippedLineNo: summary.firstSkippedLineNo,
+          lastSkippedLineNo: summary.lastSkippedLineNo,
+        };
       } catch (error) {
         this.reader = new IncrementalJsonlReader(this.path);
         reset();
@@ -498,7 +587,7 @@ export class CodexExternalSyncFileReader {
         this.records = this.records.filter((record) => record.lineNo >= firstLine - 3);
         this.coveredAfter = afterLineNo;
       }
-      return { records: this.records.slice(), latestLineNo: this.latestLineNo, sourceReset };
+      return { records: this.records.slice(), latestLineNo: this.latestLineNo, sourceReset, diagnostics };
     });
     this.queue = work.catch(() => {});
     return work;
@@ -512,6 +601,12 @@ function compactSyncRecord(obj: Record<string, unknown>, lineNo: number, text: s
     return JSON.stringify({ type, timestamp: obj.timestamp, id: obj.id,
       payload: { type: payload!.type, turn_id: payload!.turn_id,
         last_agent_message: payload!.last_agent_message } });
+  }
+  const localInput = getLocalResponseUserText(obj);
+  if (localInput) {
+    // Retain only text for local prompt matching, never expose these as External User events.
+    return JSON.stringify({ type: "response_item", timestamp: obj.timestamp, id: obj.id,
+      payload: { type: "message", role: "user", content: [{ type: "input_text", text: localInput }] } });
   }
   const event = parseExternalSyncEventLine(text, lineNo);
   if (!event) return null;
@@ -553,7 +648,7 @@ export async function readCodexThreadCompletedTurnsSinceLine(
 ): Promise<ExternalSyncTurnReadResult> {
   const reader = threadFileReader(codexThreadId);
   if (!reader) return { sourceFound: false, latestLineNo: 0,
-    latestCompleteLineNo: afterLineNo, hasTaskBoundary: false, turns: [] };
+    latestCompleteLineNo: afterLineNo, hasTaskBoundary: false, turns: [], diagnostics: emptyReadDiagnostics() };
   return reader.completed(afterLineNo);
 }
 
@@ -561,10 +656,10 @@ export async function readCodexThreadStartedTurnsSinceLine(
   codexThreadId: string, afterLineNo: number,
 ): Promise<ExternalSyncStartedTurnReadResult> {
   const reader = threadFileReader(codexThreadId);
-  if (!reader) return { sourceFound: false, latestLineNo: 0, turns: [] };
+  if (!reader) return { sourceFound: false, latestLineNo: 0, turns: [], diagnostics: emptyReadDiagnostics() };
   const read = await reader.read(afterLineNo);
   return { sourceFound: true, latestLineNo: read.latestLineNo,
-    turns: parseStartedRecords(read.records, afterLineNo) };
+    turns: parseStartedRecords(read.records, afterLineNo), diagnostics: read.diagnostics };
 }
 
 function findSessionFileByThreadId(rootDir: string, threadId: string): string | null {
@@ -596,10 +691,22 @@ export async function readCodexThreadEventsSinceLine(
   codexThreadId: string, afterLineNo: number,
 ): Promise<ExternalSyncReadResult> {
   const reader = threadFileReader(codexThreadId);
-  if (!reader) return { sourceFound: false, latestLineNo: 0, events: [] };
+  if (!reader) return { sourceFound: false, latestLineNo: 0, events: [], diagnostics: emptyReadDiagnostics() };
   const read = await reader.read(afterLineNo);
   return { sourceFound: true, latestLineNo: read.latestLineNo,
-    events: parseRecordEvents(read.records, afterLineNo) };
+    events: parseRecordEvents(read.records, afterLineNo), diagnostics: read.diagnostics };
+}
+
+export async function readCodexThreadLatestLineNumber(
+  codexThreadId: string,
+): Promise<ExternalSyncLineCursor> {
+  const reader = threadFileReader(codexThreadId);
+  if (!reader) return { sourceFound: false, latestLineNo: 0, ...emptyReadDiagnostics() };
+  return reader.latestLineNumber();
+}
+
+function emptyReadDiagnostics(): ExternalSyncReadDiagnostics {
+  return { skippedLineCount: 0, firstSkippedLineNo: null, lastSkippedLineNo: null };
 }
 
 export function parseRecordEvents(records: readonly SyncRecord[], afterLineNo: number): ExternalSyncEvent[] {

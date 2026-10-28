@@ -4,7 +4,14 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
-## v0.1.0 build.105 (2026-10-21)
+## v0.1.0 build.114 (2026-10-27)
+- Updated dependencies to address security advisories and raised the Node.js requirements to security-patched release lines. Update your Node.js runtime as well.
+- Added shared coding and office model-and-effort profiles, selectable with `!model c` and `!model o`. The model and effort are always displayed; only individually overridden settings produce warnings.
+- Added `!stop` (`!stop this`) to stop running and queued work only for the current thread.
+- The remaining weekly allowance is now shown during execution, with a comparison between the initial and final remaining allowance.
+- Fixed queue and liveness issues that could start another execution before termination was confirmed, prevent recovery from temporary monitoring errors, or leave completed executions marked as running due to unrelated Codex processes.
+- Reduced monitoring overhead when multiple threads run concurrently.
+- Fixed synchronization stalling on oversized conversation log entries such as images, and reduced memory usage when starting an execution.
 - Fixed an issue where sending another message during a new session's first execution could start concurrent executions and cause an error.
 - Fixed file uploads failing when the path in `!attach` is enclosed in quotation marks.
 - CLI Codex executions are no longer stopped based on elapsed time. If process liveness cannot be confirmed, execution locks are retained while checks continue. `CODEX_TIMEOUT_SEC` no longer applies to CLI execution; `CODEX_LIVENESS_CHECK_SEC` controls the check interval (default: 60 seconds).

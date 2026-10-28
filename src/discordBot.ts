@@ -82,9 +82,7 @@ import {
   modelListPriceHeader,
   modelListSourceLine,
   modelListTitle,
-  modelWarningLine,
-  reasoningEffortDefaultLabel,
-  reasoningEffortModelConflict,
+  modelSettingsLine,
   reasoningEffortSetDone,
   reasoningEffortUnsupported,
   permissionRequestDiscarded,
@@ -155,6 +153,8 @@ import {
   retainCodexExternalSyncReaders,
   readCodexThreadCompletedTurnsSinceLine,
   readCodexThreadEventsSinceLine,
+  readCodexThreadLatestLineNumber,
+  localTurnMatchesPrompt,
   readCodexThreadStartedTurnsSinceLine,
 } from "./codexExternalSync.js";
 import { ATTACH_MAX_BYTES, extractAttachPaths } from "./attachPolicy.js";
@@ -179,6 +179,10 @@ import { truncateExternalUserMessage } from "./externalSyncText.js";
 import { loadModelCatalog } from "./modelCatalog.js";
 import { isReasoningEffortSupported, supportedReasoningEfforts } from "./reasoningEffort.js";
 import { resolveSessionWorkingDirectoryState } from "./sessionWorkingDirectory.js";
+import {
+  modelProfileKey, parseModelProfileCommand, readModelProfile, resolveModelSettings,
+  validateModelProfile, type ResolvedModelSettings,
+} from "./modelProfiles.js";
 
 const UNREAD_RECOVERY_LIMIT = 3;
 const UNREAD_RECOVERY_POLL_MS = 3 * 60 * 1000;
@@ -383,6 +387,7 @@ interface LocalExternalSyncAttempt {
 }
 
 export class DiscordCodexBot {
+  private latestUsageSnapshot: CodexUsageStatus | null = null;
   private readonly logger: pino.Logger;
   private readonly client = new Client({
     intents: [
@@ -425,7 +430,7 @@ export class DiscordCodexBot {
   private gatewayReconnectInProgress = false;
   private gatewayReconnectTimer: NodeJS.Timeout | null = null;
   private lastGatewayReconnectAt = 0;
-  private latestUsageSnapshot: { status: CodexUsageStatus; observedAtMs: number } | null = null;
+  private stoppingAll = false;
 
   constructor(params: { db: AppDb; logger: pino.Logger }) {
     this.db = params.db;
@@ -625,6 +630,10 @@ export class DiscordCodexBot {
       }
       if (content === "!stopall" || content === "!allstop") {
         await this.handleQueueCommand(msg, "stopall");
+        return;
+      }
+      if (content === "!stop" || content === "!stop this") {
+        await this.handleStopCommand(msg);
         return;
       }
       if (content.startsWith("!queue ")) {
@@ -1223,10 +1232,11 @@ export class DiscordCodexBot {
       const workingDirectoryState = resolveSessionWorkingDirectoryState(current, resolvedCodexCwd);
       const workingDirectory = workingDirectoryState.baseWorkingDirectory
         ?? (current.codex_thread_id ? unknownValue(this.locale) : notLinkedYet(this.locale));
+      const modelSettings = this.resolveExecutionModelSettings(current);
       const lines = [
         `codex_thread_id: ${current.codex_thread_id ?? notLinkedYet(this.locale)}`,
-        `model: ${current.model_override ?? "default"}`,
-        `reasoning_effort: ${current.reasoning_effort_override ?? "default"}`,
+        `model: ${modelSettings.model ?? "?"}(${modelSettings.source})`,
+        `reasoning_effort: ${modelSettings.effort ?? "?"}${modelSettings.warnEffort ? " (override)" : ""}`,
         `sandbox: ${current.sandbox_mode ?? "workspace-write"}`,
         `danger_full_access_until: ${current.danger_full_access_until ?? "-"}`,
         `working_directory: ${workingDirectory}`,
@@ -1298,6 +1308,11 @@ export class DiscordCodexBot {
     };
     const composeStatusText = (statusLine: string): string => {
       const lines = [statusLine];
+      const shownUsage = latestRunningUsageStatus ?? provisionalUsageStatus;
+      if (shownUsage) lines.push(codexUsageStatusLine(
+        this.locale, shownUsage,
+        latestRunningUsageStatus !== usageStatusBefore ? usageStatusBefore : null,
+      ));
       if (streamHistory.length > 0) {
         lines.push("stream_log:");
         for (let i = 0; i < streamHistory.length; i += 1) {
@@ -1346,9 +1361,37 @@ export class DiscordCodexBot {
     let storedThreadIdAtStart = session.codex_thread_id ?? null;
     let observedThreadId: string | null = storedThreadIdAtStart;
     let usageStatusBefore: CodexUsageStatus | null = null;
+    let executionModelSettings: ResolvedModelSettings | null = null;
+    let latestRunningUsageStatus: CodexUsageStatus | null = null;
+    let provisionalUsageStatus: CodexUsageStatus | null = null;
+    let usageStartedAtMs: number | null = null;
+    let lastUsageProbeAtMs = 0;
+    const refreshRunningUsage = (): boolean => {
+      const now = Date.now();
+      if (usageStartedAtMs == null
+        || now - lastUsageProbeAtMs < 5000 || !observedThreadId) return false;
+      lastUsageProbeAtMs = now;
+      try {
+        const status = readLatestCodexUsageStatusByThreadId(observedThreadId, usageStartedAtMs);
+        if (!status) return false;
+        if ((status.recordedAtMs ?? 0) >= (this.latestUsageSnapshot?.recordedAtMs ?? 0)) {
+          this.latestUsageSnapshot = status;
+        }
+        if (latestRunningUsageStatus
+          && codexUsageStatusLine(this.locale, status)
+            === codexUsageStatusLine(this.locale, latestRunningUsageStatus)) return false;
+        usageStatusBefore ??= status;
+        latestRunningUsageStatus = status;
+        return true;
+      } catch (error) {
+        this.logger.warn({ err: error, executionId }, "failed to read running Codex usage status");
+        return false;
+      }
+    };
     let lateLocalSyncAttempt: Promise<LocalExternalSyncAttempt | null> | null = null;
     let threadSwitchNotice: string | null = null;
     let threadSwitchAnnounced = false;
+    let executionSignal: AbortSignal | undefined;
     const applyObservedThreadId = async (
       nextThreadId: string | null | undefined,
       source: "event" | "result",
@@ -1435,6 +1478,7 @@ export class DiscordCodexBot {
         }
       },
       onProgress: async (elapsedSec, queueLength) => {
+        refreshRunningUsage();
         const progressText = composeStatusText(
           runningElapsedMessage(
             this.locale,
@@ -1445,7 +1489,10 @@ export class DiscordCodexBot {
         );
         await editProgressMessage(progressText);
       },
-      run: async () => {
+      run: async (signal) => {
+        executionSignal = signal;
+        const settings = this.resolveExecutionModelSettings(session);
+        executionModelSettings = settings;
         if (!session.codex_thread_id) {
           const current = this.db.getSessionById(session.id);
           session.codex_thread_id = current?.codex_thread_id ?? null;
@@ -1454,7 +1501,12 @@ export class DiscordCodexBot {
           observedThreadId = session.codex_thread_id;
         }
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
-        usageStatusBefore = this.getRecentUsageSnapshot();
+        usageStartedAtMs = Date.now();
+        const cachedUsage = this.latestUsageSnapshot;
+        const cachedAge = cachedUsage?.recordedAtMs == null
+          ? Infinity : usageStartedAtMs - cachedUsage.recordedAtMs;
+        provisionalUsageStatus = cachedAge >= 0 && cachedAge <= USAGE_BEFORE_MAX_AGE_MS
+          ? cachedUsage : null;
         const shouldInjectAttachInstruction = !session.attach_instruction_sent_at;
         if (shouldInjectAttachInstruction) {
           this.db.markAttachInstructionSent(session.id);
@@ -1469,6 +1521,15 @@ export class DiscordCodexBot {
           },
           "execution started",
         );
+        // Freeze the first current-run reading; later readings update only the right side.
+        const usageProgressTimer = setInterval(() => {
+          if (!refreshRunningUsage()) return;
+          void editProgressMessage(composeStatusText(runningPhaseMessage(
+            this.locale, "turn.started", this.getUserFacingCodexSessionLabel(session),
+          ))).catch(error => {
+            this.logger.warn({ err: error, executionId }, "running usage progress update failed");
+          });
+        }, 5000);
         const runResult = await (async () => {
           try {
             return await this.runCodexWithLocalExternalSyncTracking(
@@ -1476,12 +1537,13 @@ export class DiscordCodexBot {
               executionId,
               prompt,
               () => this.codex.run({
+                signal,
                 prompt,
                 executionId,
                 sessionId: session.id,
                 codexThreadId: session.codex_thread_id,
-                modelOverride: session.model_override,
-                reasoningEffortOverride: session.reasoning_effort_override,
+                modelOverride: settings.modelOverride,
+                reasoningEffortOverride: settings.reasoningEffortOverride,
                 sandboxMode,
                 additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
                 preferredWorkingDirectory: session.preferred_working_directory,
@@ -1597,6 +1659,7 @@ export class DiscordCodexBot {
               }
             }
             if (event.type === "turn.started") {
+              refreshRunningUsage();
               await editProgressMessage(
                 composeStatusText(
                   runningPhaseMessage(
@@ -1609,6 +1672,7 @@ export class DiscordCodexBot {
             }
                 },
                 onAgentMessage: async ({ itemId, text }) => {
+            refreshRunningUsage();
             if (seenAgentItemIds.has(itemId)) return;
             seenAgentItemIds.add(itemId);
             const suppressThreadId = observedThreadId ?? session.codex_thread_id ?? null;
@@ -1675,6 +1739,7 @@ export class DiscordCodexBot {
               }),
             );
           } finally {
+            clearInterval(usageProgressTimer);
             await this.finishLocalExternalSyncAttempt(await lateLocalSyncAttempt);
             lateLocalSyncAttempt = null;
           }
@@ -1744,7 +1809,7 @@ export class DiscordCodexBot {
       onFinish: async ({ status, output, retries, errorCode }) => {
         if (finishHandled) return;
         finishHandled = true;
-        this.db.updateExecutionStatus(executionId, status, {
+        this.db.updateExecutionStatus(executionId, errorCode === "ERR_EMERGENCY_STOP" ? "cancelled" : status, {
           errorCode,
           retryCount: retries,
         });
@@ -1767,7 +1832,8 @@ export class DiscordCodexBot {
         const helpParsed = extractHelpAgentCommands(parsed.cleanedOutput);
         const triggerParsed = extractTriggerCommands(helpParsed.cleanedOutput);
         const streamBody = streamAgentMessages.join("\n").trim();
-        const effectiveOutput = streamBody || triggerParsed.cleanedOutput;
+        const effectiveOutput = errorCode === "ERR_EMERGENCY_STOP" || errorCode === "ERR_CODEX_OUTPUT_LIMIT"
+          ? output : streamBody || triggerParsed.cleanedOutput;
         if (observedThreadId && effectiveOutput.trim()) {
           this.addLocalSyncSuppressionText(observedThreadId, "agent_message", effectiveOutput);
         }
@@ -1777,19 +1843,15 @@ export class DiscordCodexBot {
         const usageStatus = observedThreadId
           ? this.readAndRememberUsageStatus(observedThreadId)
           : null;
-        if (observedThreadId && !session.model_override) {
+        if (observedThreadId && executionModelSettings?.source === "config") {
           const resolvedDefaultModel = readLatestCodexResolvedModelByThreadId(observedThreadId);
           if (resolvedDefaultModel) {
             this.db.setAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL, resolvedDefaultModel);
+            executionModelSettings.model = resolvedDefaultModel;
           }
         }
-        const settingsBlock = session.model_override || session.reasoning_effort_override
-          ? `${modelWarningLine(
-            this.locale,
-            session.model_override,
-            session.reasoning_effort_override,
-          )}\n`
-          : "";
+        const settingsBlock = executionModelSettings
+          ? `${modelSettingsLine(this.locale, executionModelSettings)}\n` : "";
         const usageBlock = usageStatus
           ? `${codexUsageStatusLine(this.locale, usageStatus, usageStatusBefore)}\n`
           : "";
@@ -1817,7 +1879,8 @@ export class DiscordCodexBot {
           ? `stream_log:\n${historyLines.join("\n")}\n`
           : "";
         const switchBlock = threadSwitchNotice ? `${threadSwitchNotice}\n` : "";
-        const needsApprovalRetry = permissionFailureDetected || retryableSandboxFailureDetected;
+        const needsApprovalRetry = !executionSignal?.aborted && errorCode !== "ERR_EMERGENCY_STOP"
+          && (permissionFailureDetected || retryableSandboxFailureDetected);
         const approvalView = this.resolveApprovalStatusView(
           session,
           sandboxMode,
@@ -1842,6 +1905,7 @@ export class DiscordCodexBot {
           await sendChannel.send(`(${i + 1}/${chunks.length}) ${chunks[i]}`);
         }
         await this.sendSandboxFirstCompletionNoticeOnce(sendChannel);
+        if (executionSignal?.aborted || errorCode === "ERR_EMERGENCY_STOP") return;
         if (needsApprovalRetry && sandboxMode === "workspace-write") {
           this.pendingApprovals.set(contextKey, {
             content,
@@ -1855,9 +1919,11 @@ export class DiscordCodexBot {
             : "runtime";
           await sendChannel.send(permissionRetryPrompt(this.locale, retryReason));
         }
+        if (status !== "success" || executionSignal?.aborted) return;
         if (parsed.paths.length > 0) {
           await this.handleAttachCommands(sendChannel, parsed.paths);
         }
+        if (executionSignal?.aborted) return;
         if (helpParsed.commands.length > 0) {
           await this.handleHelpAgentCommandFromAgent(
             sendChannel,
@@ -1870,6 +1936,7 @@ export class DiscordCodexBot {
         }
         if (triggerParsed.commands.length > 0) {
           for (const cmd of triggerParsed.commands) {
+            if (executionSignal?.aborted) return;
             const bodyArg = cmd.slice(TRIGGER_COMMAND_PREFIX.length).trim();
             await this.handleTriggerCommandFromAgent(
               sendChannel,
@@ -1891,38 +1958,76 @@ export class DiscordCodexBot {
     }
   }
 
+  private readonly stoppingLocks = new Set<string>();
+
+  private async handleStopCommand(msg: Message): Promise<void> {
+    const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
+    const session = this.sessionService.getCurrentSession(contextKey);
+    if (!session) { await msg.reply("ERR_ACTIVE_SESSION_NOT_FOUND"); return; }
+    const lockKey = this.getExecutionLockKey(session);
+    if (this.stoppingAll || this.stoppingLocks.has(lockKey) || this.manager.isLockPaused(lockKey)) {
+      await msg.reply("ERR_QUEUE_STOPPING"); return;
+    }
+    this.stoppingLocks.add(lockKey);
+    this.manager.pauseLock(lockKey);
+    try {
+      const dropped = this.manager.drainPending(lockKey);
+      const cancelled = this.db.cancelExecutionsByIds(dropped.map(task => task.executionId), "ERR_EMERGENCY_STOP");
+      for (const task of dropped) {
+        void task.onFinish({ status: "error", output: "ERR_EMERGENCY_STOP", retries: 0,
+          errorCode: "ERR_EMERGENCY_STOP" }).catch(err => {
+          this.logger.error({ err, executionId: task.executionId }, "cancelled queue notification failed");
+        });
+      }
+      const id = this.manager.cancelRunning(lockKey);
+      const stopped = await this.codex.emergencyStopExecutions(new Set(id ? [id] : []));
+      this.logger.warn({ by: msg.author.id, lockKey, cancelled, stopped }, "thread stop requested");
+      await msg.reply(queueStopallExecuted(this.locale, cancelled, stopped.confirmed,
+        stopped.unconfirmed, dropped.length, Math.max(id ? 1 : 0, stopped.requested), "this"));
+    } finally {
+      this.stoppingLocks.delete(lockKey);
+      this.manager.resumeLock(lockKey);
+    }
+  }
+
   private async handleQueueCommand(msg: Message, body: string): Promise<void> {
     const sub = body.trim().toLowerCase();
     if (sub === "stopall" || sub === "allstop") {
-      const reset = this.manager.forceResetAll();
-      const killed = this.codex.emergencyStopAllRunning();
-      const canceled = this.db.cancelAllInFlightExecutions("ERR_EMERGENCY_STOP");
-      this.logger.warn(
-        {
-          by: msg.author.id,
-          canceled,
-          killed,
-          reset,
-        },
-        "queue emergency stopall requested",
-      );
-      await msg.reply(
-        queueStopallExecuted(
-          this.locale,
-          canceled,
-          killed,
-          reset.clearedLocks,
-          reset.droppedQueued,
-        ),
-      );
+      if (this.stoppingAll) { await msg.reply("ERR_QUEUE_STOPPING"); return; }
+      this.stoppingAll = true;
+      this.manager.pauseAll();
+      let summary = "";
+      try {
+        const dropped = this.manager.drainPendingAll();
+        const cancelled = this.db.cancelExecutionsByIds(dropped.map(task => task.executionId), "ERR_EMERGENCY_STOP");
+        // Finish dropped tasks too, including claimed trigger fires; no Codex process is started.
+        for (const task of dropped) {
+          void task.onFinish({ status: "error", output: "ERR_EMERGENCY_STOP", retries: 0,
+            errorCode: "ERR_EMERGENCY_STOP" }).catch(err => {
+            this.logger.error({ err, executionId: task.executionId }, "cancelled queue notification failed");
+          });
+        }
+        const requested = this.manager.cancelRunningAll();
+        const stopped = await this.codex.emergencyStopAllRunning();
+        this.logger.warn({ by: msg.author.id, cancelled, requested, stopped, dropped: dropped.length },
+          "queue emergency stopall requested");
+        summary = queueStopallExecuted(this.locale, cancelled, stopped.confirmed,
+          stopped.unconfirmed, dropped.length, Math.max(requested, stopped.requested));
+      } finally {
+        this.stoppingAll = false;
+        this.manager.resumeAll();
+      }
+      await msg.reply(summary);
       return;
     }
     if (sub === "fix") {
       const inFlight = this.db.listInFlightExecutions(1000);
       const running = inFlight.filter((v) => v.result_status === "running");
       const activeThreadIds = new Set(this.codex.getActiveCodexThreadIds());
+      const activeExecutionIds = this.manager.getActiveExecutionIds();
       const orphanIds = running
-        .filter((v) => v.codex_thread_id && !activeThreadIds.has(v.codex_thread_id))
+        .filter((v) => !activeExecutionIds.has(v.id)
+          && v.codex_thread_id && !activeThreadIds.has(v.codex_thread_id))
         .map((v) => v.id);
       const fixed = this.db.cancelExecutionsByIds(
         orphanIds,
@@ -1937,6 +2042,7 @@ export class DiscordCodexBot {
       );
       const staleLockKeys = this.manager
         .getQueueSnapshots()
+        .filter((v) => !v.running)
         .map((v) => v.lockKey)
         .filter((lockKey) => !dbLockKeys.has(lockKey)
           && !this.codex.getUnresolvedExecutionLockKeys().has(lockKey));
@@ -2853,6 +2959,7 @@ export class DiscordCodexBot {
       commandTextMasked: "[agent-cmd-internal]",
     });
     const lockKey = `codex:${threadId}`;
+    let executionSignal: AbortSignal | undefined;
     this.addLocalSyncSuppressionText(threadId, "user_message", promptText);
     const result = await this.manager.enqueue({
       executionId,
@@ -2862,13 +2969,16 @@ export class DiscordCodexBot {
       maxRetries: 0,
       onQueued: async () => {},
       onProgress: async () => {},
-      run: async () => {
+      run: async (signal) => {
+        executionSignal = signal;
+        const settings = this.resolveExecutionModelSettings(session);
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
         const runResult = await this.runCodexWithLocalExternalSyncTracking(
           threadId,
           executionId,
           promptText,
           () => this.codex.run({
+            signal,
             prompt: promptText,
             executionId,
             onLifecycle: async info => {
@@ -2878,8 +2988,8 @@ export class DiscordCodexBot {
             },
             sessionId: session.id,
             codexThreadId: threadId,
-            modelOverride: session.model_override,
-            reasoningEffortOverride: session.reasoning_effort_override,
+            modelOverride: settings.modelOverride,
+            reasoningEffortOverride: settings.reasoningEffortOverride,
             sandboxMode,
             additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
             preferredWorkingDirectory: session.preferred_working_directory,
@@ -2897,7 +3007,7 @@ export class DiscordCodexBot {
         return { status: "success" as const, output: runResult.output };
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
-        this.db.updateExecutionStatus(executionId, status, {
+        this.db.updateExecutionStatus(executionId, errorCode === "ERR_EMERGENCY_STOP" ? "cancelled" : status, {
           errorCode,
           retryCount: retries,
         });
@@ -2914,7 +3024,7 @@ export class DiscordCodexBot {
           },
           "agent command result injected as user prompt",
         );
-        if (status !== "success") return;
+        if (status !== "success" || executionSignal?.aborted) return;
         if (chainDepth >= INTERNAL_AGENT_CHAIN_MAX) {
           this.logger.warn(
             {
@@ -2933,9 +3043,11 @@ export class DiscordCodexBot {
         const triggerParsed = extractTriggerCommands(helpParsed.cleanedOutput);
         const sendChannel = await this.resolveSendableChannelByContextKey(contextKey);
         if (!sendChannel) return;
+        if (executionSignal?.aborted) return;
         if (parsed.paths.length > 0) {
           await this.handleAttachCommands(sendChannel, parsed.paths);
         }
+        if (executionSignal?.aborted) return;
         if (helpParsed.commands.length > 0) {
           await this.handleHelpAgentCommandFromAgent(
             sendChannel,
@@ -2948,6 +3060,7 @@ export class DiscordCodexBot {
         }
         if (triggerParsed.commands.length > 0) {
           for (const cmd of triggerParsed.commands) {
+            if (executionSignal?.aborted) return;
             const bodyArg = cmd.slice(TRIGGER_COMMAND_PREFIX.length).trim();
             await this.handleTriggerCommandFromAgent(
               sendChannel,
@@ -3582,65 +3695,76 @@ export class DiscordCodexBot {
     return defaults;
   }
 
-  private effectiveModelIdForSession(session: SessionRow): string | null {
-    return session.model_override
-      ?? this.db.getAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL);
+  private resolveExecutionModelSettings(session: SessionRow): ResolvedModelSettings {
+    const current = this.db.getSessionById?.(session.id) ?? session;
+    return resolveModelSettings(current, key => this.db.getAppState?.(key) ?? null,
+      this.readDisplayDefaults(), loadModelCatalog());
   }
 
   private async handleModelCommand(msg: Message, body: string): Promise<void> {
     const contextKey = this.sessionService.buildContextKey(msg.guildId!, msg.channelId);
-    const session = this.sessionService.resolveOrCreateActiveSession({
-      contextKey,
-      requesterId: msg.author.id,
-      initialMessage: "model",
-    });
+    const session = this.sessionService.resolveOrCreateActiveSession({ contextKey,
+      requesterId: msg.author.id, initialMessage: "model" });
     const arg = body.trim();
     const catalog = loadModelCatalog();
-    const currentModel = session.model_override ?? "default";
-    if (!arg) {
-      const lines = [
-        modelListPriceHeader(this.locale),
-        ...catalog.items.map((item, index) => formatModelCatalogLine(
-          this.locale,
-          index,
-          item,
-          currentModel,
-          this.modelOptionLabel(item.id),
-        )),
-      ];
-      lines.push("---");
-      lines.push(modelListSourceLine(this.locale, "data/models.yaml"));
-      await msg.reply(`${modelListTitle(this.locale)}\n${lines.join("\n")}`);
-      return;
+    const defaults = this.readDisplayDefaults();
+    const read = (key: string): string | null => this.db.getAppState(key);
+    try {
+      if (!arg) {
+        const currentModel = session.model_override ?? (session.model_profile ? "" : "default");
+        const lines = [modelListPriceHeader(this.locale),
+          ...catalog.items.map((item, index) => formatModelCatalogLine(this.locale, index,
+            item, currentModel, this.modelOptionLabel(item.id))),
+          ...(["coding", "office"] as const).map(name => {
+            const profile = readModelProfile(read, name);
+            const value = profile
+              ? profile.model + " | effort=" + (profile.effort ?? "config")
+              : (this.locale === "en" ? "not configured" : "未設定");
+            return name[0] + " | " + name + " | " + value
+              + (!session.model_override && session.model_profile === name ? " <= current" : "");
+          }), "---", modelListSourceLine(this.locale, "data/models.yaml")];
+        await msg.reply(modelListTitle(this.locale) + "\n" + lines.join("\n"));
+        return;
+      }
+      const command = parseModelProfileCommand(arg);
+      if (command) {
+        const previous = command.index != null && command.effort != null ? null : readModelProfile(read, command.name);
+        const item = command.index == null ? null : catalog.items[command.index];
+        if (command.index != null && (!item || item.disabled || item.id === "default")) {
+          throw new Error("ERR_MODEL_PROFILE_MODEL_UNAVAILABLE");
+        }
+        const profile = item ? { model: item.id, effort: command.effort ?? previous?.effort ?? null } : previous;
+        if (!profile) throw new Error("ERR_MODEL_PROFILE_UNDEFINED");
+        validateModelProfile(profile, catalog);
+        resolveModelSettings({ ...session, model_override: null, model_profile: command.name },
+          key => key === modelProfileKey(command.name) ? JSON.stringify(profile) : read(key), defaults, catalog);
+        this.db.setSessionModelProfile(session.id, command.name, item ? JSON.stringify(profile) : undefined);
+        session.model_override = null;
+        session.model_profile = command.name;
+        const notice = item ? (this.locale === "en"
+          ? `Updated the shared ${command.name} definition; all sessions using it follow on their next execution.\n`
+          : `${command.name}の共通定義を更新しました。この用途を使う全セッションの次回実行から適用します。\n`) : "";
+        this.logger.info({ sessionId: session.id, modelProfile: command.name, updated: Boolean(item),
+          model: profile.model, effort: profile.effort, by: msg.author.id }, "model profile selected");
+        await msg.reply(notice + modelSetDone(this.locale, profile.model + "(" + command.name + ") | effort="
+          + (session.reasoning_effort_override ?? profile.effort ?? defaults.reasoningEffort ?? "?")));
+        return;
+      }
+      const index = /^\d+$/.test(arg) ? Number(arg) : NaN;
+      if (!Number.isInteger(index) || index < 0 || index >= catalog.items.length) {
+        await msg.reply(usageModel(this.locale)); return;
+      }
+      const selected = catalog.items[index]!;
+      if (selected.disabled) { await msg.reply("ERR_MODEL_DISABLED"); return; }
+      const override = selected.id === "default" ? null : selected.id;
+      resolveModelSettings({ ...session, model_override: override, model_profile: null }, read, defaults, catalog);
+      this.db.setSessionModelOverride(session.id, override);
+      session.model_override = override;
+      session.model_profile = null;
+      await msg.reply(modelSetDone(this.locale, override ?? "default"));
+    } catch (error) {
+      await msg.reply((error instanceof Error ? error.message : "ERR_MODEL_SETTINGS") + "\n" + usageModel(this.locale));
     }
-    const index = Number(arg);
-    if (!Number.isInteger(index) || index < 0 || index >= catalog.items.length) {
-      await msg.reply(usageModel(this.locale));
-      return;
-    }
-    const selected = catalog.items[index]!;
-    if (selected.disabled) {
-      await msg.reply("ERR_MODEL_DISABLED");
-      return;
-    }
-    const override = selected.id === "default" ? null : selected.id;
-    const selectedModelId = override
-      ?? this.db.getAppState(APP_STATE_LAST_RESOLVED_DEFAULT_MODEL);
-    if (
-      session.reasoning_effort_override
-      && !isReasoningEffortSupported(selectedModelId, session.reasoning_effort_override, catalog)
-    ) {
-      await msg.reply(reasoningEffortModelConflict(
-        this.locale,
-        this.modelOptionLabel(selected.id),
-        session.reasoning_effort_override,
-      ));
-      return;
-    }
-    this.db.setSessionModelOverride(session.id, override);
-    session.model_override = override;
-    const label = override ?? "default";
-    await msg.reply(modelSetDone(this.locale, label));
   }
 
   private async handleReasoningEffortCommand(msg: Message, body: string): Promise<void> {
@@ -3652,19 +3776,27 @@ export class DiscordCodexBot {
     });
     const arg = body.trim();
     const catalog = loadModelCatalog();
-    const modelId = this.effectiveModelIdForSession(session);
+    let profileDefaults: ResolvedModelSettings;
+    try {
+      profileDefaults = resolveModelSettings({ ...session, reasoning_effort_override: null },
+        key => this.db.getAppState(key), this.readDisplayDefaults(), catalog);
+    } catch (error) {
+      await msg.reply(error instanceof Error ? error.message : "ERR_MODEL_SETTINGS");
+      return;
+    }
+    const modelId = profileDefaults.model;
     const efforts = supportedReasoningEfforts(modelId, catalog);
     if (!arg) {
       const current = session.reasoning_effort_override ?? "default";
-      const defaults = this.readDisplayDefaults();
-      const defaultLabel = codexConfigDefaultLabel(this.locale, defaults.reasoningEffort);
+      const defaultLabel = codexConfigDefaultLabel(this.locale, profileDefaults.effort)
+        + (session.model_profile ? ` [${session.model_profile}]` : "");
       const lines = [
         `0 | ${defaultLabel}${current === "default" ? " <= current" : ""}`,
         ...efforts.map((effort, index) => (
           `${index + 1} | ${effort}${current === effort ? " <= current" : ""}`
         )),
       ];
-      const modelLabel = session.model_override ?? defaults.model
+      const modelLabel = profileDefaults.model
         ?? (this.locale === "en" ? "unknown default" : "既定モデル未確認");
       const title = this.locale === "en"
         ? `reasoning effort list (model=${modelLabel})`
@@ -3694,7 +3826,7 @@ export class DiscordCodexBot {
     session.reasoning_effort_override = override;
     await msg.reply(reasoningEffortSetDone(
       this.locale,
-      override ?? reasoningEffortDefaultLabel(this.locale),
+      override ?? `default (${profileDefaults.effort ?? "?"}, ${session.model_profile ?? "config"})`,
     ));
   }
 
@@ -3702,7 +3834,8 @@ export class DiscordCodexBot {
     const threadIds = this.db.listActiveCodexThreadIds();
     let anchored = 0;
     for (const threadId of threadIds) {
-      const read = await readCodexThreadEventsSinceLine(threadId, 0);
+      const read = await readCodexThreadLatestLineNumber(threadId);
+      this.logSkippedSyncLines(threadId, read);
       if (!read.sourceFound) continue;
       this.db.setExternalSyncCursor(threadId, read.latestLineNo);
       anchored += 1;
@@ -3722,7 +3855,8 @@ export class DiscordCodexBot {
     this.activeLocalSyncRuns.set(threadId, activeCount + 1);
     let read;
     try {
-      read = await readCodexThreadEventsSinceLine(threadId, Number.MAX_SAFE_INTEGER);
+      read = await readCodexThreadLatestLineNumber(threadId);
+      this.logSkippedSyncLines(threadId, read);
     } catch (error) {
       if (activeCount === 0) this.activeLocalSyncRuns.delete(threadId);
       else this.activeLocalSyncRuns.set(threadId, activeCount);
@@ -3753,13 +3887,9 @@ export class DiscordCodexBot {
         attempt.codexThreadId,
         attempt.startLineNo,
       );
+      this.logSkippedSyncLines(attempt.codexThreadId, read.diagnostics);
       const candidates = read.turns.filter((turn) => turn.startLineNo > attempt.startLineNo);
-      const promptMatches = candidates.filter((turn) => {
-        if (!turn.userMessage || !attempt.expectedPromptNormalized) return false;
-        const actual = this.normalizeSuppressionText(turn.userMessage);
-        return actual === attempt.expectedPromptNormalized
-          || actual.endsWith(attempt.expectedPromptNormalized);
-      });
+      const promptMatches = candidates.filter(turn => localTurnMatchesPrompt(turn, attempt.expectedPromptNormalized));
       if (attempt.expectedPromptNormalized && promptMatches.length === 0) {
         this.logger.warn(
           {
@@ -3851,6 +3981,14 @@ export class DiscordCodexBot {
     } finally {
       await this.finishLocalExternalSyncAttempt(attempt);
     }
+  }
+
+  private logSkippedSyncLines(codexThreadId: string, diagnostics?: {
+    skippedLineCount: number; firstSkippedLineNo: number | null; lastSkippedLineNo: number | null;
+  }): void {
+    if (!diagnostics?.skippedLineCount) return;
+    this.logger.warn({ codexThreadId, ...diagnostics, error_code: "ERR_CODEX_JSONL_LINE_TOO_LARGE" },
+      "external sync skipped oversized JSONL lines; contents not logged");
   }
 
   private normalizeSuppressionText(text: string): string {
@@ -4096,6 +4234,7 @@ export class DiscordCodexBot {
     }
     const cursor = this.db.getExternalSyncCursor(codexThreadId);
     const turnRead = await readCodexThreadCompletedTurnsSinceLine(codexThreadId, cursor ?? 0);
+    this.logSkippedSyncLines(codexThreadId, turnRead.diagnostics);
     // A local run can start while the asynchronous bootstrap scan yields.
     if ((this.activeLocalSyncRuns.get(codexThreadId) ?? 0) > 0) return null;
     if (!turnRead.sourceFound) return null;
@@ -4205,6 +4344,7 @@ export class DiscordCodexBot {
 
     // Older JSONL variants without task boundaries retain the original line-based fallback.
     const read = await readCodexThreadEventsSinceLine(codexThreadId, cursor ?? 0);
+    this.logSkippedSyncLines(codexThreadId, read.diagnostics);
     if (!read.sourceFound) return null;
 
     if (read.events.length === 0) {
@@ -4445,19 +4585,12 @@ export class DiscordCodexBot {
     this.cleanupObsoleteAtTriggers();
   }
 
-  private getRecentUsageSnapshot(nowMs = Date.now()): CodexUsageStatus | null {
-    const snapshot = this.latestUsageSnapshot;
-    if (!snapshot) return null;
-    const ageMs = nowMs - snapshot.observedAtMs;
-    if (ageMs < 0 || ageMs > USAGE_BEFORE_MAX_AGE_MS) return null;
-    return snapshot.status;
-  }
-
   private readAndRememberUsageStatus(codexThreadId: string): CodexUsageStatus | null {
     try {
       const status = readLatestCodexUsageStatusByThreadId(codexThreadId);
-      if (status) {
-        this.latestUsageSnapshot = { status, observedAtMs: Date.now() };
+      if (status?.recordedAtMs != null
+        && status.recordedAtMs > (this.latestUsageSnapshot?.recordedAtMs ?? -Infinity)) {
+        this.latestUsageSnapshot = status;
       }
       return status;
     } catch (error) {
@@ -4575,6 +4708,7 @@ export class DiscordCodexBot {
       commandTextMasked: trigger.prompt,
     });
 
+    let settings: ResolvedModelSettings | null = null;
     const enqueueResult = await this.manager.enqueue({
       executionId,
       sessionId: session.id,
@@ -4583,7 +4717,9 @@ export class DiscordCodexBot {
       maxRetries: 0,
       onQueued: async () => {},
       onProgress: async () => {},
-      run: async () => {
+      run: async (signal) => {
+        const runSettings = this.resolveExecutionModelSettings(session);
+        settings = runSettings;
         this.db.updateExecutionStatus(executionId, "running", { setStarted: true });
         const streamAgentMessages: string[] = [];
         const shouldInjectAttachInstruction = !session.attach_instruction_sent_at;
@@ -4596,6 +4732,7 @@ export class DiscordCodexBot {
           executionId,
           trigger.prompt,
           () => this.codex.run({
+            signal,
             prompt: trigger.prompt,
             executionId,
             onLifecycle: async info => {
@@ -4605,8 +4742,8 @@ export class DiscordCodexBot {
             },
             sessionId: session.id,
             codexThreadId: session.codex_thread_id,
-            modelOverride: session.model_override,
-            reasoningEffortOverride: session.reasoning_effort_override,
+            modelOverride: runSettings.modelOverride,
+            reasoningEffortOverride: runSettings.reasoningEffortOverride,
             sandboxMode: trigger.sandbox_mode_override ?? this.resolveSandboxMode(session),
             additionalReadDirs: this.resolveAdditionalReadDirsForSession(session),
             preferredWorkingDirectory: session.preferred_working_directory,
@@ -4633,10 +4770,13 @@ export class DiscordCodexBot {
         return { status: "success" as const, output: effectiveOutput };
       },
       onFinish: async ({ status, output, retries, errorCode }) => {
-        this.db.updateExecutionStatus(executionId, status, { retryCount: retries, errorCode });
+        this.db.updateExecutionStatus(executionId, errorCode === "ERR_EMERGENCY_STOP" ? "cancelled" : status, { retryCount: retries, errorCode });
+        if (status !== "success") {
+          this.db.markTriggerFireError(fireId, errorCode ?? output ?? "trigger execution failed");
+        }
         this.readAndRememberUsageStatus(trigger.codex_thread_id);
         try {
-          await this.broadcastTriggerResult(trigger, session, contextKeys, output || "(no output)");
+          await this.broadcastTriggerResult(trigger, session, contextKeys, output || "(no output)", settings);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           this.db.markTriggerFireError(fireId, `Discord delivery failed: ${message}`);
@@ -4662,8 +4802,10 @@ export class DiscordCodexBot {
     session: SessionRow,
     contextKeys: string[],
     output: string,
+    settings?: ResolvedModelSettings | null,
   ): Promise<void> {
-    const header = `[Trigger ${trigger.id}] ${trigger.name}\ncodex_session: ${this.getUserFacingCodexSessionLabel(session)}`;
+    const header = `[Trigger ${trigger.id}] ${trigger.name}\ncodex_session: ${this.getUserFacingCodexSessionLabel(session)}`
+      + (settings ? `\n${modelSettingsLine(this.locale, settings)}` : "");
     const body = splitIntoChunks(output || "(no output)", appConfig.messageChunkSize);
     let delivered = 0;
     for (const contextKey of contextKeys) {

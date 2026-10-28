@@ -3,6 +3,13 @@ import { setImmediate } from "node:timers/promises";
 
 export const JSONL_MAX_LINE_BYTES = 64 * 1024 * 1024;
 
+export interface JsonlReadSummary {
+  latestLineNo: number;
+  skippedLineCount: number;
+  firstSkippedLineNo: number | null;
+  lastSkippedLineNo: number | null;
+}
+
 export class JsonlLineTooLargeError extends Error {
   readonly code = "ERR_CODEX_JSONL_LINE_TOO_LARGE";
   constructor(readonly lineNo: number, readonly maxBytes: number) {
@@ -16,6 +23,7 @@ export class IncrementalJsonlReader {
   private lineNo = 0;
   private fragments: Buffer[] = [];
   private fragmentBytes = 0;
+  private skippingOversizedLine = false;
   private identity: string | null = null;
   private mtimeMs = 0;
   private checkpoint = Buffer.alloc(0);
@@ -30,7 +38,11 @@ export class IncrementalJsonlReader {
   async read(
     onLine: (line: string, lineNo: number) => void,
     onReset: () => void,
-  ): Promise<void> {
+    onSkippedLine?: (lineNo: number) => void,
+  ): Promise<JsonlReadSummary> {
+    let skippedLineCount = 0;
+    let firstSkippedLineNo: number | null = null;
+    let lastSkippedLineNo: number | null = null;
     const file = await open(this.path, "r");
     try {
       const stat = await file.stat();
@@ -47,6 +59,7 @@ export class IncrementalJsonlReader {
         this.lineNo = 0;
         this.fragments = [];
         this.fragmentBytes = 0;
+        this.skippingOversizedLine = false;
         onReset();
       }
       this.identity = identity;
@@ -58,11 +71,27 @@ export class IncrementalJsonlReader {
         if (!bytesRead) break;
         let start = 0;
         while (start < bytesRead) {
+          if (this.skippingOversizedLine) {
+            const newline = buffer.indexOf(10, start);
+            if (newline < 0 || newline >= bytesRead) break;
+            this.skippingOversizedLine = false;
+            this.lineNo += 1;
+            skippedLineCount += 1;
+            firstSkippedLineNo ??= this.lineNo;
+            lastSkippedLineNo = this.lineNo;
+            onSkippedLine?.(this.lineNo);
+            start = newline + 1;
+            continue;
+          }
           const newline = buffer.indexOf(10, start);
           const end = newline < 0 || newline >= bytesRead ? bytesRead : newline;
           const length = end - start;
           if (this.fragmentBytes + length > this.maxLineBytes) {
-            throw new JsonlLineTooLargeError(this.lineNo + 1, this.maxLineBytes);
+            // Large image/tool payloads are not sync candidates; skip through their newline.
+            this.fragments = [];
+            this.fragmentBytes = 0;
+            this.skippingOversizedLine = true;
+            continue;
           }
           if (length) {
             this.fragments.push(Buffer.from(buffer.subarray(start, end)));
@@ -85,6 +114,12 @@ export class IncrementalJsonlReader {
         await file.read(this.checkpoint, 0, this.checkpoint.length, this.offset - this.checkpoint.length);
       }
       this.mtimeMs = stat.mtimeMs;
+      return {
+        latestLineNo: this.lineNo,
+        skippedLineCount,
+        firstSkippedLineNo,
+        lastSkippedLineNo,
+      };
     } finally {
       await file.close();
     }

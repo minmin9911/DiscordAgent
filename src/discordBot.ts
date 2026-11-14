@@ -10,6 +10,7 @@ import {
   type Message,
 } from "discord.js";
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { deleteWindowsScheduledTask } from "./scheduledTaskDeletion.js";
 import { writeFile } from "node:fs/promises";
 import { isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -3327,13 +3328,9 @@ export class DiscordCodexBot {
   }
 
   private deleteScheduledTask(taskName: string): void {
-    const run = spawnSync(
-      "schtasks.exe",
-      ["/Delete", "/TN", taskName, "/F"],
-      { windowsHide: true, encoding: "utf8" },
-    );
-    if (run.status !== 0) {
-      throw new Error(`schtasks delete failed: ${run.stderr || run.stdout || run.status}`);
+    const result = this.tryDeleteScheduledTask(taskName);
+    if (!result.ok && !result.missing) {
+      throw new Error(`ERR_SCHEDULED_TASK_DELETE: ${result.detail ?? "unknown failure"}`);
     }
   }
 
@@ -3342,21 +3339,7 @@ export class DiscordCodexBot {
     missing: boolean;
     detail?: string;
   } {
-    const run = spawnSync(
-      "schtasks.exe",
-      ["/Delete", "/TN", taskName, "/F"],
-      { windowsHide: true, encoding: "utf8" },
-    );
-    if (run.status === 0) {
-      return { ok: true, missing: false };
-    }
-    const detail = String(run.stderr || run.stdout || run.status || "").trim();
-    const normalized = detail.toLowerCase();
-    const missing =
-      normalized.includes("cannot find the file") ||
-      normalized.includes("the system cannot find the file specified") ||
-      normalized.includes("指定されたファイルが見つかりません");
-    return { ok: false, missing, detail };
+    return deleteWindowsScheduledTask(taskName);
   }
 
   private resolveSandboxMode(session: SessionRow): SandboxMode {

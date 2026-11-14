@@ -45,6 +45,8 @@ export class ProcessLivenessTracker {
     private readonly isRuntime: (commandLine: string) => boolean,
     private readonly query: (notBefore?: number) => Promise<ProcessIdentity[] | ProcessSnapshot> = queryWindowsProcessSnapshot,
     private readonly startedAt = processObservationTime(),
+    // A separate wall-clock boundary is required for Windows CreationDate.
+    private readonly birthNotBefore = startedAt,
   ) {}
 
   async check(
@@ -67,8 +69,10 @@ export class ProcessLivenessTracker {
       const rootReused = Boolean(root && this.known.has(root.pid)
         && this.known.get(root.pid)?.created !== root.created);
       if (root && !this.known.has(root.pid)
-        && (exited || Date.parse(root.created) < Math.floor(this.startedAt))) {
-        return { state: "unknown", errors: ["Root PID identity changed"] };
+        && (exited || Date.parse(root.created) < Math.floor(this.birthNotBefore))) {
+        return { state: "unknown", errors: ["Root PID identity changed"
+          + ` (created=${root.created}, birthNotBefore=${this.birthNotBefore},`
+          + ` observationStartedAt=${this.startedAt}, rootExited=${exited})`] };
       }
       const seeds = new Set<number>();
       if (root && !exited && !rootReused) seeds.add(root.pid);
@@ -104,13 +108,13 @@ export class ProcessLivenessTracker {
         for (const row of rows) {
           if (seeds.has(row.pid) || uncertainAncestors.has(row.pid)
             || !uncertainAncestors.has(row.parentPid)
-            || Date.parse(row.created) < Math.floor(this.startedAt)) continue;
+            || Date.parse(row.created) < Math.floor(this.birthNotBefore)) continue;
           uncertainAncestors.add(row.pid);
           uncertainChanged = true;
         }
       }
       const unattributed = rows.some(row => !seeds.has(row.pid)
-        && !(Date.parse(row.created) < Math.floor(this.startedAt))
+        && !(Date.parse(row.created) < Math.floor(this.birthNotBefore))
         && ((threadId && this.isRuntime(row.commandLine ?? "") && row.commandLine?.includes(threadId))
           || (this.isRuntime(row.commandLine ?? "")
             && uncertainAncestors.has(row.parentPid))

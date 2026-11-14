@@ -4,6 +4,10 @@ Japanese changelog: [CHANGELOG.ja.md](./CHANGELOG.ja.md)
 
 Newest builds are listed first.
 
+## v0.1.0 build.116 (2026-11-15)
+- `!trigger delete` can now remove a remaining registration even if its Windows scheduled task has already been deleted.
+- Prevented incorrect process liveness checks caused by different clock sources and added diagnostics for inconclusive checks.
+
 ## v0.1.0 build.114 (2026-10-27)
 - Updated dependencies to address security advisories and raised the Node.js requirements to security-patched release lines. Update your Node.js runtime as well.
 - Added shared coding and office model-and-effort profiles, selectable with `!model c` and `!model o`. The model and effort are always displayed; only individually overridden settings produce warnings.

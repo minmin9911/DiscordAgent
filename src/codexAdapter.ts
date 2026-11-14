@@ -419,6 +419,8 @@ export class CodexAdapter {
         ? ["/d", "/s", "/c", "codex.cmd", ...args]
         : args;
       const spawnStartedAt = processObservationTime();
+      // Windows CreationDate uses wall time, not Node's monotonic clock origin.
+      const spawnWallTime = Date.now();
       const child = spawn(command, spawnArgs, {
         shell: template,
         windowsHide: true,
@@ -447,7 +449,7 @@ export class CodexAdapter {
       let livenessTimer: NodeJS.Timeout | null = null;
       let closeGraceTimer: NodeJS.Timeout | null = null;
       const tracker = child.pid && isWin
-        ? new ProcessLivenessTracker(child.pid, isCodexRuntimeCommandLine, undefined, spawnStartedAt) : null;
+        ? new ProcessLivenessTracker(child.pid, isCodexRuntimeCommandLine, undefined, spawnStartedAt, spawnWallTime) : null;
       let checking = false;
       let checkAgain = false;
       let closeReceived = false;
